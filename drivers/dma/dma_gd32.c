@@ -74,6 +74,7 @@ struct dma_gd32_channel {
 	void *user_data;
 	uint32_t direction;
 	bool busy;
+	bool cyclic;
 };
 
 struct dma_gd32_data {
@@ -471,7 +472,11 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 				     dma_gd32_memory_width(memory_cfg->width));
 	gd32_dma_periph_width_config(cfg->reg, channel,
 				     dma_gd32_periph_width(periph_cfg->width));
-	gd32_dma_circulation_disable(cfg->reg, channel);
+	if (dma_cfg->cyclic) {
+		gd32_dma_circulation_enable(cfg->reg, channel);
+	} else {
+		gd32_dma_circulation_disable(cfg->reg, channel);
+	}
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
 	if (dma_cfg->channel_direction != MEMORY_TO_MEMORY) {
 		gd32_dma_channel_subperipheral_select(cfg->reg, channel,
@@ -482,6 +487,7 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 	data->channels[channel].callback = dma_cfg->dma_callback;
 	data->channels[channel].user_data = dma_cfg->user_data;
 	data->channels[channel].direction = dma_cfg->channel_direction;
+	data->channels[channel].cyclic = dma_cfg->cyclic;
 
 	return 0;
 }
@@ -535,7 +541,8 @@ static int dma_gd32_start(const struct device *dev, uint32_t ch)
 	}
 
 	gd32_dma_interrupt_enable(cfg->reg, ch,
-				  DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS);
+				  DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS |
+				  (data->channels[ch].cyclic ? DMA_CHXCTL_HTFIE : 0));
 	gd32_dma_channel_enable(cfg->reg, ch);
 	data->channels[ch].busy = true;
 
@@ -554,9 +561,10 @@ static int dma_gd32_stop(const struct device *dev, uint32_t ch)
 	}
 
 	gd32_dma_interrupt_disable(
-		cfg->reg, ch, DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS);
+		cfg->reg, ch,
+		DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS | DMA_CHXCTL_HTFIE);
 	gd32_dma_interrupt_flag_clear(cfg->reg, ch,
-				      DMA_FLAG_FTF | GD32_DMA_FLAG_ERRORS);
+				      DMA_FLAG_FTF | DMA_FLAG_HTF | GD32_DMA_FLAG_ERRORS);
 	gd32_dma_channel_disable(cfg->reg, ch);
 	data->channels[ch].busy = false;
 
@@ -623,30 +631,38 @@ static void dma_gd32_isr(const struct device *dev)
 {
 	const struct dma_gd32_config *cfg = dev->config;
 	struct dma_gd32_data *data = dev->data;
-	uint32_t errflag, ftfflag;
-	int err = 0;
+	uint32_t errflag, ftfflag, htfflag;
+	int status;
 
 	for (uint32_t i = 0; i < cfg->channels; i++) {
 		errflag = gd32_dma_interrupt_flag_get(cfg->reg, i,
 						      GD32_DMA_FLAG_ERRORS);
-		ftfflag =
-			gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_FTF);
+		ftfflag = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_FTF);
+		htfflag = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_HTF);
 
-		if (errflag == 0 && ftfflag == 0) {
+		if (errflag == 0 && ftfflag == 0 && htfflag == 0) {
 			continue;
 		}
 
 		if (errflag) {
-			err = -EIO;
+			status = -EIO;
+		} else if (htfflag) {
+			status = DMA_STATUS_BLOCK;
+		} else {
+			status = 0;
 		}
 
-		gd32_dma_interrupt_flag_clear(
-			cfg->reg, i, DMA_FLAG_FTF | GD32_DMA_FLAG_ERRORS);
-		data->channels[i].busy = false;
+		gd32_dma_interrupt_flag_clear(cfg->reg, i,
+					      DMA_FLAG_FTF | DMA_FLAG_HTF |
+					      GD32_DMA_FLAG_ERRORS);
+
+		if (!data->channels[i].cyclic && (ftfflag || errflag)) {
+			data->channels[i].busy = false;
+		}
 
 		if (data->channels[i].callback) {
-			data->channels[i].callback(
-				dev, data->channels[i].user_data, i, err);
+			data->channels[i].callback(dev, data->channels[i].user_data, i,
+					      status);
 		}
 	}
 }
