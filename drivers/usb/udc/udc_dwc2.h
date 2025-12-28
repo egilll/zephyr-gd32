@@ -7,6 +7,7 @@
 #ifndef ZEPHYR_DRIVERS_USB_UDC_DWC2_H
 #define ZEPHYR_DRIVERS_USB_UDC_DWC2_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/usb/udc.h>
@@ -52,7 +53,9 @@ struct udc_dwc2_config {
 	void (*irq_disable_func)(const struct device *dev);
 	uint32_t ghwcfg1;
 	uint32_t ghwcfg2;
+	uint32_t ghwcfg3;
 	uint32_t ghwcfg4;
+	bool force_ghwcfg;
 };
 
 #include "udc_dwc2_vendor_quirks.h"
