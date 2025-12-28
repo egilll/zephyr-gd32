@@ -1,0 +1,23 @@
+# Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+config ENTROPY_GD32_TRNG
+    bool "GD32 TRNG entropy driver"
+    depends on DT_HAS_GD_GD32_TRNG_ENABLED
+    default y
+    select ENTROPY_HAS_DRIVER
+    select USE_GD32_TRNG
+    help
+      Enable the GD32 true random number generator (TRNG) entropy driver.
+
+if ENTROPY_GD32_TRNG
+
+config ENTROPY_GD32_POOL_SIZE
+    int "Entropy pool size"
+    range 8 512
+    default 32
+    help
+      Size in bytes of the single entropy pool filled by the TRNG ISR.
+      Must be a power of two.
+
+endif # ENTROPY_GD32_TRNG

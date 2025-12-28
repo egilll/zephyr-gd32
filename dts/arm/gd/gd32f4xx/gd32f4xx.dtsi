@@ -654,6 +654,15 @@
 			#dma-cells = <4>;
 			status = "disabled";
 		};
+
+		trng: trng@50060800 {
+			compatible = "gd,gd32-trng";
+			reg = <0x50060800 0x400>;
+			interrupts = <80 0>;
+			clocks = <&cctl GD32_CLOCK_TRNG>;
+			resets = <&rctl GD32_RESET_TRNG>;
+			status = "disabled";
+		};
 	};
 };
 

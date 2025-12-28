@@ -117,6 +117,15 @@
 			status = "okay";
 		};
 
+		trng: trng@50060800 {
+			compatible = "gd,gd32-trng";
+			reg = <0x50060800 0x400>;
+			interrupts = <63 0>;
+			clocks = <&cctl GD32_CLOCK_TRNG>;
+			resets = <&rctl GD32_RESET_TRNG>;
+			status = "disabled";
+		};
+
 		pinctrl: pin-controller@48000000 {
 			compatible = "gd,gd32-pinctrl-af";
 			reg = <0x48000000 0x1400>;

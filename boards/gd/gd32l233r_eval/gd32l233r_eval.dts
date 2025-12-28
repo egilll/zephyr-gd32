@@ -16,6 +16,7 @@
 	chosen {
 		zephyr,sram = &sram;
 		zephyr,flash = &flash0;
+		zephyr,entropy = &trng;
 		zephyr,console = &usart1;
 		zephyr,shell-uart = &usart1;
 		zephyr,flash-controller = &fmc;
@@ -98,4 +99,8 @@
 	status = "okay";
 	pinctrl-0 = <&adc0_default>;
 	pinctrl-names = "default";
+};
+
+&trng {
+	status = "okay";
 };
