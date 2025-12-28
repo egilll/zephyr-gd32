@@ -81,6 +81,52 @@
 		eeprom-0 = &eeprom0;
 		watchdog0 = &fwdgt;
 	};
+
+
+	sdio_slow: sdio_slow {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-2mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-2mhz";
+		};
+	};
+
+	sdio_default: sdio_default {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-25mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-25mhz";
+		};
+	};
+
+	sdio_fast: sdio_fast {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-50mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-50mhz";
+		};
+	};
 };
 
 &gpioa {
@@ -210,4 +256,21 @@
 	mck-enabled;
 	dmas = <&dma0 3 0 0 0>, <&dma0 4 0 0 0>;
 	dma-names = "rx", "tx";
+};
+
+&sdio {
+	status = "okay";
+	bus-width = <4>;
+	pinctrl-0 = <&sdio_default>;
+	pinctrl-1 = <&sdio_slow>;
+	pinctrl-2 = <&sdio_fast>;
+	pinctrl-names = "default", "slow", "fast";
+	/* Use a single DMA channel: DMA1 channel 3, sub-periph slot 4 */
+	dmas = <&dma1 3 4 0 0>;
+
+	mmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+		status = "okay";
+	};
 };

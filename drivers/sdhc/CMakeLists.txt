@@ -14,6 +14,7 @@ zephyr_library_sources_ifdef(CONFIG_SAM_HSMCI sam_hsmci.c)
 zephyr_library_sources_ifdef(CONFIG_SAM_SDMMC sam_sdmmc.c)
 zephyr_library_sources_ifdef(CONFIG_SDHC_AMBIQ sdhc_ambiq.c)
 zephyr_library_sources_ifdef(CONFIG_SDHC_ESP32 sdhc_esp32.c)
+zephyr_library_sources_ifdef(CONFIG_SDHC_GD32 sdhc_gd32.c)
 zephyr_library_sources_ifdef(CONFIG_SDHC_KINETIS sdhc_kinetis.c)
 zephyr_library_sources_ifdef(CONFIG_SDHC_INFINEON_CAT1 infineon_sdio.c)
 zephyr_library_sources_ifdef(CONFIG_SDHC_MAX32 sdhc_max32.c)
@@ -22,5 +23,4 @@ zephyr_library_sources_ifdef(CONFIG_SDHC_STM32_SDIO sdhc_stm32.c)
 zephyr_library_sources_ifdef(CONFIG_SPI_SDHC sdhc_spi.c)
 zephyr_library_sources_ifdef(CONFIG_XLNX_SDHC xlnx_sdhc.c)
 # zephyr-keep-sorted-stop
-
 endif()
