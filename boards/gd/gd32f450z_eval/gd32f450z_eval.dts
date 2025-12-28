@@ -171,3 +171,23 @@
 &trng {
 	status = "okay";
 };
+
+&enet {
+    status = "okay";
+    pinctrl-0 = <&enet_default>;
+    pinctrl-names = "default";
+    zephyr,random-mac-address;
+    phy-handle = <&eth_phy0>;
+};
+
+&mdio {
+    status = "okay";
+    pinctrl-0 = <&mdio_default>;
+    pinctrl-names = "default";
+
+    eth_phy0: ethernet-phy@1 {
+        compatible = "ethernet-phy";
+        reg = <1>;
+        no-reset;
+    };
+};

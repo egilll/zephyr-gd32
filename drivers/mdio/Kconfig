@@ -28,6 +28,7 @@ config MDIO_SHELL
 source "drivers/mdio/Kconfig.adin2111"
 source "drivers/mdio/Kconfig.dwcxgmac"
 source "drivers/mdio/Kconfig.esp32"
+source "drivers/mdio/Kconfig.gd32"
 source "drivers/mdio/Kconfig.gpio"
 source "drivers/mdio/Kconfig.intel_igc"
 source "drivers/mdio/Kconfig.lan865x"
