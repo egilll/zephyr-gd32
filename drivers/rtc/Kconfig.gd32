@@ -1,0 +1,32 @@
+# Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+config RTC_GD32
+    bool "GD32 RTC driver"
+    depends on DT_HAS_GD_GD32_RTC_ENABLED
+    default y
+    select USE_GD32_RTC
+    select USE_GD32_PMU
+    select USE_GD32_RCU
+    select USE_GD32_EXTI if RTC_ALARM || RTC_UPDATE
+    help
+      Enable the RTC driver for GD32 SoCs. The driver provides timekeeping
+      and optional alarm support using the on-chip backup domain.
+
+config RTC_GD32_OSC_TIMEOUT_MS
+	int "GD32 RTC oscillator stabilization timeout (ms)"
+	depends on RTC_GD32
+	default 2000
+	range 1 60000
+	help
+	  Maximum time to wait for the selected RTC clock source to stabilize
+	  during initialization.
+
+config RTC_GD32_REG_TIMEOUT_MS
+	int "GD32 RTC register operation timeout (ms)"
+	depends on RTC_GD32
+	default 100
+	range 1 60000
+	help
+	  Maximum time to wait for RTC register state transitions (e.g. INITF, RSYNF,
+	  WTWF, ALRMxWF) during configuration.

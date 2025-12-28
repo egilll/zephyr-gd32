@@ -1,0 +1,55 @@
+# Copyright (c) 2026, The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: GD32 RTC
+
+compatible: "gd,gd32-rtc"
+
+include:
+  - rtc.yaml
+  - rtc-device.yaml
+
+properties:
+  reg:
+    required: true
+
+  clock-source:
+    type: string
+    enum:
+      - lxtal
+      - irc32k
+      - hxtal
+    required: true
+    description: |
+      RTC clock source selection.
+      - lxtal: external 32.768 kHz crystal
+      - irc32k: internal 32 kHz RC
+      - hxtal: high-speed external oscillator divided by RTCDIV
+
+  hxtal-div:
+    type: int
+    description: HXTAL division factor when clock-source is "hxtal" (2..31)
+    default: 2
+
+  lxtal-drive-high:
+    type: boolean
+    description: Enable higher drive strength for the LXTAL oscillator
+
+  alarms-count:
+    const: 1
+
+  interrupts:
+    required: true
+    description: |
+      Interrupts must include (in order):
+      - RTC_Alarm_IRQn
+      - TAMPER_STAMP_IRQn
+      - RTC_WKUP_IRQn (used for CONFIG_RTC_UPDATE)
+
+  interrupt-names:
+    required: true
+    description: |
+      Interrupt names must match the interrupts order:
+      - "alarm"
+      - "tamper-stamp"
+      - "wakeup"

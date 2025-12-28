@@ -168,6 +168,12 @@
 	status = "okay";
 };
 
+&rtc {
+    status = "okay";
+    clock-source = "lxtal";
+    alarms-count = <1>;
+};
+
 &trng {
 	status = "okay";
 };
