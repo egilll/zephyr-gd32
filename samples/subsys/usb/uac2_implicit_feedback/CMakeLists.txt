@@ -9,6 +9,8 @@ target_sources(app PRIVATE src/main.c)
 
 if(CONFIG_SOC_COMPATIBLE_NRF5340_CPUAPP OR CONFIG_SOC_SERIES_NRF54H)
   target_sources(app PRIVATE src/feedback_nrf.c)
+elseif(CONFIG_SOC_FAMILY_GD_GD32)
+  target_sources(app PRIVATE src/feedback_gd32.c)
 else()
   target_sources(app PRIVATE src/feedback_dummy.c)
 endif()

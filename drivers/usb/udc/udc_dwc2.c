@@ -133,6 +133,7 @@ struct udc_dwc2_data {
 	uint16_t rxfifo_depth;
 	uint16_t max_txfifo_depth[16];
 	uint16_t sof_num;
+	uint32_t sof_cycle;
 	/* Configuration flags */
 	unsigned int dynfifosizing : 1;
 	unsigned int bufferdma : 1;

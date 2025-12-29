@@ -1,0 +1,12 @@
+/*
+ * Copyright (c) 2026 Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* Pull in the common UAC2 devicetree description for this sample. */
+#include "../app.overlay"
+
+/* Provide a stable node label for samples that expect a single full-duplex I2S
+ * device for both RX and TX.
+ */
+i2s_rxtx: &i2s1 {};

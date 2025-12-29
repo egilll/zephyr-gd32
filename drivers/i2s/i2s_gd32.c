@@ -75,6 +75,7 @@ struct stream {
 
 	void *mem_block;
 	size_t mem_block_size;
+	uint32_t last_block_start_cycle;
 
 	bool master;
 	bool tx_stop_for_drain;
@@ -405,6 +406,7 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	const uint32_t count = gd32_i2s_dma_xfer_count(stream->mem_block_size);
 	(void)dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)stream->mem_block,
 			 (uint32_t)&SPI_DATA(cfg->reg), count);
+	stream->last_block_start_cycle = k_cycle_get_32();
 	(void)dma_start(stream->dma_dev, stream->dma_channel);
 
 	k_spin_unlock(&data->lock, key);
@@ -595,11 +597,19 @@ static int gd32_i2s_stream_start(struct stream *stream)
 		gd32_i2s_request_tx_disable(stream);
 		return ret;
 	}
+	stream->last_block_start_cycle = k_cycle_get_32();
 
 	SPI_CTL1(cfg->reg) |= SPI_CTL1_ERRIE;
 	spi_dma_enable(cfg->reg, SPI_DMA_TRANSMIT);
 	i2s_enable(cfg->reg);
 	return 0;
+}
+
+uint32_t i2s_gd32_tx_block_start_cycle_get(const struct device *dev)
+{
+	struct i2s_gd32_data *data = dev->data;
+
+	return data->tx.last_block_start_cycle;
 }
 
 static void gd32_i2s_stream_disable(struct stream *stream)
