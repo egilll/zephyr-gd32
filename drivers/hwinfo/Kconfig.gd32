@@ -1,0 +1,18 @@
+# Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+config HWINFO_GD32
+	bool "GD32 HWINFO"
+	default y
+	depends on SOC_SERIES_GD32F4XX
+	select HWINFO_HAS_DRIVER
+	help
+	  Enable HWINFO support for GD32F4xx.
+
+	  This driver provides:
+	  - Device unique ID (96-bit UID) readout via the GD32 UID registers.
+	  - Reset cause reporting via the RCU reset status register (RCU_RSTSCK).
+
+	  Supported reset causes are reported based on the reset flag macros
+	  available in the GigaDevice HAL headers (for example external pin reset,
+	  watchdog reset, software reset, brownout reset, power-on reset).
