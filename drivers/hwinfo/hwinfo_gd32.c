@@ -9,16 +9,8 @@
 #include <string.h>
 
 #include <soc.h>
-#include <gd32f4xx.h>
+#include <gd32_regs.h>
 #include <zephyr/sys/byteorder.h>
-
-/* GD32F4xx Device electronic signature (Unique ID) base address.
- * According to GD32F4xx reference manual, the 96-bit UID is located at:
- * 0x1FFF7A10 (word0), 0x1FFF7A14 (word1), 0x1FFF7A18 (word2).
- */
-#ifndef GD32_UID_BASE
-#define GD32_UID_BASE 0x1FFF7A10U
-#endif
 
 ssize_t z_impl_hwinfo_get_device_id(uint8_t *buffer, size_t length)
 {
@@ -43,7 +35,7 @@ int z_impl_hwinfo_get_supported_reset_cause(uint32_t *supported)
 {
 	uint32_t sup = 0U;
 
-#if defined(RCU_RSTSCK_PINRSTF) || defined(RCU_RSTSCK_EPRSTF)
+#if defined(RCU_RSTSCK_EPRSTF)
 	sup |= RESET_PIN;
 #endif
 #if defined(RCU_RSTSCK_SWRSTF)
@@ -55,8 +47,32 @@ int z_impl_hwinfo_get_supported_reset_cause(uint32_t *supported)
 #if defined(RCU_RSTSCK_PORRSTF)
 	sup |= RESET_POR;
 #endif
-#if defined(RCU_RSTSCK_WWDGRSTF) || defined(RCU_RSTSCK_IWDGRSTF) || defined(RCU_RSTSCK_FWDGTRSTF)
+#if defined(RCU_RSTSCK_WWDGTRSTF) || defined(RCU_RSTSCK_FWDGTRSTF)
 	sup |= RESET_WATCHDOG;
+#endif
+#if defined(RCU_RSTSCK_LPRSTF)
+	sup |= RESET_LOW_POWER_WAKE;
+#endif
+#if defined(RCU_RSTSCK_OBLRSTF)
+	sup |= RESET_FLASH;
+#endif
+#if defined(RCU_RSTSCK_V11RSTF) || defined(RCU_RSTSCK_V12RSTF)
+	sup |= RESET_POR;
+#endif
+#if defined(RCU_RSTSCK_LOCKUPRSTF)
+	sup |= RESET_CPU_LOCKUP;
+#endif
+#if defined(RCU_RSTSCK_LVDRSTF)
+	sup |= RESET_BROWNOUT;
+#endif
+#if defined(RCU_RSTSCK_LOHRSTF)
+	sup |= RESET_CLOCK;
+#endif
+#if defined(RCU_RSTSCK_LOPRSTF)
+	sup |= RESET_PLL;
+#endif
+#if defined(RCU_RSTSCK_ECCRSTF)
+	sup |= RESET_PARITY;
 #endif
 
 	*supported = sup;
@@ -69,23 +85,13 @@ int z_impl_hwinfo_get_reset_cause(uint32_t *cause)
 	uint32_t flags = 0U;
 	uint32_t rsts = RCU_RSTSCK;
 
-#if defined(RCU_RSTSCK_PINRSTF)
-	if (rsts & RCU_RSTSCK_PINRSTF) {
-		flags |= RESET_PIN;
-	}
-#endif
 #if defined(RCU_RSTSCK_EPRSTF)
 	if (rsts & RCU_RSTSCK_EPRSTF) {
 		flags |= RESET_PIN;
 	}
 #endif
-#if defined(RCU_RSTSCK_WWDGRSTF)
-	if (rsts & RCU_RSTSCK_WWDGRSTF) {
-		flags |= RESET_WATCHDOG;
-	}
-#endif
-#if defined(RCU_RSTSCK_IWDGRSTF)
-	if (rsts & RCU_RSTSCK_IWDGRSTF) {
+#if defined(RCU_RSTSCK_WWDGTRSTF)
+	if (rsts & RCU_RSTSCK_WWDGTRSTF) {
 		flags |= RESET_WATCHDOG;
 	}
 #endif
@@ -107,6 +113,51 @@ int z_impl_hwinfo_get_reset_cause(uint32_t *cause)
 #if defined(RCU_RSTSCK_PORRSTF)
 	if (rsts & RCU_RSTSCK_PORRSTF) {
 		flags |= RESET_POR;
+	}
+#endif
+#if defined(RCU_RSTSCK_LPRSTF)
+	if (rsts & RCU_RSTSCK_LPRSTF) {
+		flags |= RESET_LOW_POWER_WAKE;
+	}
+#endif
+#if defined(RCU_RSTSCK_OBLRSTF)
+	if (rsts & RCU_RSTSCK_OBLRSTF) {
+		flags |= RESET_FLASH;
+	}
+#endif
+#if defined(RCU_RSTSCK_V11RSTF)
+	if (rsts & RCU_RSTSCK_V11RSTF) {
+		flags |= RESET_POR;
+	}
+#endif
+#if defined(RCU_RSTSCK_V12RSTF)
+	if (rsts & RCU_RSTSCK_V12RSTF) {
+		flags |= RESET_POR;
+	}
+#endif
+#if defined(RCU_RSTSCK_LOCKUPRSTF)
+	if (rsts & RCU_RSTSCK_LOCKUPRSTF) {
+		flags |= RESET_CPU_LOCKUP;
+	}
+#endif
+#if defined(RCU_RSTSCK_LVDRSTF)
+	if (rsts & RCU_RSTSCK_LVDRSTF) {
+		flags |= RESET_BROWNOUT;
+	}
+#endif
+#if defined(RCU_RSTSCK_LOHRSTF)
+	if (rsts & RCU_RSTSCK_LOHRSTF) {
+		flags |= RESET_CLOCK;
+	}
+#endif
+#if defined(RCU_RSTSCK_LOPRSTF)
+	if (rsts & RCU_RSTSCK_LOPRSTF) {
+		flags |= RESET_PLL;
+	}
+#endif
+#if defined(RCU_RSTSCK_ECCRSTF)
+	if (rsts & RCU_RSTSCK_ECCRSTF) {
+		flags |= RESET_PARITY;
 	}
 #endif
 

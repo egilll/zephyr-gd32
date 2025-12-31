@@ -4,10 +4,10 @@
 config HWINFO_GD32
 	bool "GD32 HWINFO"
 	default y
-	depends on SOC_SERIES_GD32F4XX
+	depends on SOC_FAMILY_GD_GD32
 	select HWINFO_HAS_DRIVER
 	help
-	  Enable HWINFO support for GD32F4xx.
+	  Enable HWINFO support for GD32.
 
 	  This driver provides:
 	  - Device unique ID (96-bit UID) readout via the GD32 UID registers.
