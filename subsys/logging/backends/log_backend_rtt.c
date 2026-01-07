@@ -10,6 +10,7 @@
 #include <zephyr/logging/log_output_dict.h>
 #include <zephyr/logging/log_backend_std.h>
 #include <SEGGER_RTT.h>
+#include <string.h>
 
 #ifndef CONFIG_LOG_BACKEND_RTT_BUFFER_SIZE
 #define CONFIG_LOG_BACKEND_RTT_BUFFER_SIZE 0
@@ -260,6 +261,39 @@ static const log_output_func_t logging_func =
 	: IS_ENABLED(CONFIG_LOG_BACKEND_RTT_MODE_OVERWRITE) ? data_out_overwrite_mode
 							    : data_out_drop_mode;
 
+static const char *rtt_color_for_level(uint8_t level)
+{
+#if IS_ENABLED(CONFIG_BREEZE_RTT) && !defined(CONFIG_LOG_BACKEND_RTT_OUTPUT_DICTIONARY_HEX)
+	switch (level) {
+	case LOG_LEVEL_ERR:
+		return RTT_CTRL_TEXT_BRIGHT_RED;
+	case LOG_LEVEL_WRN:
+		return RTT_CTRL_TEXT_BRIGHT_YELLOW;
+	case LOG_LEVEL_INF:
+		return RTT_CTRL_TEXT_BRIGHT_CYAN;
+	case LOG_LEVEL_DBG:
+	default:
+		return RTT_CTRL_TEXT_BRIGHT_BLACK;
+	}
+#else
+	ARG_UNUSED(level);
+	return NULL;
+#endif
+}
+
+static void rtt_write_ctrl(const char *s)
+{
+#if IS_ENABLED(CONFIG_BREEZE_RTT) && !defined(CONFIG_LOG_BACKEND_RTT_OUTPUT_DICTIONARY_HEX)
+	if (s == NULL) {
+		return;
+	}
+	/* Use the same RTT write path as normal log output. */
+	(void)logging_func((uint8_t *)s, strlen(s), NULL);
+#else
+	ARG_UNUSED(s);
+#endif
+}
+
 static int data_out(uint8_t *data, size_t length, void *ctx)
 {
 #if defined(CONFIG_LOG_BACKEND_RTT_OUTPUT_DICTIONARY_HEX)
@@ -333,7 +367,17 @@ static void process(const struct log_backend *const backend,
 
 	log_format_func_t log_output_func = log_format_func_t_get(log_format_current);
 
+	/* Breeze provides custom RTT coloring; disable Zephyr's built-in coloring
+	 * (which makes INFO green) to avoid conflicting ANSI codes.
+	 */
+#if IS_ENABLED(CONFIG_BREEZE_RTT) && !defined(CONFIG_LOG_BACKEND_RTT_OUTPUT_DICTIONARY_HEX)
+	flags &= ~LOG_OUTPUT_FLAG_COLORS;
+#endif
+
+	const char *color = rtt_color_for_level(log_msg_get_level(&msg->log));
+	rtt_write_ctrl(color);
 	log_output_func(&log_output_rtt, &msg->log, flags);
+	rtt_write_ctrl(RTT_CTRL_RESET);
 }
 
 static int format_set(const struct log_backend *const backend, uint32_t log_type)
