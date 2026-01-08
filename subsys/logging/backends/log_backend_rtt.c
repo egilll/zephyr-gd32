@@ -331,6 +331,9 @@ static void log_backend_rtt_init(struct log_backend const *const backend)
 		log_backend_rtt_cfg();
 	}
 
+	// clear the terminal before new output
+	SEGGER_RTT_WriteString(CONFIG_LOG_BACKEND_RTT_BUFFER, "\x1B[2J\x1B[H");
+
 #if defined(CONFIG_LOG_BACKEND_RTT_OUTPUT_DICTIONARY_HEX)
 	logging_func((uint8_t *)LOG_HEX_SEP, sizeof(LOG_HEX_SEP), NULL);
 #endif
