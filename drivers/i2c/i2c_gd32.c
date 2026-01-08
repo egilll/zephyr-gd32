@@ -16,6 +16,8 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/sys/clock.h>
+#include <zephyr/sys/util.h>
 
 #ifdef CONFIG_I2C_GD32_DMA
 #include <string.h>
@@ -41,6 +43,17 @@ LOG_MODULE_REGISTER(i2c_gd32, CONFIG_I2C_LOG_LEVEL);
 #define I2C_GD32_ERR_DMA BIT(3)
 /* I2C bus busy */
 #define I2C_GD32_ERR_BUSY BIT(4)
+/* I2C transfer timeout */
+#define I2C_GD32_ERR_TIMEOUT BIT(5)
+
+/*
+ * Use a length-scaled timeout to avoid hanging forever while still allowing
+ * long transfers (including DMA) to complete.
+ */
+#define I2C_GD32_TIMEOUT_MIN_MS 100U
+#define I2C_GD32_TIMEOUT_FACTOR 4U
+#define I2C_GD32_TIMEOUT_MARGIN_US (100U * USEC_PER_MSEC)
+#define I2C_GD32_STOP_TIMEOUT_MS 1000U
 
 #ifdef CONFIG_I2C_GD32_DMA
 struct i2c_gd32_dma_config {
@@ -86,6 +99,266 @@ struct i2c_gd32_data {
 	uint32_t dma_channel;
 #endif
 };
+
+static inline void i2c_gd32_disable_interrupts(const struct i2c_gd32_config *cfg);
+#ifdef CONFIG_I2C_GD32_DMA
+static void i2c_gd32_dma_cleanup(const struct device *dev);
+#endif
+
+static uint32_t i2c_gd32_bitrate_hz(const struct i2c_gd32_data *data,
+				   const struct i2c_gd32_config *cfg)
+{
+	switch (I2C_SPEED_GET(data->dev_config)) {
+	case I2C_SPEED_STANDARD:
+		return I2C_BITRATE_STANDARD;
+	case I2C_SPEED_FAST:
+		return I2C_BITRATE_FAST;
+#ifdef I2C_FMPCFG
+	case I2C_SPEED_FAST_PLUS:
+		return I2C_BITRATE_FAST_PLUS;
+#endif
+	default:
+		return cfg->bitrate;
+	}
+}
+
+static k_timeout_t i2c_gd32_xfer_timeout(const struct device *dev)
+{
+	const struct i2c_gd32_config *cfg = dev->config;
+	struct i2c_gd32_data *data = dev->data;
+	const uint32_t bitrate_hz = i2c_gd32_bitrate_hz(data, cfg);
+	const uint32_t addr_bytes = (data->dev_config & I2C_ADDR_10_BITS) ? 2U : 1U;
+	const uint64_t bytes = (uint64_t)data->xfer_len + addr_bytes + 2U;
+	uint64_t timeout_us;
+	uint64_t timeout_ms;
+	uint64_t byte_time_us;
+
+	if (bitrate_hz == 0U) {
+		return K_MSEC(I2C_GD32_TIMEOUT_MIN_MS);
+	}
+
+	byte_time_us = DIV_ROUND_UP((uint64_t)USEC_PER_SEC, bitrate_hz) * 9U;
+
+	if (bytes > (UINT64_MAX / byte_time_us)) {
+		timeout_us = UINT64_MAX;
+	} else {
+		timeout_us = bytes * byte_time_us;
+	}
+
+	if (timeout_us > (UINT64_MAX / I2C_GD32_TIMEOUT_FACTOR)) {
+		timeout_us = UINT64_MAX;
+	} else {
+		timeout_us *= I2C_GD32_TIMEOUT_FACTOR;
+	}
+
+	if (timeout_us > (UINT64_MAX - I2C_GD32_TIMEOUT_MARGIN_US)) {
+		timeout_us = UINT64_MAX;
+	} else {
+		timeout_us += I2C_GD32_TIMEOUT_MARGIN_US;
+	}
+
+	timeout_ms = DIV_ROUND_UP(timeout_us, USEC_PER_MSEC);
+	timeout_ms = MAX(timeout_ms, (uint64_t)I2C_GD32_TIMEOUT_MIN_MS);
+	timeout_ms = MIN(timeout_ms, (uint64_t)INT32_MAX);
+
+	return K_MSEC((int32_t)timeout_ms);
+}
+
+static void i2c_gd32_xfer_cancel(const struct device *dev)
+{
+	const struct i2c_gd32_config *cfg = dev->config;
+
+	i2c_gd32_disable_interrupts(cfg);
+
+#ifdef CONFIG_I2C_GD32_DMA
+	i2c_gd32_dma_cleanup(dev);
+#endif
+
+	/* Enter stop condition */
+	I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+}
+
+static int i2c_gd32_wait_bus_idle(const struct device *dev, k_timeout_t timeout)
+{
+	const struct i2c_gd32_config *cfg = dev->config;
+	const k_timepoint_t end = sys_timepoint_calc(timeout);
+
+	while (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
+		if (sys_timepoint_expired(end)) {
+			return -ETIMEDOUT;
+		}
+		k_sleep(K_MSEC(1));
+	}
+
+	return 0;
+}
+
+static int i2c_gd32_apply_config(const struct device *dev, uint32_t dev_config)
+{
+	struct i2c_gd32_data *data = dev->data;
+	const struct i2c_gd32_config *cfg = dev->config;
+	uint32_t pclk1, freq, clkc;
+	int err = 0;
+
+	/* Disable I2C device */
+	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
+
+	(void)clock_control_get_rate(GD32_CLOCK_CONTROLLER,
+				     (clock_control_subsys_t)&cfg->clkid,
+				     &pclk1);
+
+	/* i2c clock frequency, us */
+	freq = pclk1 / 1000000U;
+	if (freq > I2CCLK_MAX) {
+		LOG_ERR("I2C max clock freq %u, current is %u\n",
+			I2CCLK_MAX, freq);
+		err = -ENOTSUP;
+		goto out;
+	}
+
+	/*
+	 * Refer from SoC user manual.
+	 * In standard mode:
+	 *   T_high = CLKC * T_pclk1
+	 *   T_low  = CLKC * T_pclk1
+	 *
+	 * In fast mode and fast mode plus with DTCY=1:
+	 *   T_high = 9 * CLKC * T_pclk1
+	 *   T_low  = 16 * CLKC * T_pclk1
+	 *
+	 * T_pclk1 is reciprocal of pclk1:
+	 *   T_pclk1 = 1 / pclk1
+	 *
+	 * T_high and T_low construct the bit transfer:
+	 *  T_high + T_low = 1 / bitrate
+	 *
+	 * And then, we can get the CLKC equation.
+	 * Standard mode:
+	 *   CLKC = pclk1 / (bitrate * 2)
+	 * Fast mode and fast mode plus:
+	 *   CLKC = pclk1 / (bitrate * 25)
+	 *
+	 * Variable list:
+	 *   T_high:  high period of the SCL clock
+	 *   T_low:   low period of the SCL clock
+	 *   T_pclk1: duration of single pclk1 pulse
+	 *   pclk1:   i2c device clock frequency
+	 *   bitrate: 100 Kbits for standard mode
+	 */
+	switch (I2C_SPEED_GET(dev_config)) {
+	case I2C_SPEED_STANDARD:
+		if (freq < I2CCLK_MIN) {
+			LOG_ERR("I2C standard-mode min clock freq %u, current is %u\n",
+				I2CCLK_MIN, freq);
+			err = -ENOTSUP;
+			goto out;
+		}
+		I2C_CTL1(cfg->reg) &= ~I2C_CTL1_I2CCLK;
+		I2C_CTL1(cfg->reg) |= freq;
+
+		/* Standard-mode risetime maximum value: 1000ns */
+		if (freq == I2CCLK_MAX) {
+			I2C_RT(cfg->reg) = I2CCLK_MAX;
+		} else {
+			I2C_RT(cfg->reg) = freq + 1U;
+		}
+
+		/* CLKC = pclk1 / (bitrate * 2) */
+		clkc = pclk1 / (I2C_BITRATE_STANDARD * 2U);
+
+		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
+		I2C_CKCFG(cfg->reg) |= clkc;
+		/* standard-mode */
+		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_FAST;
+
+		break;
+	case I2C_SPEED_FAST:
+		if (freq < I2CCLK_FM_MIN) {
+			LOG_ERR("I2C fast-mode min clock freq %u, current is %u\n",
+				I2CCLK_FM_MIN, freq);
+			err = -ENOTSUP;
+			goto out;
+		}
+
+		/* Fast-mode risetime maximum value: 300ns */
+		I2C_RT(cfg->reg) = freq * 300U / 1000U + 1U;
+
+		/* CLKC = pclk1 / (bitrate * 25) */
+		clkc = pclk1 / (I2C_BITRATE_FAST * 25U);
+		if (clkc == 0U) {
+			clkc = 1U;
+		}
+
+		/* Default DCTY to 1 */
+		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
+		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
+		I2C_CKCFG(cfg->reg) |= clkc;
+		/* Transfer mode: fast-mode */
+		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_FAST;
+
+#ifdef I2C_FMPCFG
+		/* Disable transfer mode: fast-mode plus */
+		I2C_FMPCFG(cfg->reg) &= ~I2C_FMPCFG_FMPEN;
+#endif /* I2C_FMPCFG */
+
+		break;
+#ifdef I2C_FMPCFG
+	case I2C_SPEED_FAST_PLUS:
+		if (freq < I2CCLK_FM_PLUS_MIN) {
+			LOG_ERR("I2C fast-mode plus min clock freq %u, current is %u\n",
+				I2CCLK_FM_PLUS_MIN, freq);
+			err = -ENOTSUP;
+			goto out;
+		}
+
+		/* Fast-mode plus risetime maximum value: 120ns */
+		I2C_RT(cfg->reg) = freq * 120U / 1000U + 1U;
+
+		/* CLKC = pclk1 / (bitrate * 25) */
+		clkc = pclk1 / (I2C_BITRATE_FAST_PLUS * 25U);
+		if (clkc == 0U) {
+			clkc = 1U;
+		}
+
+		/* Default DCTY to 1 */
+		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
+		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
+		I2C_CKCFG(cfg->reg) |= clkc;
+		/* Transfer mode: fast-mode */
+		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_FAST;
+
+		/* Enable transfer mode: fast-mode plus */
+		I2C_FMPCFG(cfg->reg) |= I2C_FMPCFG_FMPEN;
+
+		break;
+#endif /* I2C_FMPCFG */
+	default:
+		err = -EINVAL;
+		goto out;
+	}
+
+	data->dev_config = dev_config;
+
+out:
+	return err;
+}
+
+static void i2c_gd32_recover(const struct device *dev)
+{
+	struct i2c_gd32_data *data = dev->data;
+	const struct i2c_gd32_config *cfg = dev->config;
+	const uint32_t dev_config = data->dev_config;
+
+	i2c_gd32_xfer_cancel(dev);
+
+	/* Disable I2C device and reset the peripheral state machine. */
+	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
+	I2C_CTL0(cfg->reg) |= I2C_CTL0_SRESET;
+	k_sleep(K_MSEC(1));
+	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_SRESET;
+
+	(void)i2c_gd32_apply_config(dev, dev_config);
+}
 
 static inline void i2c_gd32_enable_interrupts(const struct i2c_gd32_config *cfg)
 {
@@ -383,6 +656,11 @@ static void i2c_gd32_error_isr(const struct device *dev)
 		data->errs |= I2C_GD32_ERR_AERR;
 	}
 
+	if (stat & I2C_STAT0_SMBTO) {
+		I2C_STAT0(cfg->reg) &= ~I2C_STAT0_SMBTO;
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+	}
+
 	if (data->errs != 0U) {
 		/* Enter stop condition */
 		I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
@@ -419,6 +697,10 @@ static void i2c_gd32_log_err(struct i2c_gd32_data *data)
 
 	if (data->errs & I2C_GD32_ERR_BUSY) {
 		LOG_ERR("I2C bus busy");
+	}
+
+	if (data->errs & I2C_GD32_ERR_TIMEOUT) {
+		LOG_ERR("Transfer timed out");
 	}
 }
 
@@ -600,19 +882,27 @@ static int i2c_gd32_xfer_end(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	int ret;
 
 	i2c_gd32_disable_interrupts(cfg);
 
 	/* Wait for stop condition is done. */
-	while (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-		/* NOP */
+	ret = i2c_gd32_wait_bus_idle(dev, K_MSEC(I2C_GD32_STOP_TIMEOUT_MS));
+	if (ret != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		i2c_gd32_xfer_cancel(dev);
 	}
 
 #ifdef CONFIG_I2C_GD32_DMA
 	i2c_gd32_dma_cleanup(dev);
 #endif
 
-	if (data->errs) {
+	if (data->errs & I2C_GD32_ERR_TIMEOUT) {
+		i2c_gd32_recover(dev);
+		return -ETIMEDOUT;
+	}
+
+	if (data->errs != 0U) {
 		return -EIO;
 	}
 
@@ -631,7 +921,10 @@ static int i2c_gd32_msg_read(const struct device *dev)
 
 	i2c_gd32_xfer_begin(dev);
 
-	k_sem_take(&data->sync_sem, K_FOREVER);
+	if (k_sem_take(&data->sync_sem, i2c_gd32_xfer_timeout(dev)) != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		i2c_gd32_xfer_cancel(dev);
+	}
 
 	return i2c_gd32_xfer_end(dev);
 }
@@ -648,7 +941,10 @@ static int i2c_gd32_msg_write(const struct device *dev)
 
 	i2c_gd32_xfer_begin(dev);
 
-	k_sem_take(&data->sync_sem, K_FOREVER);
+	if (k_sem_take(&data->sync_sem, i2c_gd32_xfer_timeout(dev)) != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		i2c_gd32_xfer_cancel(dev);
+	}
 
 	return i2c_gd32_xfer_end(dev);
 }
@@ -766,151 +1062,12 @@ static int i2c_gd32_configure(const struct device *dev,
 			      uint32_t dev_config)
 {
 	struct i2c_gd32_data *data = dev->data;
-	const struct i2c_gd32_config *cfg = dev->config;
-	uint32_t pclk1, freq, clkc;
-	int err = 0;
+	int err;
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
 
-	/* Disable I2C device */
-	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
+	err = i2c_gd32_apply_config(dev, dev_config);
 
-	(void)clock_control_get_rate(GD32_CLOCK_CONTROLLER,
-				     (clock_control_subsys_t)&cfg->clkid,
-				     &pclk1);
-
-	/* i2c clock frequency, us */
-	freq = pclk1 / 1000000U;
-	if (freq > I2CCLK_MAX) {
-		LOG_ERR("I2C max clock freq %u, current is %u\n",
-			I2CCLK_MAX, freq);
-		err = -ENOTSUP;
-		goto error;
-	}
-
-	/*
-	 * Refer from SoC user manual.
-	 * In standard mode:
-	 *   T_high = CLKC * T_pclk1
-	 *   T_low  = CLKC * T_pclk1
-	 *
-	 * In fast mode and fast mode plus with DTCY=1:
-	 *   T_high = 9 * CLKC * T_pclk1
-	 *   T_low  = 16 * CLKC * T_pclk1
-	 *
-	 * T_pclk1 is reciprocal of pclk1:
-	 *   T_pclk1 = 1 / pclk1
-	 *
-	 * T_high and T_low construct the bit transfer:
-	 *  T_high + T_low = 1 / bitrate
-	 *
-	 * And then, we can get the CLKC equation.
-	 * Standard mode:
-	 *   CLKC = pclk1 / (bitrate * 2)
-	 * Fast mode and fast mode plus:
-	 *   CLKC = pclk1 / (bitrate * 25)
-	 *
-	 * Variable list:
-	 *   T_high:  high period of the SCL clock
-	 *   T_low:   low period of the SCL clock
-	 *   T_pclk1: duration of single pclk1 pulse
-	 *   pclk1:   i2c device clock frequency
-	 *   bitrate: 100 Kbits for standard mode
-	 */
-	switch (I2C_SPEED_GET(dev_config)) {
-	case I2C_SPEED_STANDARD:
-		if (freq < I2CCLK_MIN) {
-			LOG_ERR("I2C standard-mode min clock freq %u, current is %u\n",
-				I2CCLK_MIN, freq);
-			err = -ENOTSUP;
-			goto error;
-		}
-		I2C_CTL1(cfg->reg) &= ~I2C_CTL1_I2CCLK;
-		I2C_CTL1(cfg->reg) |= freq;
-
-		/* Standard-mode risetime maximum value: 1000ns */
-		if (freq == I2CCLK_MAX) {
-			I2C_RT(cfg->reg) = I2CCLK_MAX;
-		} else {
-			I2C_RT(cfg->reg) = freq + 1U;
-		}
-
-		/* CLKC = pclk1 / (bitrate * 2) */
-		clkc = pclk1 / (I2C_BITRATE_STANDARD * 2U);
-
-		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
-		I2C_CKCFG(cfg->reg) |= clkc;
-		/* standard-mode */
-		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_FAST;
-
-		break;
-	case I2C_SPEED_FAST:
-		if (freq < I2CCLK_FM_MIN) {
-			LOG_ERR("I2C fast-mode min clock freq %u, current is %u\n",
-				I2CCLK_FM_MIN, freq);
-			err = -ENOTSUP;
-			goto error;
-		}
-
-		/* Fast-mode risetime maximum value: 300ns */
-		I2C_RT(cfg->reg) = freq * 300U / 1000U + 1U;
-
-		/* CLKC = pclk1 / (bitrate * 25) */
-		clkc = pclk1 / (I2C_BITRATE_FAST * 25U);
-		if (clkc == 0U) {
-			clkc = 1U;
-		}
-
-		/* Default DCTY to 1 */
-		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
-		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
-		I2C_CKCFG(cfg->reg) |= clkc;
-		/* Transfer mode: fast-mode */
-		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_FAST;
-
-#ifdef I2C_FMPCFG
-		/* Disable transfer mode: fast-mode plus */
-		I2C_FMPCFG(cfg->reg) &= ~I2C_FMPCFG_FMPEN;
-#endif /* I2C_FMPCFG */
-
-		break;
-#ifdef I2C_FMPCFG
-	case I2C_SPEED_FAST_PLUS:
-		if (freq < I2CCLK_FM_PLUS_MIN) {
-			LOG_ERR("I2C fast-mode plus min clock freq %u, current is %u\n",
-				I2CCLK_FM_PLUS_MIN, freq);
-			err = -ENOTSUP;
-			goto error;
-		}
-
-		/* Fast-mode plus risetime maximum value: 120ns */
-		I2C_RT(cfg->reg) = freq * 120U / 1000U + 1U;
-
-		/* CLKC = pclk1 / (bitrate * 25) */
-		clkc = pclk1 / (I2C_BITRATE_FAST_PLUS * 25U);
-		if (clkc == 0U) {
-			clkc = 1U;
-		}
-
-		/* Default DCTY to 1 */
-		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
-		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
-		I2C_CKCFG(cfg->reg) |= clkc;
-		/* Transfer mode: fast-mode */
-		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_FAST;
-
-		/* Enable transfer mode: fast-mode plus */
-		I2C_FMPCFG(cfg->reg) |= I2C_FMPCFG_FMPEN;
-
-		break;
-#endif /* I2C_FMPCFG */
-	default:
-		err = -EINVAL;
-		goto error;
-	}
-
-	data->dev_config = dev_config;
-error:
 	k_sem_give(&data->bus_mutex);
 
 	return err;
