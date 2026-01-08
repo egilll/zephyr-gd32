@@ -684,7 +684,7 @@ static int gd32_sdhc_get_card_present(const struct device *dev)
 	}
 	bool present = (v > 0);
 
-	if ((cfg->cd_gpio.dt_flags & GPIO_ACTIVE_LOW) != 0U) {
+	if ((cfg->cd_gpio.dt_flags & GPIO_ACTIVE_HIGH) != 0U) {
 		present = !present;
 	}
 
