@@ -13,6 +13,7 @@
 #include <zephyr/drivers/clock_control/gd32.h>
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/i2c.h>
@@ -32,15 +33,36 @@ LOG_MODULE_REGISTER(i2c_gd32, CONFIG_I2C_LOG_LEVEL);
 #include "i2c-priv.h"
 
 /* Bus error */
-#define I2C_GD32_ERR_BERR BIT(0)
+#define I2C_GD32_ERR_BERR    BIT(0)
 /* Arbitration lost */
-#define I2C_GD32_ERR_LARB BIT(1)
+#define I2C_GD32_ERR_LARB    BIT(1)
 /* No ACK received */
-#define I2C_GD32_ERR_AERR BIT(2)
+#define I2C_GD32_ERR_AERR    BIT(2)
+/* Over-run or under-run */
+#define I2C_GD32_ERR_OUERR   BIT(3)
+/* PEC error */
+#define I2C_GD32_ERR_PECERR  BIT(4)
+/* SMBus timeout */
+#define I2C_GD32_ERR_SMBTO   BIT(5)
+/* SMBus alert */
+#define I2C_GD32_ERR_SMBALT  BIT(6)
 /* DMA transfer error */
-#define I2C_GD32_ERR_DMA BIT(3)
+#define I2C_GD32_ERR_DMA     BIT(7)
 /* I2C bus busy */
-#define I2C_GD32_ERR_BUSY BIT(4)
+#define I2C_GD32_ERR_BUSY    BIT(8)
+/* Transfer timeout */
+#define I2C_GD32_ERR_TIMEOUT BIT(9)
+
+/*
+ * Conservative timeout: allow slow devices/clock stretching, but still recover
+ * if the peripheral/IRQs become unresponsive.
+ */
+#define I2C_GD32_SYNC_TIMEOUT_BASE_US         200000U
+#define I2C_GD32_SYNC_TIMEOUT_PER_BYTE_FACTOR 20U
+#define I2C_GD32_SYNC_TIMEOUT_PER_BYTE_MIN_US 1000U
+#define I2C_GD32_SYNC_TIMEOUT_MAX_MS          20000U
+#define I2C_GD32_STOP_TIMEOUT_MS              100U
+#define I2C_GD32_RECOVER_PULSE_DELAY_MS       1U
 
 #ifdef CONFIG_I2C_GD32_DMA
 struct i2c_gd32_dma_config {
@@ -57,6 +79,8 @@ struct i2c_gd32_config {
 	uint32_t bitrate;
 	uint16_t clkid;
 	struct reset_dt_spec reset;
+	struct gpio_dt_spec scl_gpios;
+	struct gpio_dt_spec sda_gpios;
 	const struct pinctrl_dev_config *pcfg;
 	void (*irq_cfg_func)(void);
 #ifdef CONFIG_I2C_GD32_DMA
@@ -73,7 +97,7 @@ struct i2c_gd32_data {
 	uint16_t addr2;
 	uint32_t xfer_len;
 	struct i2c_msg *current;
-	uint8_t errs;
+	uint16_t errs;
 	bool is_restart;
 #ifdef CONFIG_I2C_GD32_DMA
 	bool dma_active;
@@ -86,6 +110,73 @@ struct i2c_gd32_data {
 	uint32_t dma_channel;
 #endif
 };
+
+static uint32_t i2c_gd32_sync_timeout_ms(const struct device *dev)
+{
+	const struct i2c_gd32_data *data = dev->data;
+	const struct i2c_gd32_config *cfg = dev->config;
+	uint32_t bitrate_bps;
+	uint32_t addr_bytes;
+	uint64_t bytes_total;
+	uint64_t per_byte_us;
+	uint64_t per_byte_budget_us;
+	uint64_t timeout_us;
+	uint64_t timeout_ms;
+
+	switch (I2C_SPEED_GET(data->dev_config)) {
+	case I2C_SPEED_STANDARD:
+		bitrate_bps = I2C_BITRATE_STANDARD;
+		break;
+	case I2C_SPEED_FAST:
+		bitrate_bps = I2C_BITRATE_FAST;
+		break;
+	case I2C_SPEED_FAST_PLUS:
+		bitrate_bps = I2C_BITRATE_FAST_PLUS;
+		break;
+	case I2C_SPEED_HIGH:
+		bitrate_bps = I2C_BITRATE_HIGH;
+		break;
+	case I2C_SPEED_ULTRA:
+		bitrate_bps = I2C_BITRATE_ULTRA;
+		break;
+	default:
+		bitrate_bps = cfg->bitrate ? cfg->bitrate : I2C_BITRATE_STANDARD;
+		break;
+	}
+
+	if (data->dev_config & I2C_ADDR_10_BITS) {
+		addr_bytes = (data->current->flags & I2C_MSG_READ) ? 3U : 2U;
+	} else {
+		addr_bytes = 1U;
+	}
+
+	bytes_total = (uint64_t)data->xfer_len + addr_bytes;
+	per_byte_us = (9ULL * 1000000ULL + (bitrate_bps - 1U)) / bitrate_bps;
+	per_byte_budget_us = MAX(I2C_GD32_SYNC_TIMEOUT_PER_BYTE_MIN_US,
+				 per_byte_us * I2C_GD32_SYNC_TIMEOUT_PER_BYTE_FACTOR);
+	timeout_us = I2C_GD32_SYNC_TIMEOUT_BASE_US + (per_byte_budget_us * (bytes_total + 2U));
+	timeout_ms = (timeout_us + 999U) / 1000U;
+
+	if (timeout_ms > I2C_GD32_SYNC_TIMEOUT_MAX_MS) {
+		timeout_ms = I2C_GD32_SYNC_TIMEOUT_MAX_MS;
+	}
+
+	return (uint32_t)timeout_ms;
+}
+
+static int i2c_gd32_wait_not_busy(const struct i2c_gd32_config *cfg, uint32_t timeout_ms)
+{
+	uint32_t deadline = k_uptime_get_32() + timeout_ms;
+
+	while (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
+		if ((int32_t)(k_uptime_get_32() - deadline) >= 0) {
+			return -ETIMEDOUT;
+		}
+		k_msleep(1);
+	}
+
+	return 0;
+}
 
 static inline void i2c_gd32_enable_interrupts(const struct i2c_gd32_config *cfg)
 {
@@ -110,15 +201,13 @@ static inline void i2c_gd32_disable_interrupts(const struct i2c_gd32_config *cfg
 	I2C_CTL1(cfg->reg) &= ~I2C_CTL1_BUFIE;
 }
 
-static inline void i2c_gd32_xfer_read(struct i2c_gd32_data *data,
-				      const struct i2c_gd32_config *cfg)
+static inline void i2c_gd32_xfer_read(struct i2c_gd32_data *data, const struct i2c_gd32_config *cfg)
 {
 	data->current->len--;
 	*data->current->buf = I2C_DATA(cfg->reg);
 	data->current->buf++;
 
-	if ((data->xfer_len > 0U) &&
-	    (data->current->len == 0U)) {
+	if ((data->xfer_len > 0U) && (data->current->len == 0U)) {
 		data->current++;
 	}
 }
@@ -130,8 +219,7 @@ static inline void i2c_gd32_xfer_write(struct i2c_gd32_data *data,
 	I2C_DATA(cfg->reg) = *data->current->buf;
 	data->current->buf++;
 
-	if ((data->xfer_len > 0U) &&
-	    (data->current->len == 0U)) {
+	if ((data->xfer_len > 0U) && (data->current->len == 0U)) {
 		data->current++;
 	}
 }
@@ -174,7 +262,6 @@ static void i2c_gd32_handle_rbne(const struct device *dev)
 		i2c_gd32_xfer_read(data, cfg);
 		break;
 	}
-
 }
 
 static void i2c_gd32_handle_tbe(const struct device *dev)
@@ -326,10 +413,10 @@ static void i2c_gd32_event_isr(const struct device *dev)
 		{
 			i2c_gd32_handle_addsend(dev);
 		}
-	/*
-	 * Must handle BTC first.
-	 * For I2C_STAT0, BTC is the superset of RBNE and TBE.
-	 */
+		/*
+		 * Must handle BTC first.
+		 * For I2C_STAT0, BTC is the superset of RBNE and TBE.
+		 */
 	} else if (stat & I2C_STAT0_BTC) {
 #ifdef CONFIG_I2C_GD32_DMA
 		if (data->dma_active) {
@@ -383,6 +470,26 @@ static void i2c_gd32_error_isr(const struct device *dev)
 		data->errs |= I2C_GD32_ERR_AERR;
 	}
 
+	if (stat & I2C_STAT0_OUERR) {
+		I2C_STAT0(cfg->reg) &= ~I2C_STAT0_OUERR;
+		data->errs |= I2C_GD32_ERR_OUERR;
+	}
+
+	if (stat & I2C_STAT0_PECERR) {
+		I2C_STAT0(cfg->reg) &= ~I2C_STAT0_PECERR;
+		data->errs |= I2C_GD32_ERR_PECERR;
+	}
+
+	if (stat & I2C_STAT0_SMBTO) {
+		I2C_STAT0(cfg->reg) &= ~I2C_STAT0_SMBTO;
+		data->errs |= I2C_GD32_ERR_SMBTO;
+	}
+
+	if (stat & I2C_STAT0_SMBALT) {
+		I2C_STAT0(cfg->reg) &= ~I2C_STAT0_SMBALT;
+		data->errs |= I2C_GD32_ERR_SMBALT;
+	}
+
 	if (data->errs != 0U) {
 		/* Enter stop condition */
 		I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
@@ -413,6 +520,22 @@ static void i2c_gd32_log_err(struct i2c_gd32_data *data)
 		LOG_ERR("No ACK received");
 	}
 
+	if (data->errs & I2C_GD32_ERR_OUERR) {
+		LOG_ERR("Over-run or under-run");
+	}
+
+	if (data->errs & I2C_GD32_ERR_PECERR) {
+		LOG_ERR("PEC error");
+	}
+
+	if (data->errs & I2C_GD32_ERR_SMBTO) {
+		LOG_ERR("SMBus timeout");
+	}
+
+	if (data->errs & I2C_GD32_ERR_SMBALT) {
+		LOG_ERR("SMBus alert");
+	}
+
 	if (data->errs & I2C_GD32_ERR_DMA) {
 		LOG_ERR("DMA error");
 	}
@@ -420,11 +543,77 @@ static void i2c_gd32_log_err(struct i2c_gd32_data *data)
 	if (data->errs & I2C_GD32_ERR_BUSY) {
 		LOG_ERR("I2C bus busy");
 	}
+
+	if (data->errs & I2C_GD32_ERR_TIMEOUT) {
+		LOG_ERR("Transfer timeout");
+	}
+}
+
+static int i2c_gd32_recover_bus_bitbang(const struct device *dev)
+{
+	const struct i2c_gd32_config *cfg = dev->config;
+	int ret;
+	int sda;
+
+	if ((cfg->scl_gpios.port == NULL) || (cfg->sda_gpios.port == NULL)) {
+		return -ENOTSUP;
+	}
+
+	if (!device_is_ready(cfg->scl_gpios.port) || !device_is_ready(cfg->sda_gpios.port)) {
+		return -ENODEV;
+	}
+
+	ret = gpio_pin_configure_dt(&cfg->scl_gpios,
+				    GPIO_OUTPUT_HIGH | GPIO_OPEN_DRAIN | GPIO_PULL_UP);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = gpio_pin_configure_dt(&cfg->sda_gpios,
+				    GPIO_OUTPUT_HIGH | GPIO_OPEN_DRAIN | GPIO_PULL_UP);
+	if (ret != 0) {
+		return ret;
+	}
+
+	sda = gpio_pin_get_dt(&cfg->sda_gpios);
+	if (sda < 0) {
+		return sda;
+	}
+
+	/*
+	 * Recover a wedged target by toggling SCL a few cycles while releasing SDA,
+	 * then forcing a STOP condition.
+	 */
+	for (int i = 0; (i < 9) && (sda == 0); ++i) {
+		(void)gpio_pin_set_dt(&cfg->scl_gpios, 0);
+		k_msleep(I2C_GD32_RECOVER_PULSE_DELAY_MS);
+		(void)gpio_pin_set_dt(&cfg->scl_gpios, 1);
+		k_msleep(I2C_GD32_RECOVER_PULSE_DELAY_MS);
+
+		sda = gpio_pin_get_dt(&cfg->sda_gpios);
+		if (sda < 0) {
+			return sda;
+		}
+	}
+
+	(void)gpio_pin_set_dt(&cfg->sda_gpios, 0);
+	k_msleep(I2C_GD32_RECOVER_PULSE_DELAY_MS);
+	(void)gpio_pin_set_dt(&cfg->scl_gpios, 1);
+	k_msleep(I2C_GD32_RECOVER_PULSE_DELAY_MS);
+	(void)gpio_pin_set_dt(&cfg->sda_gpios, 1);
+	k_msleep(I2C_GD32_RECOVER_PULSE_DELAY_MS);
+
+	sda = gpio_pin_get_dt(&cfg->sda_gpios);
+	if (sda < 0) {
+		return sda;
+	}
+
+	return (sda != 0) ? 0 : -EBUSY;
 }
 
 #ifdef CONFIG_I2C_GD32_DMA
-static void i2c_gd32_dma_callback(const struct device *dma_dev, void *user_data,
-				  uint32_t channel, int status)
+static void i2c_gd32_dma_callback(const struct device *dma_dev, void *user_data, uint32_t channel,
+				  int status)
 {
 	const struct device *dev = user_data;
 	struct i2c_gd32_data *data = dev->data;
@@ -544,6 +733,76 @@ static void i2c_gd32_dma_cleanup(const struct device *dev)
 }
 #endif /* CONFIG_I2C_GD32_DMA */
 
+static int i2c_gd32_recover_bus_locked(const struct device *dev)
+{
+	struct i2c_gd32_data *data = dev->data;
+	const struct i2c_gd32_config *cfg = dev->config;
+	uint32_t ctl1 = I2C_CTL1(cfg->reg);
+	uint32_t ckcfg = I2C_CKCFG(cfg->reg);
+	uint32_t rt = I2C_RT(cfg->reg);
+	uint32_t fctl = I2C_FCTL(cfg->reg);
+#ifdef I2C_FMPCFG
+	uint32_t fmpcfg = I2C_FMPCFG(cfg->reg);
+#endif
+	int ret;
+
+	i2c_gd32_disable_interrupts(cfg);
+
+#ifdef CONFIG_I2C_GD32_DMA
+	i2c_gd32_dma_cleanup(dev);
+#endif
+
+	/* Try to abort any active transaction and release the bus. */
+	I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+	(void)i2c_gd32_wait_not_busy(cfg, I2C_GD32_STOP_TIMEOUT_MS);
+
+	/* Reset I2C internal state machine. */
+	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
+
+	ret = i2c_gd32_recover_bus_bitbang(dev);
+	if ((ret != 0) && (ret != -ENOTSUP)) {
+		LOG_WRN("Bus bitbang recovery failed: %d", ret);
+	}
+	(void)pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
+
+	I2C_CTL0(cfg->reg) |= I2C_CTL0_SRESET;
+	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_SRESET;
+
+	/* Full peripheral reset for a wedged controller, then restore timing config. */
+	(void)reset_line_toggle_dt(&cfg->reset);
+
+	I2C_CTL1(cfg->reg) = ctl1 & ~(I2C_CTL1_ERRIE | I2C_CTL1_EVIE | I2C_CTL1_BUFIE |
+				      I2C_CTL1_DMAON | I2C_CTL1_DMALST);
+	I2C_CKCFG(cfg->reg) = ckcfg;
+	I2C_RT(cfg->reg) = rt;
+	I2C_FCTL(cfg->reg) = fctl;
+#ifdef I2C_FMPCFG
+	I2C_FMPCFG(cfg->reg) = fmpcfg;
+#endif
+
+	(void)I2C_STAT0(cfg->reg);
+	(void)I2C_STAT1(cfg->reg);
+
+	ret = i2c_gd32_wait_not_busy(cfg, I2C_GD32_STOP_TIMEOUT_MS);
+	if (ret != 0) {
+		data->errs |= I2C_GD32_ERR_BUSY;
+	}
+
+	return ret;
+}
+
+static int i2c_gd32_recover_bus(const struct device *dev)
+{
+	struct i2c_gd32_data *data = dev->data;
+	int ret;
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
+	ret = i2c_gd32_recover_bus_locked(dev);
+	k_sem_give(&data->bus_mutex);
+
+	return ret;
+}
+
 static void i2c_gd32_xfer_begin(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
@@ -604,8 +863,9 @@ static int i2c_gd32_xfer_end(const struct device *dev)
 	i2c_gd32_disable_interrupts(cfg);
 
 	/* Wait for stop condition is done. */
-	while (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-		/* NOP */
+	if (i2c_gd32_wait_not_busy(cfg, I2C_GD32_STOP_TIMEOUT_MS) != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		(void)i2c_gd32_recover_bus_locked(dev);
 	}
 
 #ifdef CONFIG_I2C_GD32_DMA
@@ -613,6 +873,9 @@ static int i2c_gd32_xfer_end(const struct device *dev)
 #endif
 
 	if (data->errs) {
+		if (data->errs & I2C_GD32_ERR_TIMEOUT) {
+			return -ETIMEDOUT;
+		}
 		return -EIO;
 	}
 
@@ -623,15 +886,20 @@ static int i2c_gd32_msg_read(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	uint32_t timeout_ms;
 
 	if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
 		data->errs = I2C_GD32_ERR_BUSY;
 		return -EBUSY;
 	}
 
+	timeout_ms = i2c_gd32_sync_timeout_ms(dev);
 	i2c_gd32_xfer_begin(dev);
 
-	k_sem_take(&data->sync_sem, K_FOREVER);
+	if (k_sem_take(&data->sync_sem, K_MSEC(timeout_ms)) != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		(void)i2c_gd32_recover_bus_locked(dev);
+	}
 
 	return i2c_gd32_xfer_end(dev);
 }
@@ -640,22 +908,25 @@ static int i2c_gd32_msg_write(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	uint32_t timeout_ms;
 
 	if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
 		data->errs = I2C_GD32_ERR_BUSY;
 		return -EBUSY;
 	}
 
+	timeout_ms = i2c_gd32_sync_timeout_ms(dev);
 	i2c_gd32_xfer_begin(dev);
 
-	k_sem_take(&data->sync_sem, K_FOREVER);
+	if (k_sem_take(&data->sync_sem, K_MSEC(timeout_ms)) != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		(void)i2c_gd32_recover_bus_locked(dev);
+	}
 
 	return i2c_gd32_xfer_end(dev);
 }
 
-static int i2c_gd32_transfer(const struct device *dev,
-			     struct i2c_msg *msgs,
-			     uint8_t num_msgs,
+static int i2c_gd32_transfer(const struct device *dev, struct i2c_msg *msgs, uint8_t num_msgs,
 			     uint16_t addr)
 {
 	struct i2c_gd32_data *data = dev->data;
@@ -678,8 +949,7 @@ static int i2c_gd32_transfer(const struct device *dev,
 			 * If there have a R/W transfer state change between messages,
 			 * An explicit I2C_MSG_RESTART flag is needed for the second message.
 			 */
-			if ((current->flags & I2C_MSG_RW_MASK) !=
-			(next->flags & I2C_MSG_RW_MASK)) {
+			if ((current->flags & I2C_MSG_RW_MASK) != (next->flags & I2C_MSG_RW_MASK)) {
 				if ((next->flags & I2C_MSG_RESTART) == 0U) {
 					return -EINVAL;
 				}
@@ -691,8 +961,7 @@ static int i2c_gd32_transfer(const struct device *dev,
 			}
 		}
 
-		if ((current->buf == NULL) ||
-		    (current->len == 0U)) {
+		if ((current->buf == NULL) || (current->len == 0U)) {
 			return -EINVAL;
 		}
 
@@ -734,8 +1003,8 @@ static int i2c_gd32_transfer(const struct device *dev,
 		data->dma_active = false;
 		if ((itr - i) == 1U) {
 			bool is_read = (data->current->flags & I2C_MSG_READ) != 0U;
-			bool use_dma = is_read ? i2c_gd32_dma_available(&cfg->dma_rx) :
-						 i2c_gd32_dma_available(&cfg->dma_tx);
+			bool use_dma = is_read ? i2c_gd32_dma_available(&cfg->dma_rx)
+					       : i2c_gd32_dma_available(&cfg->dma_tx);
 			if (use_dma) {
 				(void)i2c_gd32_dma_setup(dev, is_read);
 			}
@@ -762,8 +1031,7 @@ static int i2c_gd32_transfer(const struct device *dev,
 	return err;
 }
 
-static int i2c_gd32_configure(const struct device *dev,
-			      uint32_t dev_config)
+static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
@@ -775,15 +1043,13 @@ static int i2c_gd32_configure(const struct device *dev,
 	/* Disable I2C device */
 	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
 
-	(void)clock_control_get_rate(GD32_CLOCK_CONTROLLER,
-				     (clock_control_subsys_t)&cfg->clkid,
+	(void)clock_control_get_rate(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid,
 				     &pclk1);
 
 	/* i2c clock frequency, us */
 	freq = pclk1 / 1000000U;
 	if (freq > I2CCLK_MAX) {
-		LOG_ERR("I2C max clock freq %u, current is %u\n",
-			I2CCLK_MAX, freq);
+		LOG_ERR("I2C max clock freq %u, current is %u\n", I2CCLK_MAX, freq);
 		err = -ENOTSUP;
 		goto error;
 	}
@@ -820,8 +1086,8 @@ static int i2c_gd32_configure(const struct device *dev,
 	switch (I2C_SPEED_GET(dev_config)) {
 	case I2C_SPEED_STANDARD:
 		if (freq < I2CCLK_MIN) {
-			LOG_ERR("I2C standard-mode min clock freq %u, current is %u\n",
-				I2CCLK_MIN, freq);
+			LOG_ERR("I2C standard-mode min clock freq %u, current is %u\n", I2CCLK_MIN,
+				freq);
 			err = -ENOTSUP;
 			goto error;
 		}
@@ -846,8 +1112,8 @@ static int i2c_gd32_configure(const struct device *dev,
 		break;
 	case I2C_SPEED_FAST:
 		if (freq < I2CCLK_FM_MIN) {
-			LOG_ERR("I2C fast-mode min clock freq %u, current is %u\n",
-				I2CCLK_FM_MIN, freq);
+			LOG_ERR("I2C fast-mode min clock freq %u, current is %u\n", I2CCLK_FM_MIN,
+				freq);
 			err = -ENOTSUP;
 			goto error;
 		}
@@ -919,6 +1185,7 @@ error:
 static DEVICE_API(i2c, i2c_gd32_driver_api) = {
 	.configure = i2c_gd32_configure,
 	.transfer = i2c_gd32_transfer,
+	.recover_bus = i2c_gd32_recover_bus,
 #ifdef CONFIG_I2C_RTIO
 	.iodev_submit = i2c_iodev_submit_fallback,
 #endif
@@ -942,8 +1209,7 @@ static int i2c_gd32_init(const struct device *dev)
 	/* Sync semaphore to sync i2c state between isr and transfer api. */
 	k_sem_init(&data->sync_sem, 0, K_SEM_MAX_LIMIT);
 
-	(void)clock_control_on(GD32_CLOCK_CONTROLLER,
-			       (clock_control_subsys_t)&cfg->clkid);
+	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
 
 	(void)reset_line_toggle_dt(&cfg->reset);
 
@@ -968,58 +1234,53 @@ static int i2c_gd32_init(const struct device *dev)
 }
 
 #ifdef CONFIG_I2C_GD32_DMA
-#define DMA_INITIALIZER(idx, dir)							     \
-	{										     \
-		.dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, dir)),		     \
-		.channel = DT_INST_DMAS_CELL_BY_NAME(idx, dir, channel),		     \
+#define DMA_INITIALIZER(idx, dir)                                                                  \
+	{                                                                                          \
+		.dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, dir)),                         \
+		.channel = DT_INST_DMAS_CELL_BY_NAME(idx, dir, channel),                           \
 		.slot = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),	     \
-				    (DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),  \
-		.config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),		     \
-		.fifo_threshold = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1), \
+				    (DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),                            \
+			 .config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),                    \
+			 .fifo_threshold = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1), \
 					      (DT_INST_DMAS_CELL_BY_NAME(idx, dir, fifo_threshold)), \
-					      (0)),					     \
-	}
+					      (0)),         \
+			 }
 
-#define DMA_BY_NAME(idx, dir)								     \
+#define DMA_BY_NAME(idx, dir)                                                                      \
 	COND_CODE_1(DT_INST_DMAS_HAS_NAME(idx, dir), (DMA_INITIALIZER(idx, dir)), ({0}))
 #else
 #define DMA_BY_NAME(idx, dir) {0}
 #endif /* CONFIG_I2C_GD32_DMA */
 
-#define I2C_GD32_INIT(inst)							\
-	PINCTRL_DT_INST_DEFINE(inst);						\
-	static void i2c_gd32_irq_cfg_func_##inst(void)				\
-	{									\
-		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(inst, event, irq),		\
-			    DT_INST_IRQ_BY_NAME(inst, event, priority),		\
-			    i2c_gd32_event_isr,					\
-			    DEVICE_DT_INST_GET(inst),				\
-			    0);							\
-		irq_enable(DT_INST_IRQ_BY_NAME(inst, event, irq));		\
-										\
-		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(inst, error, irq),		\
-			    DT_INST_IRQ_BY_NAME(inst, error, priority),		\
-			    i2c_gd32_error_isr,					\
-			    DEVICE_DT_INST_GET(inst),				\
-			    0);							\
-		irq_enable(DT_INST_IRQ_BY_NAME(inst, error, irq));		\
-	}									\
-	static struct i2c_gd32_data i2c_gd32_data_##inst;			\
-	const static struct i2c_gd32_config i2c_gd32_cfg_##inst = {		\
-		.reg = DT_INST_REG_ADDR(inst),					\
-		.bitrate = DT_INST_PROP(inst, clock_frequency),			\
-		.clkid = DT_INST_CLOCKS_CELL(inst, id),				\
-		.reset = RESET_DT_SPEC_INST_GET(inst),				\
-		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),			\
-		.irq_cfg_func = i2c_gd32_irq_cfg_func_##inst,			\
+#define I2C_GD32_INIT(inst)                                                                        \
+	PINCTRL_DT_INST_DEFINE(inst);                                                              \
+	static void i2c_gd32_irq_cfg_func_##inst(void)                                             \
+	{                                                                                          \
+		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(inst, event, irq),                                 \
+			    DT_INST_IRQ_BY_NAME(inst, event, priority), i2c_gd32_event_isr,        \
+			    DEVICE_DT_INST_GET(inst), 0);                                          \
+		irq_enable(DT_INST_IRQ_BY_NAME(inst, event, irq));                                 \
+                                                                                                   \
+		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(inst, error, irq),                                 \
+			    DT_INST_IRQ_BY_NAME(inst, error, priority), i2c_gd32_error_isr,        \
+			    DEVICE_DT_INST_GET(inst), 0);                                          \
+		irq_enable(DT_INST_IRQ_BY_NAME(inst, error, irq));                                 \
+	}                                                                                          \
+	static struct i2c_gd32_data i2c_gd32_data_##inst;                                          \
+	const static struct i2c_gd32_config i2c_gd32_cfg_##inst = {                                \
+		.reg = DT_INST_REG_ADDR(inst),                                                     \
+		.bitrate = DT_INST_PROP(inst, clock_frequency),                                    \
+		.clkid = DT_INST_CLOCKS_CELL(inst, id),                                            \
+		.reset = RESET_DT_SPEC_INST_GET(inst),                                             \
+		.scl_gpios = GPIO_DT_SPEC_INST_GET_OR(inst, scl_gpios, {0}),                       \
+		.sda_gpios = GPIO_DT_SPEC_INST_GET_OR(inst, sda_gpios, {0}),                       \
+		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),                                      \
+		.irq_cfg_func = i2c_gd32_irq_cfg_func_##inst,                                      \
 		IF_ENABLED(CONFIG_I2C_GD32_DMA,					\
 			   (.dma_rx = DMA_BY_NAME(inst, rx),			\
-			    .dma_tx = DMA_BY_NAME(inst, tx),))			\
-	};									\
-	I2C_DEVICE_DT_INST_DEFINE(inst,						\
-				  i2c_gd32_init, NULL,				\
-				  &i2c_gd32_data_##inst, &i2c_gd32_cfg_##inst,	\
-				  POST_KERNEL, CONFIG_I2C_INIT_PRIORITY,	\
-				  &i2c_gd32_driver_api);			\
+			    .dma_tx = DMA_BY_NAME(inst, tx),)) };        \
+	I2C_DEVICE_DT_INST_DEFINE(inst, i2c_gd32_init, NULL, &i2c_gd32_data_##inst,                \
+				  &i2c_gd32_cfg_##inst, POST_KERNEL, CONFIG_I2C_INIT_PRIORITY,     \
+				  &i2c_gd32_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(I2C_GD32_INIT)
