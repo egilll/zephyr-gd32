@@ -36,6 +36,13 @@
 		};
 	};
 
+	bldo: bldo {
+		compatible = "gd,gd32-bldo";
+		regulator-name = "BLDO_1V2";
+		clocks = <&cctl GD32_CLOCK_PMU>;
+		status = "disabled";
+	};
+
 	soc {
 		tcmsram: memory@10000000 {
 			compatible = "zephyr,memory-region", "arm,dtcm";
@@ -50,6 +57,13 @@
 			zephyr,memory-region = "SRAM";
 			zephyr,memory-attr = <(DT_MEM_CACHEABLE | DT_MEM_DMA |
 					       DT_MEM_SW_ALLOC_CACHE | DT_MEM_SW_ALLOC_DMA)>;
+		};
+
+		backup_sram: sram@40024000 {
+			compatible = "gd,gd32-backup-sram";
+			reg = <0x40024000 0x1000>;
+			clocks = <&cctl GD32_CLOCK_BKPSRAM>;
+			status = "disabled";
 		};
 
 		rcu: reset-clock-controller@40023800 {
