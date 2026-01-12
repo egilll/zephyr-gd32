@@ -60,6 +60,14 @@ BUILD_ASSERT((CONFIG_SDHC_GD32_BOUNCE_BUFFER_SIZE % sizeof(uint32_t)) == 0U);
 	(SDIO_INT_DTEND | SDIO_INT_DTCRCERR | SDIO_INT_DTTMOUT | SDIO_INT_TXURE | SDIO_INT_RXORE | \
 	 SDIO_INT_STBITE | SDIO_INT_DTBLKEND)
 
+#define GD32_SDIO_FLAG_CMD_MASK                                                                    \
+	(SDIO_INT_FLAG_CMDRECV | SDIO_INT_FLAG_CMDSEND | SDIO_INT_FLAG_CCRCERR |                     \
+	 SDIO_INT_FLAG_CMDTMOUT | SDIO_INT_FLAG_STBITE)
+
+#define GD32_SDIO_FLAG_DATA_MASK                                                                   \
+	(SDIO_INT_FLAG_DTEND | SDIO_INT_FLAG_DTBLKEND | SDIO_INT_FLAG_DTCRCERR |                     \
+	 SDIO_INT_FLAG_DTTMOUT | SDIO_INT_FLAG_TXURE | SDIO_INT_FLAG_RXORE | SDIO_INT_FLAG_STBITE)
+
 enum gd32_sdhc_xfer_err {
 	GD32_SDHC_ERR_NONE = 0U,
 	GD32_SDHC_ERR_CMD_CRC = BIT(0),
@@ -114,6 +122,7 @@ struct gd32_sdhc_data {
 	volatile int dma_status;
 
 	bool card_high_capacity;
+	uint16_t rca;
 
 #if CONFIG_SDHC_GD32_BOUNCE_BUFFER_SIZE > 0
 	bool bounce_used;
@@ -127,10 +136,6 @@ struct gd32_sdhc_data {
 
 	struct gpio_callback cd_cb;
 	const struct device *dev;
-
-	uint32_t cmd13_count;
-	uint32_t last_cmd13_r1;
-	uint32_t last_r1_err_flags;
 };
 
 static void gd32_cd_gpio_cb(const struct device *port, struct gpio_callback *cb,
@@ -163,11 +168,11 @@ static void gd32_cd_gpio_cb(const struct device *port, struct gpio_callback *cb,
 
 static void gd32_sdhc_dump_hw_state(const char *tag)
 {
-	LOG_ERR("%s: STAT=0x%08x INTEN=0x%08x CMDCTL=0x%08x DATACTL=0x%08x DATATO=0x%08x "
+	LOG_DBG("%s: STAT=0x%08x INTEN=0x%08x CMDCTL=0x%08x DATACTL=0x%08x DATATO=0x%08x "
 		"DATALEN=0x%08x DATACNT=0x%08x",
 		tag, SDIO_STAT, SDIO_INTEN, SDIO_CMDCTL, SDIO_DATACTL, SDIO_DATATO, SDIO_DATALEN,
 		SDIO_DATACNT);
-	LOG_ERR("%s: RSPCMDIDX=0x%08x RESP0=0x%08x RESP1=0x%08x RESP2=0x%08x RESP3=0x%08x", tag,
+	LOG_DBG("%s: RSPCMDIDX=0x%08x RESP0=0x%08x RESP1=0x%08x RESP2=0x%08x RESP3=0x%08x", tag,
 		SDIO_RSPCMDIDX, SDIO_RESP0, SDIO_RESP1, SDIO_RESP2, SDIO_RESP3);
 }
 
@@ -206,176 +211,6 @@ static void gd32_sdhc_log_data_error(uint32_t data_err, int dma_status)
 	}
 }
 
-static const char *gd32_sdhc_primary_error_str(uint32_t cmd_err, uint32_t data_err, int dma_status)
-{
-	if (dma_status < 0) {
-		return "DMA error";
-	}
-	if ((data_err & GD32_SDHC_ERR_DATA_CRC) != 0U) {
-		return "DATA CRC error";
-	}
-	if ((data_err & GD32_SDHC_ERR_DATA_TIMEOUT) != 0U) {
-		return "DATA timeout";
-	}
-	if ((data_err & GD32_SDHC_ERR_TX_UNDERRUN) != 0U) {
-		return "TX underrun";
-	}
-	if ((data_err & GD32_SDHC_ERR_RX_OVERRUN) != 0U) {
-		return "RX overrun";
-	}
-	if ((data_err & GD32_SDHC_ERR_START_BIT) != 0U) {
-		return "DATA start-bit error";
-	}
-	if ((cmd_err & GD32_SDHC_ERR_CMD_TIMEOUT) != 0U) {
-		return "CMD timeout";
-	}
-	if ((cmd_err & GD32_SDHC_ERR_CMD_CRC) != 0U) {
-		return "CMD CRC error";
-	}
-	if ((cmd_err & GD32_SDHC_ERR_START_BIT) != 0U) {
-		return "CMD start-bit error";
-	}
-	return "I/O error";
-}
-
-static uint32_t gd32_sdhc_retry_delay_ms(uint32_t cmd_err, uint32_t data_err, int dma_status)
-{
-	if (dma_status < 0) {
-		return 10U;
-	}
-
-	if ((data_err & (GD32_SDHC_ERR_DATA_CRC | GD32_SDHC_ERR_START_BIT)) != 0U) {
-		return 50U;
-	}
-
-	if (data_err != 0U) {
-		return 20U;
-	}
-
-	if ((cmd_err & GD32_SDHC_ERR_CMD_TIMEOUT) != 0U) {
-		return 5U;
-	}
-
-	if ((cmd_err & (GD32_SDHC_ERR_CMD_CRC | GD32_SDHC_ERR_START_BIT)) != 0U) {
-		return 2U;
-	}
-
-	return 5U;
-}
-
-static void gd32_sdhc_log_r1_error_bits(uint32_t r1)
-{
-	uint32_t err = r1 & SD_R1_ERR_FLAGS;
-
-	if (err == 0U) {
-		return;
-	}
-
-	LOG_ERR("R1 error flags: 0x%08x (state=%u ready=%u)", err, SD_R1_CURRENT_STATE(r1),
-		(r1 & SD_R1_RDY_DATA) != 0U);
-
-	if ((err & SD_R1_OUT_OF_RANGE) != 0U) {
-		LOG_ERR("R1: OUT_OF_RANGE");
-	}
-	if ((err & SD_R1_ADDR_ERR) != 0U) {
-		LOG_ERR("R1: ADDR_ERR");
-	}
-	if ((err & SD_R1_BLOCK_LEN_ERR) != 0U) {
-		LOG_ERR("R1: BLOCK_LEN_ERR");
-	}
-	if ((err & SD_R1_ERASE_SEQ_ERR) != 0U) {
-		LOG_ERR("R1: ERASE_SEQ_ERR");
-	}
-	if ((err & SD_R1_ERASE_PARAM) != 0U) {
-		LOG_ERR("R1: ERASE_PARAM");
-	}
-	if ((err & SD_R1_WP_VIOLATION) != 0U) {
-		LOG_ERR("R1: WP_VIOLATION");
-	}
-	if ((err & SD_R1_CARD_LOCKED) != 0U) {
-		LOG_ERR("R1: CARD_LOCKED");
-	}
-	if ((err & SD_R1_UNLOCK_FAIL) != 0U) {
-		LOG_ERR("R1: UNLOCK_FAIL");
-	}
-	if ((err & SD_R1_CRC_ERR) != 0U) {
-		LOG_ERR("R1: CRC_ERR");
-	}
-	if ((err & SD_R1_ILLEGAL_CMD) != 0U) {
-		LOG_ERR("R1: ILLEGAL_CMD");
-	}
-	if ((err & SD_R1_ECC_FAIL) != 0U) {
-		LOG_ERR("R1: ECC_FAIL");
-	}
-	if ((err & SD_R1_CC_ERR) != 0U) {
-		LOG_ERR("R1: CC_ERR");
-	}
-	if ((err & SD_R1_ERR) != 0U) {
-		LOG_ERR("R1: ERR");
-	}
-	if ((err & SD_R1_CSD_OVERWRITE) != 0U) {
-		LOG_ERR("R1: CSD_OVERWRITE");
-	}
-	if ((err & SD_R1_ERASE_SKIP) != 0U) {
-		LOG_ERR("R1: ERASE_SKIP");
-	}
-	if ((err & SD_R1_AUTH_ERR) != 0U) {
-		LOG_ERR("R1: AUTH_ERR");
-	}
-}
-
-static void gd32_sdhc_maybe_log_response(struct gd32_sdhc_data *data,
-					 const struct sdhc_command *cmd)
-{
-	uint32_t native = cmd->response_type & SDHC_NATIVE_RESPONSE_MASK;
-
-	if (native == SD_RSP_TYPE_NONE) {
-		return;
-	}
-
-	if (native == SD_RSP_TYPE_R2) {
-		LOG_DBG("CMD%u resp=%08x %08x %08x %08x", cmd->opcode, cmd->response[0],
-			cmd->response[1], cmd->response[2], cmd->response[3]);
-		return;
-	}
-
-	uint32_t r0 = cmd->response[0];
-
-	if (cmd->opcode == SD_SEND_STATUS) {
-		data->cmd13_count++;
-
-		uint32_t err = r0 & SD_R1_ERR_FLAGS;
-		bool log_err = (err != 0U) && (err != data->last_r1_err_flags);
-		bool log_dbg = (r0 != data->last_cmd13_r1) || ((data->cmd13_count & 0x3FU) == 0U);
-
-		if (log_err) {
-			LOG_ERR("CMD13 status=0x%08x (state=%u ready=%u)", r0,
-				SD_R1_CURRENT_STATE(r0), (r0 & SD_R1_RDY_DATA) != 0U);
-			gd32_sdhc_log_r1_error_bits(r0);
-			data->last_r1_err_flags = err;
-		}
-
-		if (log_dbg) {
-			LOG_DBG("CMD13 status=0x%08x (state=%u ready=%u err=0x%08x)", r0,
-				SD_R1_CURRENT_STATE(r0), (r0 & SD_R1_RDY_DATA) != 0U, err);
-			data->last_cmd13_r1 = r0;
-		}
-		return;
-	}
-
-	LOG_DBG("CMD%u resp0=0x%08x", cmd->opcode, r0);
-
-	if ((native == SD_RSP_TYPE_R1) || (native == SD_RSP_TYPE_R1b)) {
-		uint32_t err = r0 & SD_R1_ERR_FLAGS;
-		if ((err != 0U) && (err != data->last_r1_err_flags)) {
-			LOG_ERR("CMD%u R1 error: 0x%08x (state=%u ready=%u)", cmd->opcode, r0,
-				SD_R1_CURRENT_STATE(r0), (r0 & SD_R1_RDY_DATA) != 0U);
-			gd32_sdhc_log_r1_error_bits(r0);
-			data->last_r1_err_flags = err;
-		}
-	}
-}
-
 static inline uint32_t gd32_sdio_datablocksize_get(uint16_t bytes)
 {
 	uint8_t exp_val = 0U;
@@ -398,6 +233,55 @@ static inline void gd32_sdio_sync(void)
 	(void)SDIO_STAT;
 }
 
+static inline void gd32_sdio_clkctl_write(uint32_t val)
+{
+	SDIO_CLKCTL = val;
+	gd32_sdio_sync();
+}
+
+static inline void gd32_sdio_cmdctl_write(uint32_t val)
+{
+	SDIO_CMDCTL = val;
+	gd32_sdio_sync();
+}
+
+static inline void gd32_sdio_datactl_write(uint32_t val)
+{
+	SDIO_DATACTL = val;
+	gd32_sdio_sync();
+}
+
+static void gd32_sdio_clkctl_update(uint32_t clear_mask, uint32_t set_mask)
+{
+	uint32_t v = SDIO_CLKCTL;
+
+	v &= ~clear_mask;
+	v |= set_mask;
+
+	gd32_sdio_clkctl_write(v);
+}
+
+static void gd32_sdio_cmd_start(uint32_t cmd_idx, uint32_t arg, uint32_t resp_sel, uint32_t wait)
+{
+	uint32_t cmdctl = SDIO_CMDCTL;
+
+	/* Disable CSM while reconfiguring CMDCTL. */
+	cmdctl &= ~SDIO_CMDCTL_CSMEN;
+	gd32_sdio_cmdctl_write(cmdctl);
+
+	SDIO_CMDAGMT = arg;
+	gd32_sdio_sync();
+
+	cmdctl = SDIO_CMDCTL;
+	cmdctl &= ~(SDIO_CMDCTL_CMDIDX | SDIO_CMDCTL_CMDRESP | SDIO_CMDCTL_INTWAIT |
+		    SDIO_CMDCTL_WAITDEND);
+	cmdctl |= (cmd_idx & 0x3FU);
+	cmdctl |= resp_sel;
+	cmdctl |= wait;
+	cmdctl |= SDIO_CMDCTL_CSMEN;
+	gd32_sdio_cmdctl_write(cmdctl);
+}
+
 static uint32_t gd32_sdhc_timeout_to_cycles(const struct gd32_sdhc_data *data, int timeout_ms)
 {
 	if (timeout_ms == SDHC_TIMEOUT_FOREVER) {
@@ -417,25 +301,10 @@ static uint32_t gd32_sdhc_timeout_to_cycles(const struct gd32_sdhc_data *data, i
 	return (cycles > UINT32_MAX) ? UINT32_MAX : (uint32_t)cycles;
 }
 
-static void gd32_sdhc_isr(const struct device *dev)
+static bool gd32_sdhc_cmd_process_pending(struct gd32_sdhc_data *data, uint32_t pending)
 {
-	struct gd32_sdhc_data *data = dev->data;
-	uint32_t pending = SDIO_STAT & SDIO_INTEN;
+	bool cmd_event = false;
 
-	if (pending == 0U) {
-		return;
-	}
-
-	/* SDIO card interrupt (function interrupt) */
-	if ((pending & SDIO_INT_FLAG_SDIOINT) != 0U) {
-		sdio_interrupt_flag_clear(SDIO_INT_FLAG_SDIOINT);
-		if ((data->enabled_sources & SDHC_INT_SDIO) != 0 && data->card_cb != NULL) {
-			data->card_cb(dev, SDHC_INT_SDIO, data->card_cb_user_data);
-		}
-		pending &= ~SDIO_INT_FLAG_SDIOINT;
-	}
-
-	/* Command completion / error */
 	if ((pending & (SDIO_INT_FLAG_CCRCERR | SDIO_INT_FLAG_CMDTMOUT | SDIO_INT_FLAG_STBITE)) !=
 	    0U) {
 		if ((pending & SDIO_INT_FLAG_CCRCERR) != 0U) {
@@ -447,14 +316,20 @@ static void gd32_sdhc_isr(const struct device *dev)
 		if ((pending & SDIO_INT_FLAG_STBITE) != 0U) {
 			data->cmd_err |= GD32_SDHC_ERR_START_BIT;
 		}
-		k_sem_give(&data->cmd_sem);
+		cmd_event = true;
 	}
 
 	if ((pending & (SDIO_INT_FLAG_CMDRECV | SDIO_INT_FLAG_CMDSEND)) != 0U) {
-		k_sem_give(&data->cmd_sem);
+		cmd_event = true;
 	}
 
-	/* Data completion / error */
+	return cmd_event;
+}
+
+static bool gd32_sdhc_data_process_pending(struct gd32_sdhc_data *data, uint32_t pending)
+{
+	bool data_event = false;
+
 	if ((pending & (SDIO_INT_FLAG_DTCRCERR | SDIO_INT_FLAG_DTTMOUT | SDIO_INT_FLAG_TXURE |
 			SDIO_INT_FLAG_RXORE | SDIO_INT_FLAG_STBITE)) != 0U) {
 		if ((pending & SDIO_INT_FLAG_DTCRCERR) != 0U) {
@@ -472,21 +347,49 @@ static void gd32_sdhc_isr(const struct device *dev)
 		if ((pending & SDIO_INT_FLAG_STBITE) != 0U) {
 			data->data_err |= GD32_SDHC_ERR_START_BIT;
 		}
-		k_sem_give(&data->data_sem);
+		data_event = true;
 	}
 
 	if ((pending & SDIO_INT_FLAG_DTEND) != 0U) {
 		data->data_events |= SDIO_INT_FLAG_DTEND;
-		k_sem_give(&data->data_sem);
+		data_event = true;
 	}
 
 	if ((pending & SDIO_INT_FLAG_DTBLKEND) != 0U) {
 		data->data_events |= SDIO_INT_FLAG_DTBLKEND;
-		k_sem_give(&data->data_sem);
+		data_event = true;
 	}
 
-	/* Clear all latched interrupt flags we have enabled. */
+	return data_event;
+}
+
+static void gd32_sdhc_isr(const struct device *dev)
+{
+	struct gd32_sdhc_data *data = dev->data;
+	uint32_t pending = SDIO_STAT & SDIO_INTEN;
+
+	if (pending == 0U) {
+		return;
+	}
+
+	/* Clear latched flags first to avoid losing events when a waiting thread resumes. */
 	sdio_interrupt_flag_clear(pending & GD32_SDIO_INT_CLEAR_ALL);
+	gd32_sdio_sync();
+
+	/* SDIO card interrupt (function interrupt) */
+	if ((pending & SDIO_INT_FLAG_SDIOINT) != 0U) {
+		if ((data->enabled_sources & SDHC_INT_SDIO) != 0 && data->card_cb != NULL) {
+			data->card_cb(dev, SDHC_INT_SDIO, data->card_cb_user_data);
+		}
+	}
+
+	if (gd32_sdhc_cmd_process_pending(data, pending)) {
+		k_sem_give(&data->cmd_sem);
+	}
+
+	if (gd32_sdhc_data_process_pending(data, pending)) {
+		k_sem_give(&data->data_sem);
+	}
 }
 
 static void gd32_sdhc_dma_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
@@ -517,9 +420,8 @@ static int gd32_sdhc_reset(const struct device *dev)
 	k_mutex_lock(&data->lock, K_FOREVER);
 
 	sdio_interrupt_disable(0xFFFFFFFFU);
-	sdio_dma_disable();
-	sdio_dsm_disable();
-	sdio_csm_disable();
+	gd32_sdio_datactl_write(SDIO_DATACTL & ~(SDIO_DATACTL_DMAEN | SDIO_DATACTL_DATAEN));
+	gd32_sdio_cmdctl_write(SDIO_CMDCTL & ~SDIO_CMDCTL_CSMEN);
 	sdio_interrupt_flag_clear(GD32_SDIO_INT_CLEAR_ALL);
 	gd32_sdio_sync();
 
@@ -528,6 +430,7 @@ static int gd32_sdhc_reset(const struct device *dev)
 	}
 
 	data->card_high_capacity = false;
+	data->rca = 0U;
 
 	k_mutex_unlock(&data->lock);
 	return 0;
@@ -537,14 +440,29 @@ static int gd32_sdhc_set_clock(const struct device *dev, uint32_t clock_hz)
 {
 	const struct gd32_sdhc_config *cfg = dev->config;
 	struct gd32_sdhc_data *data = dev->data;
+	uint32_t pclk2_hz = 0U;
+	uint32_t max_by_pclk2_hz = 0U;
 
 	if (clock_hz == 0U) {
 		LOG_DBG("Clock off");
-		sdio_clock_disable();
-		sdio_hardware_clock_disable();
+		gd32_sdio_clkctl_update(SDIO_CLKCTL_CLKEN | SDIO_CLKCTL_HWCLKEN, 0U);
 		gd32_sdio_sync();
 		data->host_io.clock = 0U;
 		return 0;
+	}
+
+	if (clock_control_get_rate(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid,
+				   &pclk2_hz) == 0) {
+		/*
+		 * PCLK2 must be >= 3/8 of SDIO_CLK.
+		 * => SDIO_CLK must be <= PCLK2 * 8 / 3.
+		 */
+		max_by_pclk2_hz = (uint32_t)(((uint64_t)pclk2_hz * 8U) / 3U);
+		if (max_by_pclk2_hz != 0U && clock_hz > max_by_pclk2_hz) {
+			LOG_WRN("Clock clamped by PCLK2: req=%uHz PCLK2=%uHz max=%uHz", clock_hz,
+				pclk2_hz, max_by_pclk2_hz);
+			clock_hz = max_by_pclk2_hz;
+		}
 	}
 
 	if ((clock_hz < cfg->min_bus_freq) ||
@@ -574,6 +492,8 @@ static int gd32_sdhc_set_clock(const struct device *dev, uint32_t clock_hz)
 	}
 
 	sdio_hardware_clock_disable();
+	gd32_sdio_sync();
+	sdio_hardware_clock_enable();
 	gd32_sdio_sync();
 	sdio_clock_enable();
 	gd32_sdio_sync();
@@ -642,13 +562,13 @@ static int gd32_sdhc_set_io(const struct device *dev, struct sdhc_io *ios)
 		LOG_DBG("Bus width set: %u", ios->bus_width);
 		switch (ios->bus_width) {
 		case SDHC_BUS_WIDTH1BIT:
-			sdio_bus_mode_set(SDIO_BUSMODE_1BIT);
+			gd32_sdio_clkctl_update(SDIO_CLKCTL_BUSMODE, SDIO_BUSMODE_1BIT);
 			break;
 		case SDHC_BUS_WIDTH4BIT:
-			sdio_bus_mode_set(SDIO_BUSMODE_4BIT);
+			gd32_sdio_clkctl_update(SDIO_CLKCTL_BUSMODE, SDIO_BUSMODE_4BIT);
 			break;
 		case SDHC_BUS_WIDTH8BIT:
-			sdio_bus_mode_set(SDIO_BUSMODE_8BIT);
+			gd32_sdio_clkctl_update(SDIO_CLKCTL_BUSMODE, SDIO_BUSMODE_8BIT);
 			break;
 		default:
 			ret = -ENOTSUP;
@@ -824,15 +744,18 @@ static bool gd32_sdhc_cmd_needs_cmdsend(uint32_t response_type)
 	return (response_type & SDHC_NATIVE_RESPONSE_MASK) == SD_RSP_TYPE_NONE;
 }
 
-static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd)
+static int gd32_sdhc_send_cmd_common(const struct device *dev, struct sdhc_command *cmd, bool log_errors)
 {
 	struct gd32_sdhc_data *data = dev->data;
 	uint32_t resp = gd32_sdhc_resp_sel(cmd->response_type);
 	bool wait_cmdsend = gd32_sdhc_cmd_needs_cmdsend(cmd->response_type);
 	bool resp_has_crc = gd32_sdhc_resp_has_crc(cmd->response_type);
 
-	LOG_DBG("CMD%u arg=0x%08x resp=%u timeout=%d", cmd->opcode, cmd->arg,
-		(unsigned int)(cmd->response_type & SDHC_NATIVE_RESPONSE_MASK), cmd->timeout_ms);
+	if (log_errors) {
+		LOG_DBG("CMD%u arg=0x%08x resp=%u timeout=%d", cmd->opcode, cmd->arg,
+			(unsigned int)(cmd->response_type & SDHC_NATIVE_RESPONSE_MASK),
+			cmd->timeout_ms);
+	}
 
 	data->cmd_err = 0U;
 	k_sem_reset(&data->cmd_sem);
@@ -855,20 +778,30 @@ static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd
 		sdio_interrupt_enable(en);
 	}
 
-	sdio_command_response_config(cmd->opcode, cmd->arg, resp);
-	gd32_sdio_sync();
-	sdio_wait_type_set(SDIO_WAITTYPE_NO);
-	gd32_sdio_sync();
-	sdio_csm_enable();
-	gd32_sdio_sync();
+	gd32_sdio_cmd_start(cmd->opcode, cmd->arg, resp, SDIO_WAITTYPE_NO);
 
 	int ret = k_sem_take(&data->cmd_sem, gd32_ms_to_timeout(cmd->timeout_ms));
+
+	if (ret != 0) {
+		uint32_t pending = SDIO_STAT & GD32_SDIO_FLAG_CMD_MASK;
+
+		if (pending != 0U) {
+			(void)gd32_sdhc_cmd_process_pending(data, pending);
+			sdio_interrupt_flag_clear(pending & GD32_SDIO_INT_CLEAR_XFER);
+			gd32_sdio_sync();
+			ret = 0;
+		}
+	}
 
 	sdio_interrupt_disable(GD32_SDIO_INT_CMD_MASK);
 
 	if (ret != 0) {
-		LOG_ERR("CMD%u timed out", cmd->opcode);
-		gd32_sdhc_dump_hw_state("CMD timeout");
+		if (log_errors) {
+			LOG_ERR("CMD%u timed out", cmd->opcode);
+			gd32_sdhc_dump_hw_state("CMD timeout");
+		} else {
+			LOG_DBG("CMD%u timed out", cmd->opcode);
+		}
 		return -ETIMEDOUT;
 	}
 
@@ -879,7 +812,9 @@ static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd
 
 		if (data->cmd_err == 0U) {
 			gd32_sdhc_read_response(cmd);
-			gd32_sdhc_maybe_log_response(data, cmd);
+			if (cmd->opcode == SD_SEND_RELATIVE_ADDR) {
+				data->rca = (uint16_t)((cmd->response[0] & 0xFFFF0000U) >> 16U);
+			}
 			if (cmd->opcode == SD_APP_SEND_OP_COND) {
 				data->card_high_capacity =
 					(cmd->response[0] & SD_OCR_CARD_CAP_FLAG) != 0U;
@@ -890,9 +825,13 @@ static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd
 			return 0;
 		}
 
-		LOG_ERR("CMD%u failed (err=0x%x)", cmd->opcode, data->cmd_err);
-		gd32_sdhc_log_cmd_error(data->cmd_err);
-		gd32_sdhc_dump_hw_state("CMD failed");
+		if (log_errors) {
+			LOG_ERR("CMD%u failed (err=0x%x)", cmd->opcode, data->cmd_err);
+			gd32_sdhc_log_cmd_error(data->cmd_err);
+			gd32_sdhc_dump_hw_state("CMD failed");
+		} else {
+			LOG_DBG("CMD%u failed (err=0x%x)", cmd->opcode, data->cmd_err);
+		}
 		if ((data->cmd_err & GD32_SDHC_ERR_CMD_TIMEOUT) != 0U) {
 			return -ETIMEDOUT;
 		}
@@ -901,20 +840,32 @@ static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd
 
 	if (gd32_sdhc_resp_has_cmdidx(cmd->response_type) &&
 	    (sdio_command_index_get() != cmd->opcode)) {
-		LOG_ERR("CMD%u bad cmd index in response (%u)", cmd->opcode,
-			sdio_command_index_get());
-		gd32_sdhc_dump_hw_state("CMD bad index");
+		if (log_errors) {
+			LOG_ERR("CMD%u bad cmd index in response (%u)", cmd->opcode,
+				sdio_command_index_get());
+			gd32_sdhc_dump_hw_state("CMD bad index");
+		} else {
+			LOG_DBG("CMD%u bad cmd index in response (%u)", cmd->opcode,
+				sdio_command_index_get());
+		}
 		return -EIO;
 	}
 
 	gd32_sdhc_read_response(cmd);
-	gd32_sdhc_maybe_log_response(data, cmd);
+	if (cmd->opcode == SD_SEND_RELATIVE_ADDR) {
+		data->rca = (uint16_t)((cmd->response[0] & 0xFFFF0000U) >> 16U);
+	}
 	if (cmd->opcode == SD_APP_SEND_OP_COND) {
 		data->card_high_capacity = (cmd->response[0] & SD_OCR_CARD_CAP_FLAG) != 0U;
 	} else if (cmd->opcode == MMC_SEND_OP_COND) {
 		data->card_high_capacity = (cmd->response[0] & MMC_OCR_SECTOR_MODE) != 0U;
 	}
 	return 0;
+}
+
+static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd)
+{
+	return gd32_sdhc_send_cmd_common(dev, cmd, true);
 }
 
 static bool gd32_sdhc_is_write(const struct sdhc_command *cmd)
@@ -933,6 +884,52 @@ static bool gd32_sdhc_is_write(const struct sdhc_command *cmd)
 static bool gd32_sdhc_is_multiblock_rw(const struct sdhc_command *cmd)
 {
 	return (cmd->opcode == SD_READ_MULTIPLE_BLOCK) || (cmd->opcode == SD_WRITE_MULTIPLE_BLOCK);
+}
+
+static int gd32_sdhc_wait_ready_for_data(const struct device *dev, uint32_t timeout_ms)
+{
+	struct gd32_sdhc_data *data = dev->data;
+	int64_t deadline_ms = INT64_MAX;
+
+	if (data->rca == 0U) {
+		return 0;
+	}
+
+	if (timeout_ms != SDHC_TIMEOUT_FOREVER) {
+		deadline_ms = k_uptime_get() + (int64_t)timeout_ms;
+	}
+
+	struct sdhc_command status = {
+		.opcode = SD_SEND_STATUS,
+		.arg = (uint32_t)data->rca << 16U,
+		.response_type = SD_RSP_TYPE_R1,
+		.retries = 0,
+		.timeout_ms = 50,
+	};
+
+	for (;;) {
+		int ret = gd32_sdhc_send_cmd_common(dev, &status, false);
+		if (ret == 0) {
+			uint32_t r1 = status.response[0];
+
+			if ((r1 & SD_R1_ERR_FLAGS) != 0U) {
+				return -EIO;
+			}
+
+			if (((r1 & SD_R1_RDY_DATA) != 0U) &&
+			    (SD_R1_CURRENT_STATE(r1) == SDMMC_R1_TRANSFER)) {
+				return 0;
+			}
+		}
+
+		if (timeout_ms != SDHC_TIMEOUT_FOREVER) {
+			if (k_uptime_get() >= deadline_ms) {
+				return -EBUSY;
+			}
+		}
+
+		k_sleep(K_MSEC(1));
+	}
 }
 
 static uint32_t gd32_sdhc_data_mode(const struct sdhc_command *cmd)
@@ -990,9 +987,8 @@ static int gd32_sdhc_prepare_bounce(struct gd32_sdhc_data *data, bool write, con
 	data->bounce_used = false;
 #endif
 
-	size_t dma_len = ROUND_UP(len, sizeof(uint32_t));
-	bool needs_bounce = ((dma_len != len) || !IS_ALIGNED(buf, sizeof(uint32_t)) ||
-			     !gd32_sdhc_buf_is_dma_capable(buf, len));
+	size_t dma_len = len;
+	bool needs_bounce = !gd32_sdhc_buf_is_dma_capable(buf, len);
 
 	if (!needs_bounce) {
 		*out_dma_buf = (void *)buf;
@@ -1021,7 +1017,6 @@ static int gd32_sdhc_prepare_bounce(struct gd32_sdhc_data *data, bool write, con
 
 	if (write) {
 		memcpy(bounce, buf, len);
-		memset((uint8_t *)bounce + len, 0, dma_len - len);
 		sys_cache_data_flush_range(bounce, dma_len);
 	} else {
 		sys_cache_data_invd_range(bounce, dma_len);
@@ -1067,6 +1062,15 @@ static void gd32_sdhc_release_bounce(struct gd32_sdhc_data *data, bool write, bo
 #endif
 }
 
+static uint32_t gd32_sdhc_dma_xfer_unit(const void *dma_buf, size_t dma_len)
+{
+	if (IS_ALIGNED(dma_buf, sizeof(uint32_t)) && ((dma_len % sizeof(uint32_t)) == 0U)) {
+		return sizeof(uint32_t);
+	}
+
+	return 1U;
+}
+
 static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_buf, size_t dma_len)
 {
 	const struct gd32_sdhc_config *cfg = dev->config;
@@ -1079,11 +1083,14 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 	struct dma_block_config blk = {0};
 	struct dma_config dma_cfg = {0};
 
+	uint32_t xfer_unit = gd32_sdhc_dma_xfer_unit(dma_buf, dma_len);
+	uint32_t burst_len = (xfer_unit == sizeof(uint32_t)) ? 4U : 1U;
+
 	dma_cfg.channel_direction = write ? MEMORY_TO_PERIPHERAL : PERIPHERAL_TO_MEMORY;
-	dma_cfg.source_data_size = 4U;
-	dma_cfg.dest_data_size = 4U;
-	dma_cfg.source_burst_length = 4U;
-	dma_cfg.dest_burst_length = 4U;
+	dma_cfg.source_data_size = xfer_unit;
+	dma_cfg.dest_data_size = xfer_unit;
+	dma_cfg.source_burst_length = burst_len;
+	dma_cfg.dest_burst_length = burst_len;
 	dma_cfg.channel_priority = 3U;
 	dma_cfg.block_count = 1U;
 	dma_cfg.head_block = &blk;
@@ -1106,7 +1113,7 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 		blk.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 	}
 
-	blk.block_size = (uint32_t)(dma_len / sizeof(uint32_t));
+	blk.block_size = (uint32_t)(dma_len / xfer_unit);
 
 	data->dma_status = 0;
 	k_sem_reset(&data->dma_sem);
@@ -1144,8 +1151,13 @@ static void gd32_sdhc_stop_dma(const struct device *dev)
 
 static void gd32_sdhc_drain_rx_fifo(void)
 {
-	while (sdio_flag_get(SDIO_FLAG_RXDTVAL) != RESET) {
+	/* FIFO is 32 words deep; drain a bounded amount to avoid lockups. */
+	for (uint32_t i = 0U; i < 64U && (sdio_flag_get(SDIO_FLAG_RXDTVAL) != RESET); i++) {
 		(void)sdio_data_read();
+	}
+
+	if (sdio_flag_get(SDIO_FLAG_RXDTVAL) != RESET) {
+		LOG_WRN("RX FIFO did not drain");
 	}
 }
 
@@ -1154,9 +1166,8 @@ static void gd32_sdhc_abort_io(const struct device *dev)
 	struct gd32_sdhc_data *data = dev->data;
 
 	sdio_interrupt_disable(GD32_SDIO_INT_CMD_MASK | GD32_SDIO_INT_DATA_MASK);
-	sdio_dsm_disable();
-	sdio_dma_disable();
-	sdio_csm_disable();
+	gd32_sdio_datactl_write(SDIO_DATACTL & ~(SDIO_DATACTL_DMAEN | SDIO_DATACTL_DATAEN));
+	gd32_sdio_cmdctl_write(SDIO_CMDCTL & ~SDIO_CMDCTL_CSMEN);
 
 	gd32_sdhc_stop_dma(dev);
 	(void)k_sem_take(&data->dma_sem, K_NO_WAIT);
@@ -1200,11 +1211,23 @@ static int gd32_sdhc_prepare_data_path(const struct device *dev, const struct sd
 	sdio_interrupt_flag_clear(GD32_SDIO_INT_CLEAR_XFER);
 	gd32_sdio_sync();
 
-	sdio_data_config(timeout, bytes, blksz);
+	SDIO_DATATO = timeout;
+	SDIO_DATALEN = bytes;
 	gd32_sdio_sync();
-	sdio_data_transfer_config(gd32_sdhc_data_mode(cmd),
-				  write ? SDIO_TRANSDIRECTION_TOCARD : SDIO_TRANSDIRECTION_TOSDIO);
-	gd32_sdio_sync();
+
+	uint32_t datactl = SDIO_DATACTL;
+	datactl &= ~(SDIO_DATACTL_DATAEN | SDIO_DATACTL_DMAEN | SDIO_DATACTL_DATADIR |
+		     SDIO_DATACTL_TRANSMOD | SDIO_DATACTL_BLKSZ | SDIO_DATACTL_RWEN |
+		     SDIO_DATACTL_RWSTOP | SDIO_DATACTL_RWTYPE | SDIO_DATACTL_IOEN);
+	datactl |= blksz;
+	datactl |= gd32_sdhc_data_mode(cmd);
+	if (!write) {
+		datactl |= SDIO_TRANSDIRECTION_TOSDIO;
+	}
+	if (cmd->opcode == SDIO_RW_EXTENDED) {
+		datactl |= SDIO_DATACTL_IOEN;
+	}
+	gd32_sdio_datactl_write(datactl);
 
 	return 0;
 }
@@ -1238,12 +1261,18 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 
 		int ret = k_sem_take(&data->data_sem, to);
 		if (ret != 0) {
-			LOG_ERR("DATA timeout waiting for SDIO (CMD%u write=%u data_err=0x%x "
-				"events=0x%x STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
-				cmd->opcode, write ? 1U : 0U, data->data_err, data->data_events,
-				SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
-			gd32_sdhc_dump_hw_state("DATA SDIO timeout");
-			return -ETIMEDOUT;
+			uint32_t pending = SDIO_STAT & GD32_SDIO_FLAG_DATA_MASK;
+
+			if (pending != 0U) {
+				(void)gd32_sdhc_data_process_pending(data, pending);
+				sdio_interrupt_flag_clear(pending & GD32_SDIO_INT_CLEAR_XFER);
+				gd32_sdio_sync();
+			} else {
+				LOG_ERR("DATA timeout (CMD%u write=%u)", cmd->opcode,
+					write ? 1U : 0U);
+				gd32_sdhc_dump_hw_state("DATA timeout");
+				return -ETIMEDOUT;
+			}
 		}
 
 		if (write && ((data->data_err & GD32_SDHC_ERR_DATA_TIMEOUT) != 0U) &&
@@ -1252,14 +1281,11 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 		}
 
 		if (data->data_err != 0U) {
-			LOG_ERR("DATA error (CMD%u write=%u data_err=0x%x events=0x%x STAT=0x%08x "
-				"INTEN=0x%08x DATACNT=0x%08x)",
-				cmd->opcode, write ? 1U : 0U, data->data_err, data->data_events,
-				SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
+			LOG_ERR("DATA error (CMD%u write=%u err=0x%x)", cmd->opcode,
+				write ? 1U : 0U, data->data_err);
 			sdio_interrupt_disable(GD32_SDIO_INT_DATA_MASK);
-			sdio_dsm_disable();
-			sdio_dma_disable();
-			gd32_sdio_sync();
+			gd32_sdio_datactl_write(SDIO_DATACTL &
+						~(SDIO_DATACTL_DMAEN | SDIO_DATACTL_DATAEN));
 
 			gd32_sdhc_stop_dma(dev);
 			(void)k_sem_take(&data->dma_sem, K_NO_WAIT);
@@ -1294,30 +1320,22 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 
 	int ret = k_sem_take(&data->dma_sem, dma_to);
 	if (ret != 0) {
-		LOG_ERR("DATA timeout waiting for DMA (CMD%u write=%u data_err=0x%x events=0x%x "
-			"STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
-			cmd->opcode, write ? 1U : 0U, data->data_err, data->data_events, SDIO_STAT,
-			SDIO_INTEN, SDIO_DATACNT);
+		LOG_ERR("DATA DMA timeout (CMD%u write=%u)", cmd->opcode, write ? 1U : 0U);
 		gd32_sdhc_dump_hw_state("DATA DMA timeout");
 		return -ETIMEDOUT;
 	}
 
 	if (data->dma_status < 0) {
-		LOG_ERR("DMA status error (CMD%u write=%u dma=%d data_err=0x%x events=0x%x "
-			"STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
-			cmd->opcode, write ? 1U : 0U, data->dma_status, data->data_err,
-			data->data_events, SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
+		LOG_ERR("DMA error (CMD%u write=%u status=%d)", cmd->opcode, write ? 1U : 0U,
+			data->dma_status);
 		gd32_sdhc_log_data_error(data->data_err, data->dma_status);
 		gd32_sdhc_dump_hw_state("DMA failed");
 		return -EIO;
 	}
 
 	if (data->data_err != 0U) {
-		LOG_ERR("DATA error after DMA (CMD%u write=%u data_err=0x%x events=0x%x "
-			"STAT=0x%08x "
-			"INTEN=0x%08x DATACNT=0x%08x)",
-			cmd->opcode, write ? 1U : 0U, data->data_err, data->data_events, SDIO_STAT,
-			SDIO_INTEN, SDIO_DATACNT);
+		LOG_ERR("DATA error after DMA (CMD%u write=%u err=0x%x)", cmd->opcode,
+			write ? 1U : 0U, data->data_err);
 		gd32_sdhc_log_data_error(data->data_err, data->dma_status);
 		gd32_sdhc_dump_hw_state("DATA failed");
 		if ((data->data_err & GD32_SDHC_ERR_DATA_TIMEOUT) != 0U) {
@@ -1327,17 +1345,6 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 	}
 
 	return 0;
-}
-
-static bool gd32_sdhc_is_transient_data_failure(uint32_t data_err, int dma_status)
-{
-	if (dma_status < 0) {
-		return true;
-	}
-
-	return (data_err &
-		(GD32_SDHC_ERR_DATA_CRC | GD32_SDHC_ERR_START_BIT | GD32_SDHC_ERR_TX_UNDERRUN |
-		 GD32_SDHC_ERR_RX_OVERRUN | GD32_SDHC_ERR_DATA_TIMEOUT)) != 0U;
 }
 
 static int gd32_sdhc_transfer_data_chunk(const struct device *dev, struct sdhc_command *cmd,
@@ -1418,8 +1425,7 @@ static int gd32_sdhc_transfer_data_chunk(const struct device *dev, struct sdhc_c
 	ret = gd32_sdhc_wait_data_done(dev, cmd, xfer, write);
 
 	gd32_sdhc_stop_dma(dev);
-	sdio_dsm_disable();
-	sdio_dma_disable();
+	gd32_sdio_datactl_write(SDIO_DATACTL & ~(SDIO_DATACTL_DMAEN | SDIO_DATACTL_DATAEN));
 	sdio_interrupt_disable(GD32_SDIO_INT_DATA_MASK);
 	gd32_sdhc_drain_rx_fifo();
 	sdio_interrupt_flag_clear(GD32_SDIO_INT_CLEAR_XFER);
@@ -1454,21 +1460,10 @@ static int gd32_sdhc_build_data_chunk_cmd(struct gd32_sdhc_data *data,
 	switch (cmd->opcode) {
 	case SD_READ_SINGLE_BLOCK:
 	case SD_READ_MULTIPLE_BLOCK: {
-		bool high_capacity = data->card_high_capacity;
-
-		if (xfer->block_addr != 0U) {
-			if (cmd->arg == xfer->block_addr) {
-				high_capacity = true;
-			} else if (cmd->arg ==
-				   ((uint64_t)xfer->block_addr * (uint64_t)xfer->block_size)) {
-				high_capacity = false;
-			}
-		}
-
 		uint32_t start_block = xfer->block_addr + block_offset;
 		uint64_t start_addr =
-			high_capacity ? start_block
-				      : ((uint64_t)start_block * (uint64_t)xfer->block_size);
+			data->card_high_capacity ? start_block
+						 : ((uint64_t)start_block * (uint64_t)xfer->block_size);
 		if (start_addr > UINT32_MAX) {
 			return -EINVAL;
 		}
@@ -1479,21 +1474,10 @@ static int gd32_sdhc_build_data_chunk_cmd(struct gd32_sdhc_data *data,
 	}
 	case SD_WRITE_SINGLE_BLOCK:
 	case SD_WRITE_MULTIPLE_BLOCK: {
-		bool high_capacity = data->card_high_capacity;
-
-		if (xfer->block_addr != 0U) {
-			if (cmd->arg == xfer->block_addr) {
-				high_capacity = true;
-			} else if (cmd->arg ==
-				   ((uint64_t)xfer->block_addr * (uint64_t)xfer->block_size)) {
-				high_capacity = false;
-			}
-		}
-
 		uint32_t start_block = xfer->block_addr + block_offset;
 		uint64_t start_addr =
-			high_capacity ? start_block
-				      : ((uint64_t)start_block * (uint64_t)xfer->block_size);
+			data->card_high_capacity ? start_block
+						 : ((uint64_t)start_block * (uint64_t)xfer->block_size);
 		if (start_addr > UINT32_MAX) {
 			return -EINVAL;
 		}
@@ -1539,8 +1523,7 @@ static int gd32_sdhc_transfer_data_chunk_with_retries(const struct device *dev,
 						      struct sdhc_data *xfer)
 {
 	struct gd32_sdhc_data *data = dev->data;
-	int base_attempts = (int)cmd->retries + 1;
-	int max_attempts = base_attempts + ((cmd->retries == 0U) ? 1 : 0);
+	int max_attempts = (int)cmd->retries + 1;
 	int last_ret = 0;
 	uint32_t last_cmd_err = 0U;
 	uint32_t last_data_err = 0U;
@@ -1550,9 +1533,6 @@ static int gd32_sdhc_transfer_data_chunk_with_retries(const struct device *dev,
 
 	for (int attempt = 1;; ++attempt) {
 		attempts_used = attempt;
-		gd32_sdhc_abort_io(dev);
-		gd32_sdhc_wait_idle_ms(20U);
-
 		ret = gd32_sdhc_transfer_data_chunk(dev, cmd, xfer);
 
 		last_ret = ret;
@@ -1564,27 +1544,13 @@ static int gd32_sdhc_transfer_data_chunk_with_retries(const struct device *dev,
 			break;
 		}
 
-		bool transient =
-			gd32_sdhc_is_transient_data_failure(last_data_err, last_dma_status);
-		bool retry_allowed =
-			(attempt < base_attempts) ||
-			((cmd->retries == 0U) && (attempt == base_attempts) && transient);
-		if (!retry_allowed) {
+		if (attempt >= max_attempts) {
 			break;
 		}
 
-		uint32_t delay_ms =
-			gd32_sdhc_retry_delay_ms(last_cmd_err, last_data_err, last_dma_status);
-		LOG_INF("Retrying DATA CMD%u (%s) in %ums (%d/%d) (ret=%d cmd_err=0x%x "
-			"data_err=0x%x dma=%d)",
-			cmd->opcode,
-			gd32_sdhc_primary_error_str(last_cmd_err, last_data_err, last_dma_status),
-			delay_ms, attempt + 1, max_attempts, last_ret, last_cmd_err, last_data_err,
-			last_dma_status);
-
 		gd32_sdhc_abort_io(dev);
 		gd32_sdhc_wait_idle_ms(20U);
-		k_sleep(K_MSEC(delay_ms));
+		k_sleep(K_MSEC(5));
 	}
 
 	if (ret != 0) {
@@ -1603,13 +1569,12 @@ static int gd32_sdhc_cmd_with_data(const struct device *dev, struct sdhc_command
 {
 	struct gd32_sdhc_data *data = dev->data;
 	size_t bytes = (size_t)xfer->block_size * (size_t)xfer->blocks;
+	bool write = gd32_sdhc_is_write(cmd);
 
 #if CONFIG_SDHC_GD32_BOUNCE_BUFFER_SIZE > 0
-	size_t dma_len = ROUND_UP(bytes, sizeof(uint32_t));
-	bool needs_bounce = ((dma_len != bytes) || !IS_ALIGNED(xfer->data, sizeof(uint32_t)) ||
-			     !gd32_sdhc_buf_is_dma_capable(xfer->data, bytes));
+	bool needs_bounce = !gd32_sdhc_buf_is_dma_capable(xfer->data, bytes);
 	bool needs_chunking = needs_bounce && (gd32_sdhc_data_mode(cmd) == SDIO_TRANSMODE_BLOCK) &&
-			      (dma_len > sizeof(data->bounce_buf));
+			      (bytes > sizeof(data->bounce_buf));
 #else
 	bool needs_chunking = false;
 	ARG_UNUSED(data);
@@ -1637,9 +1602,9 @@ static int gd32_sdhc_cmd_with_data(const struct device *dev, struct sdhc_command
 	}
 
 	uint32_t done_blocks = 0U;
-	while (done_blocks < blocks_total) {
-		uint32_t chunk_blocks = MIN(blocks_total - done_blocks, max_blocks_per_chunk);
-		size_t offset_bytes = (size_t)done_blocks * (size_t)block_size;
+		while (done_blocks < blocks_total) {
+			uint32_t chunk_blocks = MIN(blocks_total - done_blocks, max_blocks_per_chunk);
+			size_t offset_bytes = (size_t)done_blocks * (size_t)block_size;
 
 		struct sdhc_command chunk_cmd = *cmd;
 		struct sdhc_data chunk_xfer = *xfer;
@@ -1649,14 +1614,27 @@ static int gd32_sdhc_cmd_with_data(const struct device *dev, struct sdhc_command
 
 		int ret = gd32_sdhc_build_data_chunk_cmd(data, cmd, xfer, &chunk_cmd, done_blocks,
 							 chunk_blocks);
-		if (ret != 0) {
-			return ret;
-		}
+			if (ret != 0) {
+				return ret;
+			}
 
-		ret = gd32_sdhc_transfer_data_chunk_with_retries(dev, &chunk_cmd, &chunk_xfer);
-		if (ret != 0) {
-			return ret;
-		}
+			if (write) {
+				/*
+				 * Chunking a multi-block write into multiple CMD24 transfers requires
+				 * waiting for the card to become ready between blocks. Otherwise the
+				 * card may ignore a subsequent CMD24 while it is still programming
+				 * the previous block.
+				 */
+				ret = gd32_sdhc_wait_ready_for_data(dev, xfer->timeout_ms);
+				if (ret != 0) {
+					return ret;
+				}
+			}
+
+			ret = gd32_sdhc_transfer_data_chunk_with_retries(dev, &chunk_cmd, &chunk_xfer);
+			if (ret != 0) {
+				return ret;
+			}
 
 		done_blocks += chunk_blocks;
 	}
@@ -1679,6 +1657,9 @@ static int gd32_sdhc_request(const struct device *dev, struct sdhc_command *cmd,
 
 	int ret = 0;
 
+	gd32_sdhc_abort_io(dev);
+	gd32_sdhc_wait_idle_ms(20U);
+
 	if (xfer != NULL) {
 		ret = gd32_sdhc_cmd_with_data(dev, cmd, xfer);
 	} else {
@@ -1687,9 +1668,6 @@ static int gd32_sdhc_request(const struct device *dev, struct sdhc_command *cmd,
 		uint32_t last_cmd_err = 0U;
 
 		for (int attempt = 1; attempt <= attempts; ++attempt) {
-			gd32_sdhc_abort_io(dev);
-			gd32_sdhc_wait_idle_ms(20U);
-
 			ret = gd32_sdhc_send_cmd(dev, cmd);
 			last_ret = ret;
 			last_cmd_err = data->cmd_err;
@@ -1699,15 +1677,9 @@ static int gd32_sdhc_request(const struct device *dev, struct sdhc_command *cmd,
 			}
 
 			if (attempt < attempts) {
-				uint32_t delay_ms = gd32_sdhc_retry_delay_ms(last_cmd_err, 0U, 0);
-				LOG_INF("Retrying CMD%u (%s) in %ums (%d/%d) (ret=%d cmd_err=0x%x)",
-					cmd->opcode,
-					gd32_sdhc_primary_error_str(last_cmd_err, 0U, 0), delay_ms,
-					attempt + 1, attempts, last_ret, last_cmd_err);
-
 				gd32_sdhc_abort_io(dev);
 				gd32_sdhc_wait_idle_ms(20U);
-				k_sleep(K_MSEC(delay_ms));
+				k_sleep(K_MSEC(5));
 			}
 		}
 
@@ -1795,9 +1767,6 @@ static int gd32_sdhc_init(const struct device *dev)
 	k_sem_init(&data->data_sem, 0, 1);
 	k_sem_init(&data->dma_sem, 0, 1);
 
-	data->cmd13_count = 0U;
-	data->last_cmd13_r1 = 0U;
-	data->last_r1_err_flags = 0U;
 	data->card_high_capacity = false;
 
 	/* Ensure the peripheral is in a known state. */
@@ -1806,8 +1775,7 @@ static int gd32_sdhc_init(const struct device *dev)
 	sdio_interrupt_flag_clear(GD32_SDIO_INT_CLEAR_ALL);
 	gd32_sdio_sync();
 
-	sdio_bus_mode_set(SDIO_BUSMODE_1BIT);
-	gd32_sdio_sync();
+	gd32_sdio_clkctl_update(SDIO_CLKCTL_BUSMODE, SDIO_BUSMODE_1BIT);
 	sdio_power_state_set(SDIO_POWER_OFF);
 	gd32_sdio_sync();
 

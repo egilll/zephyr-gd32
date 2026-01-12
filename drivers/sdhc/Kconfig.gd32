@@ -24,8 +24,9 @@ config SDHC_GD32_BOUNCE_BUFFER_SIZE
 	default 512
 	help
 	  Size in bytes of the static bounce buffer used when SDIO DMA needs
-	  a DMA-capable buffer (DT_MEM_DMA) or when the provided buffer or
-	  length is not word-aligned. If the transfer is larger than the
+	  a DMA-capable buffer (DT_MEM_DMA). Unaligned buffers and non-word
+	  lengths are handled using byte-wide DMA transfers instead of bounce
+	  buffering. If a transfer requires bounce buffering and is larger than the
 	  bounce buffer, the driver splits it into multiple transfers.
 	  Set to 0 to disable bounce buffering and require DMA-safe buffers.
 
