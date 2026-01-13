@@ -1171,8 +1171,32 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 		break;
 #endif /* I2C_FMPCFG */
 	default:
-		err = -EINVAL;
-		goto error;
+		//set up clocks in standard mode but with 50KHz bitrate (HDMI limit)
+		if (freq < I2CCLK_MIN) {
+			LOG_ERR("I2C standard-mode min clock freq %u, current is %u\n",
+				I2CCLK_MIN, freq);
+			err = -ENOTSUP;
+			goto error;
+		}
+		I2C_CTL1(cfg->reg) &= ~I2C_CTL1_I2CCLK;
+		I2C_CTL1(cfg->reg) |= freq;
+
+		/* Standard-mode risetime maximum value: 1000ns */
+		if (freq == I2CCLK_MAX) {
+			I2C_RT(cfg->reg) = I2CCLK_MAX;
+		} else {
+			I2C_RT(cfg->reg) = freq + 1U;
+		}
+
+		/* CLKC = pclk1 / (bitrate * 2) */
+		clkc = pclk1 / (50000 * 2U);
+
+		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
+		I2C_CKCFG(cfg->reg) |= clkc;
+		/* standard-mode */
+		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_FAST;
+
+		break;
 	}
 
 	data->dev_config = dev_config;
