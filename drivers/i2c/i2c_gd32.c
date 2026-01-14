@@ -17,6 +17,7 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/sys/util.h>
 
 #ifdef CONFIG_I2C_GD32_DMA
 #include <string.h>
@@ -993,10 +994,16 @@ static int i2c_gd32_transfer(const struct device *dev, struct i2c_msg *msgs, uin
 		}
 
 		if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-			data->errs = I2C_GD32_ERR_BUSY;
-			err = -EBUSY;
-			i2c_gd32_log_err(data);
-			break;
+			(void)i2c_gd32_wait_not_busy(cfg, I2C_GD32_STOP_TIMEOUT_MS);
+			if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
+				(void)i2c_gd32_recover_bus_locked(dev);
+			}
+			if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
+				data->errs = I2C_GD32_ERR_BUSY;
+				err = -EBUSY;
+				i2c_gd32_log_err(data);
+				break;
+			}
 		}
 
 #ifdef CONFIG_I2C_GD32_DMA
@@ -1036,6 +1043,7 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
 	uint32_t pclk1, freq, clkc;
+	int ret;
 	int err = 0;
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
@@ -1043,15 +1051,18 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 	/* Disable I2C device */
 	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
 
-	(void)clock_control_get_rate(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid,
+	ret = clock_control_get_rate(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid,
 				     &pclk1);
+	if (ret != 0) {
+		err = ret;
+		goto error;
+	}
 
 	/* i2c clock frequency, us */
 	freq = pclk1 / 1000000U;
 	if (freq > I2CCLK_MAX) {
-		LOG_ERR("I2C max clock freq %u, current is %u\n", I2CCLK_MAX, freq);
-		err = -ENOTSUP;
-		goto error;
+		LOG_WRN("I2C max I2CCLK %u, current is %u", I2CCLK_MAX, freq);
+		freq = I2CCLK_MAX;
 	}
 
 	/*
@@ -1102,7 +1113,15 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 		}
 
 		/* CLKC = pclk1 / (bitrate * 2) */
-		clkc = pclk1 / (I2C_BITRATE_STANDARD * 2U);
+		clkc = DIV_ROUND_UP(pclk1, I2C_BITRATE_STANDARD * 2U);
+		if (clkc < 4U) {
+			clkc = 4U;
+		}
+		if (clkc > I2C_CKCFG_CLKC) {
+			LOG_ERR("I2C standard-mode CLKC overflow: %u", clkc);
+			err = -ENOTSUP;
+			goto error;
+		}
 
 		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
 		I2C_CKCFG(cfg->reg) |= clkc;
@@ -1118,19 +1137,40 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 			goto error;
 		}
 
+		I2C_CTL1(cfg->reg) &= ~I2C_CTL1_I2CCLK;
+		I2C_CTL1(cfg->reg) |= freq;
+
 		/* Fast-mode risetime maximum value: 300ns */
 		I2C_RT(cfg->reg) = freq * 300U / 1000U + 1U;
 
-		/* CLKC = pclk1 / (bitrate * 25) */
-		clkc = pclk1 / (I2C_BITRATE_FAST * 25U);
-		if (clkc == 0U) {
-			clkc = 1U;
-		}
+		{
+			uint32_t clkc_dtcy2 = DIV_ROUND_UP(pclk1, I2C_BITRATE_FAST * 3U);
+			uint32_t clkc_dtcy169 = DIV_ROUND_UP(pclk1, I2C_BITRATE_FAST * 25U);
+			uint32_t bitrate_dtcy2 = pclk1 / (3U * MAX(clkc_dtcy2, 1U));
+			uint32_t bitrate_dtcy169 = pclk1 / (25U * MAX(clkc_dtcy169, 1U));
 
-		/* Default DCTY to 1 */
-		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
-		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
-		I2C_CKCFG(cfg->reg) |= clkc;
+			if (clkc_dtcy2 == 0U) {
+				clkc_dtcy2 = 1U;
+			}
+			if (clkc_dtcy169 == 0U) {
+				clkc_dtcy169 = 1U;
+			}
+			if ((clkc_dtcy2 > I2C_CKCFG_CLKC) || (clkc_dtcy169 > I2C_CKCFG_CLKC)) {
+				LOG_ERR("I2C fast-mode CLKC overflow");
+				err = -ENOTSUP;
+				goto error;
+			}
+
+			I2C_CKCFG(cfg->reg) &= ~(I2C_CKCFG_DTCY | I2C_CKCFG_CLKC);
+			if (bitrate_dtcy169 >= bitrate_dtcy2) {
+				I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
+				clkc = clkc_dtcy169;
+			} else {
+				clkc = clkc_dtcy2;
+			}
+
+			I2C_CKCFG(cfg->reg) |= clkc;
+		}
 		/* Transfer mode: fast-mode */
 		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_FAST;
 
@@ -1149,19 +1189,40 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 			goto error;
 		}
 
+		I2C_CTL1(cfg->reg) &= ~I2C_CTL1_I2CCLK;
+		I2C_CTL1(cfg->reg) |= freq;
+
 		/* Fast-mode plus risetime maximum value: 120ns */
 		I2C_RT(cfg->reg) = freq * 120U / 1000U + 1U;
 
-		/* CLKC = pclk1 / (bitrate * 25) */
-		clkc = pclk1 / (I2C_BITRATE_FAST_PLUS * 25U);
-		if (clkc == 0U) {
-			clkc = 1U;
-		}
+		{
+			uint32_t clkc_dtcy2 = DIV_ROUND_UP(pclk1, I2C_BITRATE_FAST_PLUS * 3U);
+			uint32_t clkc_dtcy169 = DIV_ROUND_UP(pclk1, I2C_BITRATE_FAST_PLUS * 25U);
+			uint32_t bitrate_dtcy2 = pclk1 / (3U * MAX(clkc_dtcy2, 1U));
+			uint32_t bitrate_dtcy169 = pclk1 / (25U * MAX(clkc_dtcy169, 1U));
 
-		/* Default DCTY to 1 */
-		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
-		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
-		I2C_CKCFG(cfg->reg) |= clkc;
+			if (clkc_dtcy2 == 0U) {
+				clkc_dtcy2 = 1U;
+			}
+			if (clkc_dtcy169 == 0U) {
+				clkc_dtcy169 = 1U;
+			}
+			if ((clkc_dtcy2 > I2C_CKCFG_CLKC) || (clkc_dtcy169 > I2C_CKCFG_CLKC)) {
+				LOG_ERR("I2C fast-mode plus CLKC overflow");
+				err = -ENOTSUP;
+				goto error;
+			}
+
+			I2C_CKCFG(cfg->reg) &= ~(I2C_CKCFG_DTCY | I2C_CKCFG_CLKC);
+			if (bitrate_dtcy169 >= bitrate_dtcy2) {
+				I2C_CKCFG(cfg->reg) |= I2C_CKCFG_DTCY;
+				clkc = clkc_dtcy169;
+			} else {
+				clkc = clkc_dtcy2;
+			}
+
+			I2C_CKCFG(cfg->reg) |= clkc;
+		}
 		/* Transfer mode: fast-mode */
 		I2C_CKCFG(cfg->reg) |= I2C_CKCFG_FAST;
 
@@ -1192,7 +1253,15 @@ static int i2c_gd32_configure(const struct device *dev, uint32_t dev_config)
 		}
 
 		/* CLKC = pclk1 / (bitrate * 2) */
-		clkc = pclk1 / (bitrate * 2U);
+		clkc = DIV_ROUND_UP(pclk1, bitrate * 2U);
+		if (clkc < 4U) {
+			clkc = 4U;
+		}
+		if (clkc > I2C_CKCFG_CLKC) {
+			LOG_ERR("I2C standard-mode CLKC overflow: %u", clkc);
+			err = -ENOTSUP;
+			goto error;
+		}
 
 		I2C_CKCFG(cfg->reg) &= ~I2C_CKCFG_CLKC;
 		I2C_CKCFG(cfg->reg) |= clkc;
