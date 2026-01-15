@@ -12,13 +12,16 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/kernel.h>
 #include <zephyr/irq.h>
 #include <zephyr/sys/util.h>
+#ifdef CONFIG_DMA
 #include <zephyr/drivers/dma.h>
+#endif
 
 #include <gd32_usart.h>
 
-#ifdef CONFIG_UART_ASYNC_API
+#if defined(CONFIG_UART_ASYNC_API) && defined(CONFIG_DMA)
 static void usart_gd32_dma_rx_cb(const struct device *dma_dev, void *user_data,
 				 uint32_t channel, int status);
 static void usart_gd32_dma_tx_cb(const struct device *dma_dev, void *user_data,
@@ -48,7 +51,7 @@ static void usart_gd32_dma_tx_cb(const struct device *dma_dev, void *user_data,
 
 #define GD32_USART_DMA_INIT_FIELDS(index)                                          \
 	GD32_USART_DMA_STREAM_INIT(index, rx, PERIPHERAL_TO_MEMORY),              \
-	GD32_USART_DMA_STREAM_INIT(index, tx, MEMORY_TO_PERIPHERAL)
+	GD32_USART_DMA_STREAM_INIT(index, tx, MEMORY_TO_PERIPHERAL),
 #else
 #define GD32_USART_DMA_INIT_FIELDS(index)
 #endif
@@ -83,15 +86,28 @@ struct gd32_usart_data {
 	void *async_user_data;
 	const struct device *dev;
 	struct {
-		const struct device *dma_dev;
-		uint32_t dma_channel;
-		struct dma_config dma_cfg;
-		struct dma_block_config blk_cfg;
 		uint8_t *buffer;
 		size_t buffer_length;
 		size_t offset;
 		size_t counter;
+	} rx;
+	struct {
+		const uint8_t *buffer;
+		size_t buffer_length;
+		size_t counter;
+	} tx;
+	int32_t rx_timeout;
+	struct k_work_delayable rx_timeout_work;
+#ifdef CONFIG_DMA
+	struct {
+		const struct device *dma_dev;
+		uint32_t dma_channel;
+		struct dma_config dma_cfg;
+		struct dma_block_config blk_cfg;
 	} dma_rx, dma_tx;
+#endif
+	bool rx_dma_active;
+	bool tx_dma_active;
 	uint8_t *rx_next_buffer;
 	size_t rx_next_buffer_len;
 #endif /* CONFIG_UART_ASYNC_API */
@@ -100,12 +116,33 @@ struct gd32_usart_data {
 #ifdef CONFIG_UART_ASYNC_API
 #define GD32_USART_DATA_REG_ADDR(base) ((uint32_t)((base) + 0x04U))
 
+static void usart_gd32_async_isr(const struct device *dev);
+
 static inline void async_user_callback(struct gd32_usart_data *data,
 				       struct uart_event *evt)
 {
 	if (data->async_cb) {
 		data->async_cb(data->dev, evt, data->async_user_data);
 	}
+}
+
+static inline void async_evt_rx_rdy(struct gd32_usart_data *data)
+{
+	if (data->rx.counter <= data->rx.offset) {
+		return;
+	}
+
+	struct uart_event evt = {
+		.type = UART_RX_RDY,
+		.data.rx = {
+			.buf = data->rx.buffer,
+			.len = data->rx.counter - data->rx.offset,
+			.offset = data->rx.offset,
+		},
+	};
+
+	data->rx.offset = data->rx.counter;
+	async_user_callback(data, &evt);
 }
 
 static inline void async_evt_rx_buf_request(struct gd32_usart_data *data)
@@ -144,8 +181,8 @@ static inline void async_evt_rx_stopped(struct gd32_usart_data *data, int reason
 		.data.rx_stop = {
 			.reason = reason,
 			.data = {
-				.buf = data->dma_rx.buffer,
-				.len = data->dma_rx.counter,
+				.buf = data->rx.buffer,
+				.len = data->rx.counter,
 				.offset = 0,
 			},
 		},
@@ -159,15 +196,15 @@ static inline void async_evt_tx_done(struct gd32_usart_data *data)
 	struct uart_event evt = {
 		.type = UART_TX_DONE,
 		.data.tx = {
-			.buf = data->dma_tx.buffer,
-			.len = data->dma_tx.counter,
+			.buf = data->tx.buffer,
+			.len = data->tx.counter,
 		},
 	};
 
-	data->dma_tx.buffer = NULL;
-	data->dma_tx.buffer_length = 0U;
-	data->dma_tx.offset = 0U;
-	data->dma_tx.counter = 0U;
+	data->tx.buffer = NULL;
+	data->tx.buffer_length = 0U;
+	data->tx.counter = 0U;
+	data->tx_dma_active = false;
 
 	async_user_callback(data, &evt);
 }
@@ -177,17 +214,24 @@ static inline void async_evt_tx_abort(struct gd32_usart_data *data)
 	struct uart_event evt = {
 		.type = UART_TX_ABORTED,
 		.data.tx = {
-			.buf = data->dma_tx.buffer,
-			.len = data->dma_tx.counter,
+			.buf = data->tx.buffer,
+			.len = data->tx.counter,
 		},
 	};
 
-	data->dma_tx.buffer = NULL;
-	data->dma_tx.buffer_length = 0U;
-	data->dma_tx.offset = 0U;
-	data->dma_tx.counter = 0U;
+	data->tx.buffer = NULL;
+	data->tx.buffer_length = 0U;
+	data->tx.counter = 0U;
+	data->tx_dma_active = false;
 
 	async_user_callback(data, &evt);
+}
+
+static inline void async_timer_start(struct k_work_delayable *work, int32_t timeout)
+{
+	if ((timeout != SYS_FOREVER_US) && (timeout != 0)) {
+		k_work_reschedule(work, K_USEC(timeout));
+	}
 }
 #endif /* CONFIG_UART_ASYNC_API */
 
@@ -195,6 +239,10 @@ static inline void async_evt_tx_abort(struct gd32_usart_data *data)
 static void usart_gd32_isr(const struct device *dev)
 {
 	struct gd32_usart_data *const data = dev->data;
+
+#ifdef CONFIG_UART_ASYNC_API
+	usart_gd32_async_isr(dev);
+#endif
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	if (data->user_cb) {
@@ -207,6 +255,7 @@ static void usart_gd32_isr(const struct device *dev)
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN || CONFIG_UART_ASYNC_API */
 
 #ifdef CONFIG_UART_ASYNC_API
+#ifdef CONFIG_DMA
 static void usart_gd32_dma_rx_cb(const struct device *dma_dev, void *user_data,
 				 uint32_t channel, int status)
 {
@@ -218,80 +267,103 @@ static void usart_gd32_dma_rx_cb(const struct device *dma_dev, void *user_data,
 	ARG_UNUSED(channel);
 
 	if (status < 0) {
+		struct dma_status stat;
+
+		(void)k_work_cancel_delayable(&data->rx_timeout_work);
+		if (dma_get_status(data->dma_rx.dma_dev, data->dma_rx.dma_channel, &stat) == 0) {
+			data->rx.counter = data->rx.buffer_length - stat.pending_length;
+		} else {
+			data->rx.counter = data->rx.buffer_length;
+		}
+
 		async_evt_rx_stopped(data, UART_ERROR_OVERRUN);
 		dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
-		data->dma_rx.buffer_length = 0U;
+		usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+		async_evt_rx_rdy(data);
+		async_evt_rx_buf_released(data, data->rx.buffer);
+		if (data->rx_next_buffer_len) {
+			async_evt_rx_buf_released(data, data->rx_next_buffer);
+			data->rx_next_buffer = NULL;
+			data->rx_next_buffer_len = 0U;
+		}
+		data->rx.buffer = NULL;
+		data->rx.buffer_length = 0U;
+		data->rx.offset = 0U;
+		data->rx.counter = 0U;
+		data->rx_dma_active = false;
 		async_evt_rx_disabled(data);
 		return;
 	}
 
-	if (data->dma_rx.buffer_length == 0U) {
+	if (data->rx.buffer_length == 0U) {
 		return;
 	}
 
 	if (data->dma_rx.dma_cfg.cyclic) {
 		size_t pos = (status == DMA_STATUS_BLOCK) ?
-			(data->dma_rx.buffer_length / 2U) : data->dma_rx.buffer_length;
+			(data->rx.buffer_length / 2U) : data->rx.buffer_length;
 
-		data->dma_rx.counter = pos;
+		data->rx.counter = pos;
 
 		struct uart_event evt = {
 			.type = UART_RX_RDY,
 			.data.rx = {
-				.buf = data->dma_rx.buffer,
-				.len = data->dma_rx.counter - data->dma_rx.offset,
-				.offset = data->dma_rx.offset,
+				.buf = data->rx.buffer,
+				.len = data->rx.counter - data->rx.offset,
+				.offset = data->rx.offset,
 			},
 		};
 
 		async_user_callback(data, &evt);
-		data->dma_rx.offset = (status == DMA_STATUS_BLOCK) ? pos : 0U;
+		data->rx.offset = (status == DMA_STATUS_BLOCK) ? pos : 0U;
 		return;
 	}
 
 	struct dma_status stat;
 
 	if (dma_get_status(data->dma_rx.dma_dev, data->dma_rx.dma_channel, &stat) == 0) {
-		data->dma_rx.counter = data->dma_rx.buffer_length - stat.pending_length;
+		data->rx.counter = data->rx.buffer_length - stat.pending_length;
 	} else {
-		data->dma_rx.counter = data->dma_rx.buffer_length;
+		data->rx.counter = data->rx.buffer_length;
 	}
 
 	struct uart_event evt = {
 		.type = UART_RX_RDY,
 		.data.rx = {
-			.buf = data->dma_rx.buffer,
-			.len = data->dma_rx.counter - data->dma_rx.offset,
-			.offset = data->dma_rx.offset,
+			.buf = data->rx.buffer,
+			.len = data->rx.counter - data->rx.offset,
+			.offset = data->rx.offset,
 		},
 	};
 
-	data->dma_rx.offset = data->dma_rx.counter;
+	data->rx.offset = data->rx.counter;
 	async_user_callback(data, &evt);
 
-	uint8_t *released = data->dma_rx.buffer;
+	uint8_t *released = data->rx.buffer;
 
 	if (data->rx_next_buffer_len) {
-		data->dma_rx.buffer = data->rx_next_buffer;
-		data->dma_rx.buffer_length = data->rx_next_buffer_len;
+		data->rx.buffer = data->rx_next_buffer;
+		data->rx.buffer_length = data->rx_next_buffer_len;
 		data->rx_next_buffer = NULL;
 		data->rx_next_buffer_len = 0U;
-		data->dma_rx.offset = 0U;
-		data->dma_rx.counter = 0U;
+		data->rx.offset = 0U;
+		data->rx.counter = 0U;
 		dma_reload(data->dma_rx.dma_dev, data->dma_rx.dma_channel,
 			  GD32_USART_DATA_REG_ADDR(cfg->reg),
-			  (uint32_t)data->dma_rx.buffer,
-			  data->dma_rx.buffer_length);
+			  (uint32_t)data->rx.buffer,
+			  data->rx.buffer_length);
 		dma_start(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
 		async_evt_rx_buf_released(data, released);
 		async_evt_rx_buf_request(data);
 	} else {
 		dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
 		async_evt_rx_buf_released(data, released);
-		data->dma_rx.buffer = NULL;
-		data->dma_rx.buffer_length = 0U;
-		data->dma_rx.offset = 0U;
-		data->dma_rx.counter = 0U;
+		usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+		data->rx.buffer = NULL;
+		data->rx.buffer_length = 0U;
+		data->rx.offset = 0U;
+		data->rx.counter = 0U;
+		data->rx_dma_active = false;
 		async_evt_rx_disabled(data);
 	}
 }
@@ -311,22 +383,21 @@ static void usart_gd32_dma_tx_cb(const struct device *dma_dev, void *user_data,
 	}
 
 	struct dma_status stat;
-	size_t tx_len = data->dma_tx.buffer_length;
+	size_t tx_len = data->tx.buffer_length;
 
 	if (tx_len > 0U) {
 		if (dma_get_status(data->dma_tx.dma_dev, data->dma_tx.dma_channel, &stat) == 0) {
-			data->dma_tx.counter = tx_len - stat.pending_length;
+			data->tx.counter = tx_len - stat.pending_length;
 		} else {
-			data->dma_tx.counter = tx_len;
+			data->tx.counter = tx_len;
 		}
 	}
 
 	async_evt_tx_done(data);
-	if (data->dma_tx.buffer == NULL) {
-		dma_stop(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
-		usart_dma_transmit_config(cfg->reg, USART_DENT_DISABLE);
-	}
+	dma_stop(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
+	usart_dma_transmit_config(cfg->reg, USART_DENT_DISABLE);
 }
+#endif /* CONFIG_DMA */
 
 static int usart_gd32_async_callback_set(const struct device *dev,
 					  uart_callback_t callback,
@@ -347,64 +418,275 @@ static int usart_gd32_async_callback_set(const struct device *dev,
 	return 0;
 }
 
+static void usart_gd32_async_rx_timeout_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct gd32_usart_data *data = CONTAINER_OF(dwork, struct gd32_usart_data, rx_timeout_work);
+	unsigned int key = irq_lock();
+
+	async_evt_rx_rdy(data);
+	irq_unlock(key);
+}
+
+static void usart_gd32_async_rx_stop(const struct device *dev, int reason)
+{
+	struct gd32_usart_data *data = dev->data;
+	const struct gd32_usart_config *cfg = dev->config;
+
+	if (data->rx.buffer_length == 0U) {
+		return;
+	}
+
+	(void)k_work_cancel_delayable(&data->rx_timeout_work);
+
+	usart_interrupt_disable(cfg->reg, USART_INT_RBNE);
+	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
+	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
+
+#ifdef CONFIG_DMA
+	if (data->rx_dma_active) {
+		dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
+		usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+		data->rx_dma_active = false;
+	}
+#endif
+
+	async_evt_rx_stopped(data, reason);
+	async_evt_rx_rdy(data);
+	async_evt_rx_buf_released(data, data->rx.buffer);
+	if (data->rx_next_buffer_len) {
+		async_evt_rx_buf_released(data, data->rx_next_buffer);
+		data->rx_next_buffer = NULL;
+		data->rx_next_buffer_len = 0U;
+	}
+
+	data->rx.buffer = NULL;
+	data->rx.buffer_length = 0U;
+	data->rx.offset = 0U;
+	data->rx.counter = 0U;
+	async_evt_rx_disabled(data);
+}
+
+static void usart_gd32_async_rx_buf_done(const struct device *dev, bool request_next_buf)
+{
+	struct gd32_usart_data *data = dev->data;
+	const struct gd32_usart_config *cfg = dev->config;
+	uint8_t *released = data->rx.buffer;
+
+	(void)k_work_cancel_delayable(&data->rx_timeout_work);
+	async_evt_rx_rdy(data);
+	async_evt_rx_buf_released(data, released);
+
+	if (data->rx_next_buffer_len) {
+		data->rx.buffer = data->rx_next_buffer;
+		data->rx.buffer_length = data->rx_next_buffer_len;
+		data->rx.offset = 0U;
+		data->rx.counter = 0U;
+		data->rx_next_buffer = NULL;
+		data->rx_next_buffer_len = 0U;
+		if (request_next_buf) {
+			async_evt_rx_buf_request(data);
+		}
+		return;
+	}
+
+	usart_interrupt_disable(cfg->reg, USART_INT_RBNE);
+	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
+	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
+	data->rx.buffer = NULL;
+	data->rx.buffer_length = 0U;
+	data->rx.offset = 0U;
+	data->rx.counter = 0U;
+	async_evt_rx_disabled(data);
+}
+
+static void usart_gd32_async_isr(const struct device *dev)
+{
+	struct gd32_usart_data *data = dev->data;
+	const struct gd32_usart_config *cfg = dev->config;
+	uint32_t stat0 = USART_STAT(cfg->reg);
+
+	if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR | USART_STAT0_FERR | USART_STAT0_PERR)) {
+		int reason = 0;
+
+		if (stat0 & USART_STAT0_ORERR) {
+			reason |= UART_ERROR_OVERRUN;
+		}
+
+		if (stat0 & USART_STAT0_NERR) {
+			reason |= UART_ERROR_NOISE;
+		}
+
+		if (stat0 & USART_STAT0_FERR) {
+			reason |= UART_ERROR_FRAMING;
+		}
+
+		if (stat0 & USART_STAT0_PERR) {
+			reason |= UART_ERROR_PARITY;
+		}
+
+		volatile uint32_t dummy = USART_DATA(cfg->reg);
+		ARG_UNUSED(dummy);
+
+		if (data->rx.buffer_length != 0U) {
+			usart_gd32_async_rx_stop(dev, reason);
+		}
+	}
+
+	if (!data->rx_dma_active && (data->rx.buffer_length != 0U) &&
+	    usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_RBNE)) {
+		while (usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
+			if (data->rx.counter >= data->rx.buffer_length) {
+				usart_gd32_async_rx_buf_done(dev, true);
+				if (data->rx.buffer_length == 0U) {
+					break;
+				}
+			}
+
+			data->rx.buffer[data->rx.counter++] = (uint8_t)usart_data_receive(cfg->reg);
+			async_timer_start(&data->rx_timeout_work, data->rx_timeout);
+
+			if (data->rx.counter >= data->rx.buffer_length) {
+				usart_gd32_async_rx_buf_done(dev, true);
+				if (data->rx.buffer_length == 0U) {
+					break;
+				}
+			}
+		}
+	}
+
+	if (!data->tx_dma_active && (data->tx.buffer_length != 0U)) {
+		if (usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_TBE)) {
+			while (usart_flag_get(cfg->reg, USART_FLAG_TBE) &&
+			       (data->tx.counter < data->tx.buffer_length)) {
+				usart_data_transmit(cfg->reg, data->tx.buffer[data->tx.counter++]);
+			}
+
+			if (data->tx.counter >= data->tx.buffer_length) {
+				usart_interrupt_disable(cfg->reg, USART_INT_TBE);
+				usart_flag_clear(cfg->reg, USART_FLAG_TC);
+				usart_interrupt_enable(cfg->reg, USART_INT_TC);
+			}
+		}
+
+		if (usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_TC) &&
+		    (data->tx.counter >= data->tx.buffer_length)) {
+			usart_interrupt_disable(cfg->reg, USART_INT_TC);
+			usart_flag_clear(cfg->reg, USART_FLAG_TC);
+			data->tx.counter = data->tx.buffer_length;
+			async_evt_tx_done(data);
+		}
+	}
+}
+
 static int usart_gd32_async_tx(const struct device *dev, const uint8_t *tx_data,
 				 size_t buf_size, int32_t timeout)
 {
 	struct gd32_usart_data *data = dev->data;
 	const struct gd32_usart_config *cfg = dev->config;
-	int ret;
+	unsigned int key;
 
 	ARG_UNUSED(timeout);
-
-	if (data->dma_tx.dma_dev == NULL) {
-		return -ENODEV;
-	}
 
 	if ((tx_data == NULL) || (buf_size == 0U)) {
 		return -EINVAL;
 	}
 
-	if (data->dma_tx.buffer_length != 0U) {
+	key = irq_lock();
+
+	if (data->tx.buffer_length != 0U) {
+		irq_unlock(key);
 		return -EBUSY;
 	}
 
-	data->dma_tx.buffer = (uint8_t *)tx_data;
-	data->dma_tx.buffer_length = buf_size;
-	data->dma_tx.offset = 0U;
-	data->dma_tx.counter = 0U;
-	data->dma_tx.blk_cfg.source_address = (uint32_t)data->dma_tx.buffer;
-	data->dma_tx.blk_cfg.block_size = data->dma_tx.buffer_length;
+	data->tx.buffer = tx_data;
+	data->tx.buffer_length = buf_size;
+	data->tx.counter = 0U;
 
-	ret = dma_config(data->dma_tx.dma_dev, data->dma_tx.dma_channel,
-			       &data->dma_tx.dma_cfg);
-	if (ret < 0) {
-		data->dma_tx.buffer = NULL;
-		data->dma_tx.buffer_length = 0U;
+#ifdef CONFIG_DMA
+	if (data->dma_tx.dma_dev != NULL) {
+		int ret;
+
+		data->tx_dma_active = true;
+		data->dma_tx.blk_cfg.source_address = (uint32_t)data->tx.buffer;
+		data->dma_tx.blk_cfg.block_size = data->tx.buffer_length;
+
+		ret = dma_config(data->dma_tx.dma_dev, data->dma_tx.dma_channel, &data->dma_tx.dma_cfg);
+		if (ret < 0) {
+			data->tx.buffer = NULL;
+			data->tx.buffer_length = 0U;
+			data->tx.counter = 0U;
+			data->tx_dma_active = false;
+			irq_unlock(key);
+			return ret;
+		}
+
+		usart_dma_transmit_config(cfg->reg, USART_DENT_ENABLE);
+		ret = dma_start(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
+		if (ret < 0) {
+			usart_dma_transmit_config(cfg->reg, USART_DENT_DISABLE);
+			data->tx.buffer = NULL;
+			data->tx.buffer_length = 0U;
+			data->tx.counter = 0U;
+			data->tx_dma_active = false;
+		}
+
+		irq_unlock(key);
 		return ret;
 	}
+#endif
 
-	usart_dma_transmit_config(cfg->reg, USART_DENT_ENABLE);
+	data->tx_dma_active = false;
+	if (usart_flag_get(cfg->reg, USART_FLAG_TBE)) {
+		usart_data_transmit(cfg->reg, data->tx.buffer[data->tx.counter++]);
+	}
 
-	return dma_start(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
+	if (data->tx.counter < data->tx.buffer_length) {
+		usart_interrupt_enable(cfg->reg, USART_INT_TBE);
+	} else {
+		usart_flag_clear(cfg->reg, USART_FLAG_TC);
+		usart_interrupt_enable(cfg->reg, USART_INT_TC);
+	}
+
+	irq_unlock(key);
+	return 0;
 }
 
 static int usart_gd32_async_tx_abort(const struct device *dev)
 {
 	struct gd32_usart_data *data = dev->data;
 	const struct gd32_usart_config *cfg = dev->config;
-	struct dma_status stat;
+	unsigned int key;
 
-	if (data->dma_tx.buffer_length == 0U) {
-		return -EINVAL;
+	key = irq_lock();
+
+	if (data->tx.buffer_length == 0U) {
+		irq_unlock(key);
+		return -EFAULT;
 	}
 
-	if (dma_get_status(data->dma_tx.dma_dev, data->dma_tx.dma_channel, &stat) == 0) {
-		data->dma_tx.counter = data->dma_tx.buffer_length - stat.pending_length;
-	}
+#ifdef CONFIG_DMA
+	if (data->tx_dma_active) {
+		struct dma_status stat;
 
-	dma_stop(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
-	usart_dma_transmit_config(cfg->reg, USART_DENT_DISABLE);
+		if (dma_get_status(data->dma_tx.dma_dev, data->dma_tx.dma_channel, &stat) == 0) {
+			data->tx.counter = data->tx.buffer_length - stat.pending_length;
+		} else {
+			data->tx.counter = data->tx.buffer_length;
+		}
+
+		dma_stop(data->dma_tx.dma_dev, data->dma_tx.dma_channel);
+		usart_dma_transmit_config(cfg->reg, USART_DENT_DISABLE);
+		async_evt_tx_abort(data);
+		irq_unlock(key);
+		return 0;
+	}
+#endif
+
+	usart_interrupt_disable(cfg->reg, USART_INT_TBE);
+	usart_interrupt_disable(cfg->reg, USART_INT_TC);
 	async_evt_tx_abort(data);
+	irq_unlock(key);
 
 	return 0;
 }
@@ -414,44 +696,73 @@ static int usart_gd32_async_rx_enable(const struct device *dev, uint8_t *buf,
 {
 	struct gd32_usart_data *data = dev->data;
 	const struct gd32_usart_config *cfg = dev->config;
-	int ret;
+	int ret = 0;
+	unsigned int key;
 
-	ARG_UNUSED(timeout);
+	key = irq_lock();
 
-	if (data->dma_rx.dma_dev == NULL) {
-		return -ENODEV;
-	}
-
-	if (data->dma_rx.buffer_length != 0U) {
+	if (data->rx.buffer_length != 0U) {
+		irq_unlock(key);
 		return -EBUSY;
 	}
 
 	if ((buf == NULL) || (len == 0U)) {
+		irq_unlock(key);
 		return -EINVAL;
 	}
 
-	data->dma_rx.buffer = buf;
-	data->dma_rx.buffer_length = len;
-	data->dma_rx.offset = 0U;
-	data->dma_rx.counter = 0U;
+	data->rx.buffer = buf;
+	data->rx.buffer_length = len;
+	data->rx.offset = 0U;
+	data->rx.counter = 0U;
+	data->rx_timeout = timeout;
 	data->rx_next_buffer = NULL;
 	data->rx_next_buffer_len = 0U;
+	data->rx_dma_active = false;
 
-	data->dma_rx.dma_cfg.cyclic = cfg->rx_dma_circular ? 1U : 0U;
-	data->dma_rx.blk_cfg.dest_address = (uint32_t)data->dma_rx.buffer;
-	data->dma_rx.blk_cfg.block_size = data->dma_rx.buffer_length;
+#ifdef CONFIG_DMA
+	if (data->dma_rx.dma_dev != NULL) {
+		data->rx_dma_active = true;
+		data->dma_rx.dma_cfg.cyclic = cfg->rx_dma_circular ? 1U : 0U;
+		data->dma_rx.blk_cfg.dest_address = (uint32_t)data->rx.buffer;
+		data->dma_rx.blk_cfg.block_size = data->rx.buffer_length;
 
-	ret = dma_config(data->dma_rx.dma_dev, data->dma_rx.dma_channel,
-			       &data->dma_rx.dma_cfg);
-	if (ret < 0) {
-		data->dma_rx.buffer = NULL;
-		data->dma_rx.buffer_length = 0U;
-		return ret;
+		ret = dma_config(data->dma_rx.dma_dev, data->dma_rx.dma_channel, &data->dma_rx.dma_cfg);
+		if (ret < 0) {
+			data->rx.buffer = NULL;
+			data->rx.buffer_length = 0U;
+			data->rx.offset = 0U;
+			data->rx.counter = 0U;
+			data->rx_dma_active = false;
+			irq_unlock(key);
+			return ret;
+		}
+
+		usart_dma_receive_config(cfg->reg, USART_DENR_ENABLE);
+		ret = dma_start(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
+		if (ret < 0) {
+			usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+			data->rx.buffer = NULL;
+			data->rx.buffer_length = 0U;
+			data->rx.offset = 0U;
+			data->rx.counter = 0U;
+			data->rx_dma_active = false;
+			irq_unlock(key);
+			return ret;
+		}
+	}
+#endif
+
+	usart_interrupt_enable(cfg->reg, USART_INT_ERR);
+	usart_interrupt_enable(cfg->reg, USART_INT_PERR);
+
+	if (!data->rx_dma_active) {
+		usart_interrupt_enable(cfg->reg, USART_INT_RBNE);
 	}
 
-	usart_dma_receive_config(cfg->reg, USART_DENR_ENABLE);
-
-	return dma_start(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
+	async_evt_rx_buf_request(data);
+	irq_unlock(key);
+	return ret;
 }
 
 static int usart_gd32_rx_buf_rsp(const struct device *dev, uint8_t *buf, size_t len)
@@ -462,10 +773,22 @@ static int usart_gd32_rx_buf_rsp(const struct device *dev, uint8_t *buf, size_t 
 
 	key = irq_lock();
 
-	if (data->dma_rx.dma_cfg.cyclic || (data->dma_rx.buffer_length == 0U)) {
+	if ((buf == NULL) || (len == 0U)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (data->rx.buffer_length == 0U) {
 		ret = -EACCES;
 		goto out;
 	}
+
+#ifdef CONFIG_DMA
+	if (data->rx_dma_active && data->dma_rx.dma_cfg.cyclic) {
+		ret = -EACCES;
+		goto out;
+	}
+#endif
 
 	if (data->rx_next_buffer_len != 0U) {
 		ret = -EBUSY;
@@ -484,39 +807,71 @@ static int usart_gd32_async_rx_disable(const struct device *dev)
 {
 	struct gd32_usart_data *data = dev->data;
 	const struct gd32_usart_config *cfg = dev->config;
-	struct dma_status stat;
 	unsigned int key;
+	uint8_t *released_first = NULL;
 
 	key = irq_lock();
 
-	if (data->dma_rx.buffer_length == 0U) {
+	if (data->rx.buffer_length == 0U) {
 		irq_unlock(key);
-		return -EINVAL;
+		return -EFAULT;
 	}
 
-	dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
-	usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+	(void)k_work_cancel_delayable(&data->rx_timeout_work);
 
-	if (dma_get_status(data->dma_rx.dma_dev, data->dma_rx.dma_channel, &stat) == 0) {
-		size_t rx_len = data->dma_rx.buffer_length - stat.pending_length;
+#ifdef CONFIG_DMA
+	if (data->rx_dma_active) {
+		struct dma_status stat;
 
-		if (rx_len > data->dma_rx.offset) {
-			data->dma_rx.counter = rx_len;
-			struct uart_event evt = {
-				.type = UART_RX_RDY,
-				.data.rx = {
-					.buf = data->dma_rx.buffer,
-					.len = data->dma_rx.counter - data->dma_rx.offset,
-					.offset = data->dma_rx.offset,
-				},
-			};
+		dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
+		usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+		if (dma_get_status(data->dma_rx.dma_dev, data->dma_rx.dma_channel, &stat) == 0) {
+			data->rx.counter = data->rx.buffer_length - stat.pending_length;
+		} else {
+			data->rx.counter = data->rx.buffer_length;
+		}
+		data->rx_dma_active = false;
+	} else
+#endif
+	{
+		while (usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
+			uint32_t stat0 = USART_STAT(cfg->reg);
 
-			data->dma_rx.offset = data->dma_rx.counter;
-			async_user_callback(data, &evt);
+			if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR |
+				     USART_STAT0_FERR | USART_STAT0_PERR)) {
+				(void)usart_data_receive(cfg->reg);
+				continue;
+			}
+
+			if (data->rx.counter >= data->rx.buffer_length) {
+				if (data->rx_next_buffer_len == 0U) {
+					(void)usart_data_receive(cfg->reg);
+					continue;
+				}
+
+				async_evt_rx_rdy(data);
+				released_first = data->rx.buffer;
+				data->rx.buffer = data->rx_next_buffer;
+				data->rx.buffer_length = data->rx_next_buffer_len;
+				data->rx.offset = 0U;
+				data->rx.counter = 0U;
+				data->rx_next_buffer = NULL;
+				data->rx_next_buffer_len = 0U;
+			}
+
+			data->rx.buffer[data->rx.counter++] = (uint8_t)usart_data_receive(cfg->reg);
 		}
 	}
 
-	async_evt_rx_buf_released(data, data->dma_rx.buffer);
+	usart_interrupt_disable(cfg->reg, USART_INT_RBNE);
+	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
+	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
+
+	async_evt_rx_rdy(data);
+	if (released_first != NULL) {
+		async_evt_rx_buf_released(data, released_first);
+	}
+	async_evt_rx_buf_released(data, data->rx.buffer);
 
 	if (data->rx_next_buffer_len) {
 		async_evt_rx_buf_released(data, data->rx_next_buffer);
@@ -524,10 +879,10 @@ static int usart_gd32_async_rx_disable(const struct device *dev)
 		data->rx_next_buffer_len = 0U;
 	}
 
-	data->dma_rx.buffer = NULL;
-	data->dma_rx.buffer_length = 0U;
-	data->dma_rx.offset = 0U;
-	data->dma_rx.counter = 0U;
+	data->rx.buffer = NULL;
+	data->rx.buffer_length = 0U;
+	data->rx.offset = 0U;
+	data->rx.counter = 0U;
 
 	async_evt_rx_disabled(data);
 	irq_unlock(key);
@@ -590,6 +945,18 @@ static int usart_gd32_init(const struct device *dev)
 
 #ifdef CONFIG_UART_ASYNC_API
 	data->dev = dev;
+	data->rx.buffer = NULL;
+	data->rx.buffer_length = 0U;
+	data->rx.offset = 0U;
+	data->rx.counter = 0U;
+	data->tx.buffer = NULL;
+	data->tx.buffer_length = 0U;
+	data->tx.counter = 0U;
+	data->rx_timeout = 0;
+	data->rx_dma_active = false;
+	data->tx_dma_active = false;
+	k_work_init_delayable(&data->rx_timeout_work, usart_gd32_async_rx_timeout_handler);
+#ifdef CONFIG_DMA
 	data->dma_rx.dma_cfg.head_block = &data->dma_rx.blk_cfg;
 	data->dma_tx.dma_cfg.head_block = &data->dma_tx.blk_cfg;
 	data->dma_rx.dma_cfg.user_data = (void *)dev;
@@ -600,14 +967,7 @@ static int usart_gd32_init(const struct device *dev)
 	data->dma_tx.blk_cfg.dest_address = GD32_USART_DATA_REG_ADDR(cfg->reg);
 	data->dma_tx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 	data->dma_tx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	data->dma_rx.buffer = NULL;
-	data->dma_rx.buffer_length = 0U;
-	data->dma_rx.offset = 0U;
-	data->dma_rx.counter = 0U;
-	data->dma_tx.buffer = NULL;
-	data->dma_tx.buffer_length = 0U;
-	data->dma_tx.offset = 0U;
-	data->dma_tx.counter = 0U;
+#endif
 	data->rx_next_buffer = NULL;
 	data->rx_next_buffer_len = 0U;
 #endif
@@ -619,6 +979,14 @@ static int usart_gd32_poll_in(const struct device *dev, unsigned char *c)
 {
 	const struct gd32_usart_config *const cfg = dev->config;
 	uint32_t status;
+
+#ifdef CONFIG_UART_ASYNC_API
+	struct gd32_usart_data *data = dev->data;
+
+	if (data->rx.buffer_length != 0U) {
+		return -EBUSY;
+	}
+#endif
 
 	status = usart_flag_get(cfg->reg, USART_FLAG_RBNE);
 
@@ -648,25 +1016,26 @@ static int usart_gd32_err_check(const struct device *dev)
 	uint32_t status = USART_STAT(cfg->reg);
 	int errors = 0;
 
-	if (status & USART_FLAG_ORERR) {
-		usart_flag_clear(cfg->reg, USART_FLAG_ORERR);
-
+	if (status & USART_STAT0_ORERR) {
 		errors |= UART_ERROR_OVERRUN;
 	}
 
-	if (status & USART_FLAG_PERR) {
-		usart_flag_clear(cfg->reg, USART_FLAG_PERR);
-
+	if (status & USART_STAT0_PERR) {
 		errors |= UART_ERROR_PARITY;
 	}
 
-	if (status & USART_FLAG_FERR) {
-		usart_flag_clear(cfg->reg, USART_FLAG_FERR);
-
+	if (status & USART_STAT0_FERR) {
 		errors |= UART_ERROR_FRAMING;
 	}
 
-	usart_flag_clear(cfg->reg, USART_FLAG_NERR);
+	if (status & USART_STAT0_NERR) {
+		errors |= UART_ERROR_NOISE;
+	}
+
+	if (errors != 0) {
+		volatile uint32_t dummy = USART_DATA(cfg->reg);
+		ARG_UNUSED(dummy);
+	}
 
 	return errors;
 }
@@ -846,8 +1215,8 @@ static DEVICE_API(uart, usart_gd32_driver_api) = {
 	GD32_USART_IRQ_HANDLER(n)						\
 	static struct gd32_usart_data usart_gd32_data_##n = {			\
 		.baud_rate = DT_INST_PROP(n, current_speed),			\
-		IF_ENABLED(CONFIG_UART_ASYNC_API,			\
-			(GD32_USART_DMA_INIT_FIELDS(n),))	\
+		IF_ENABLED(CONFIG_UART_ASYNC_API,				\
+			(GD32_USART_DMA_INIT_FIELDS(n)))			\
 	};									\
 	static const struct gd32_usart_config usart_gd32_config_##n = {		\
 		.reg = DT_INST_REG_ADDR(n),					\
