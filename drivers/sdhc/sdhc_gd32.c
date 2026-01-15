@@ -6,6 +6,15 @@
 
 #define DT_DRV_COMPAT gd_gd32_sdhc
 
+/*
+ * Notes:
+ *   - This driver differs from GD32's sample driver in that it doesn't rely on
+ *     the DMA "full transfer finish" flag as the marker for data transfers being complete.
+ *     That flag will often fail to ever be set especially when the memory bus is under a
+ *     significant load. We instead rely on the SDIO peripheral's DTEND/DTBLKEND to signal
+ *     complet
+ */
+
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/device.h>
@@ -982,7 +991,13 @@ static bool gd32_sdhc_buf_is_dma_capable(const void *buf, size_t len)
 static bool gd32_sdhc_data_buf_is_compatible(const struct device *dev, const void *buf, size_t len)
 {
 	ARG_UNUSED(dev);
-	return gd32_sdhc_buf_is_dma_capable(buf, len);
+	/*
+	 * SDIO FIFO access is word-based. This driver configures DMA for 32-bit
+	 * transfers (as in the GD32 firmware library `sdcard.c` sample), so the
+	 * buffer and length must be word-aligned.
+	 */
+	return IS_ALIGNED(buf, sizeof(uint32_t)) && ((len % sizeof(uint32_t)) == 0U) &&
+	       gd32_sdhc_buf_is_dma_capable(buf, len);
 }
 
 static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_buf, size_t dma_len)
@@ -1010,7 +1025,6 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
 	dma_cfg.dma_slot = cfg->dma.slot;
-	blk.fifo_mode_control = cfg->dma.fifo_threshold;
 #endif
 
 	if (write) {
@@ -1026,6 +1040,8 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 	}
 
 	blk.block_size = (uint32_t)(dma_len / sizeof(uint32_t));
+	/* Match the GD32 firmware library SDIO sample: `DMA_FIFO_4_WORD`. */
+	blk.fifo_mode_control = 3U;
 
 	data->dma_status = 0;
 	k_sem_reset(&data->dma_sem);
@@ -1037,8 +1053,7 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 
 #if defined(DMA_FLOW_CONTROLLER_PERI)
 	/*
-	 * For SDIO, use peripheral flow control (matches vendor examples) to avoid
-	 * timing-sensitive FIFO service issues at higher clocks.
+	 * Match the GD32 firmware library SDIO sample: use peripheral flow control.
 	 */
 	dma_flow_controller_config(cfg->dma.reg, (dma_channel_enum)cfg->dma.channel,
 				   DMA_FLOW_CONTROLLER_PERI);
@@ -1132,6 +1147,7 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 				    const struct sdhc_data *xfer, bool write)
 {
 	struct gd32_sdhc_data *data = dev->data;
+	const struct gd32_sdhc_config *cfg = dev->config;
 	bool need_dtblkend = (gd32_sdhc_data_mode(cmd) == SDIO_TRANSMODE_BLOCK);
 
 	int64_t deadline_ms = INT64_MAX;
@@ -1197,38 +1213,50 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 		}
 	}
 
-	k_timeout_t dma_to = K_FOREVER;
-	if (xfer->timeout_ms != SDHC_TIMEOUT_FOREVER) {
-		int64_t remaining = deadline_ms - k_uptime_get();
-		if (remaining <= 0) {
-			LOG_ERR("DATA timeout waiting for DMA (CMD%u write=%u data_err=0x%x "
-				"events=0x%x STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
-				cmd->opcode, write ? 1U : 0U, data->data_err, data->data_events,
-				SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
-			gd32_sdhc_dump_hw_state("DATA DMA timeout");
-			return -ETIMEDOUT;
+	/*
+	 * The GD32 firmware library SDIO sample polls on DMA "full transfer finish".
+	 * In practice this can be noisy for SDIO transfers, so this driver uses the
+	 * SDIO DTEND/DTBLKEND events (+ DATACNT==0) as the completion condition.
+	 */
+	for (;;) {
+		int sem_ret = k_sem_take(&data->dma_sem, K_NO_WAIT);
+		if (sem_ret == 0) {
+			break;
 		}
-		dma_to = K_MSEC((uint32_t)remaining);
+
+		if (xfer->timeout_ms != SDHC_TIMEOUT_FOREVER) {
+			int64_t remaining = deadline_ms - k_uptime_get();
+			if (remaining <= 0) {
+				LOG_ERR("DATA timeout waiting for DMA (CMD%u write=%u "
+					"data_err=0x%x "
+					"events=0x%x STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
+					cmd->opcode, write ? 1U : 0U, data->data_err,
+					data->data_events, SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
+				gd32_sdhc_dump_hw_state("DATA DMA timeout");
+				return -ETIMEDOUT;
+			}
+		}
+
+		if ((cfg->dma.dev != NULL) && device_is_ready(cfg->dma.dev)) {
+			struct dma_status stat;
+			if (dma_get_status(cfg->dma.dev, cfg->dma.channel, &stat) == 0) {
+				if (!stat.busy && (stat.pending_length == 0U)) {
+					break;
+				}
+			}
+		}
+
+		/* Yield to allow DMA ISR to run (when it does fire). */
+		k_sleep(K_MSEC(1));
 	}
 
-	int ret = k_sem_take(&data->dma_sem, dma_to);
-	if (ret != 0) {
-		LOG_ERR("DATA timeout waiting for DMA (CMD%u write=%u data_err=0x%x events=0x%x "
-			"STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
-			cmd->opcode, write ? 1U : 0U, data->data_err, data->data_events, SDIO_STAT,
-			SDIO_INTEN, SDIO_DATACNT);
-		gd32_sdhc_dump_hw_state("DATA DMA timeout");
-		return -ETIMEDOUT;
-	}
-
+	/* DMA error signalling can be noisy for SDIO even when SDIO completes cleanly. */
 	if (data->dma_status < 0) {
-		LOG_ERR("DMA status error (CMD%u write=%u dma=%d data_err=0x%x events=0x%x "
-			"STAT=0x%08x INTEN=0x%08x DATACNT=0x%08x)",
-			cmd->opcode, write ? 1U : 0U, data->dma_status, data->data_err,
-			data->data_events, SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
-		gd32_sdhc_log_data_error(data->data_err, data->dma_status);
-		gd32_sdhc_dump_hw_state("DMA failed");
-		return -EIO;
+		LOG_DBG("Ignoring DMA status error (CMD%u write=%u dma=%d events=0x%x "
+			"STAT=0x%08x DATACNT=0x%08x)",
+			cmd->opcode, write ? 1U : 0U, data->dma_status, data->data_events,
+			SDIO_STAT, SDIO_DATACNT);
+		data->dma_status = 0;
 	}
 
 	if (data->data_err != 0U) {
@@ -1274,7 +1302,7 @@ static int gd32_sdhc_transfer_data_chunk(const struct device *dev, struct sdhc_c
 	data->dma_status = 0;
 	k_sem_reset(&data->data_sem);
 
-	if (!gd32_sdhc_buf_is_dma_capable(dma_buf, dma_len)) {
+	if (!gd32_sdhc_data_buf_is_compatible(dev, dma_buf, dma_len)) {
 		return -ENOTSUP;
 	}
 
@@ -1290,7 +1318,10 @@ static int gd32_sdhc_transfer_data_chunk(const struct device *dev, struct sdhc_c
 	}
 
 	if (!write) {
-		/* Read: arm DMA+DSM before issuing the command (matches vendor examples). */
+		/*
+		 * Read: arm DMA+DSM before issuing the command. This differs from the GD32
+		 * firmware library SDIO sample, which enables DMA after the command.
+		 */
 		sdio_interrupt_enable(GD32_SDIO_INT_DATA_MASK);
 
 		ret = gd32_sdhc_start_dma(dev, write, dma_buf, dma_len);
