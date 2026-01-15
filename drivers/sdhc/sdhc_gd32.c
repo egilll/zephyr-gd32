@@ -78,6 +78,7 @@ struct gd32_sdhc_dma_chan {
 	uint32_t channel;
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
 	uint32_t slot;
+	uint8_t fifo_threshold;
 #endif
 };
 
@@ -1009,6 +1010,7 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
 	dma_cfg.dma_slot = cfg->dma.slot;
+	blk.fifo_mode_control = cfg->dma.fifo_threshold;
 #endif
 
 	if (write) {
@@ -1626,7 +1628,9 @@ static DEVICE_API(sdhc, gd32_sdhc_api) = {
 		.reg = DT_REG_ADDR(DT_INST_DMAS_CTLR(inst)),                                       \
 		.channel = DT_INST_DMAS_CELL_BY_IDX(inst, 0, channel),                             \
 		COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),                                  \
-			    (.slot = DT_INST_DMAS_CELL_BY_IDX(inst, 0, slot),), ()) }
+			    (.slot = DT_INST_DMAS_CELL_BY_IDX(inst, 0, slot),                      \
+			     .fifo_threshold = DT_INST_DMAS_CELL_BY_IDX(inst, 0, fifo_threshold),), \
+			    ()) }
 
 #define GD32_SDHC_FIFO_ADDR(inst) (DT_INST_REG_ADDR(inst) + 0x80U)
 
