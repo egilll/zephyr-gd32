@@ -97,9 +97,18 @@ struct i2c_gd32_data {
 	uint16_t addr1;
 	uint16_t addr2;
 	uint32_t xfer_len;
+	struct i2c_msg *msgs;
+	uint8_t num_msgs;
+	uint8_t seg_next;
 	struct i2c_msg *current;
 	uint16_t errs;
 	bool is_restart;
+	bool addr_is_read;
+	bool waiting_for_start;
+	bool sync_done;
+#ifdef CONFIG_I2C_GD32_DMA
+	/* DMA is only used for single-message transfers. */
+#endif
 #ifdef CONFIG_I2C_GD32_DMA
 	bool dma_active;
 	bool dma_is_read;
@@ -112,12 +121,24 @@ struct i2c_gd32_data {
 #endif
 };
 
-static uint32_t i2c_gd32_sync_timeout_ms(const struct device *dev)
+enum i2c_gd32_seg_end {
+	I2C_GD32_SEG_END_STOP = 0,
+	I2C_GD32_SEG_END_RESTART,
+};
+
+static inline void i2c_gd32_enable_interrupts(const struct i2c_gd32_config *cfg);
+#ifdef CONFIG_I2C_GD32_DMA
+static inline void i2c_gd32_enable_interrupts_dma(const struct i2c_gd32_config *cfg);
+#endif
+
+static uint32_t i2c_gd32_sync_timeout_ms_xfer(const struct device *dev, struct i2c_msg *msgs,
+					      uint8_t num_msgs)
 {
 	const struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
 	uint32_t bitrate_bps;
 	uint32_t addr_bytes;
+	uint32_t seg_cnt;
 	uint64_t bytes_total;
 	uint64_t per_byte_us;
 	uint64_t per_byte_budget_us;
@@ -146,12 +167,24 @@ static uint32_t i2c_gd32_sync_timeout_ms(const struct device *dev)
 	}
 
 	if (data->dev_config & I2C_ADDR_10_BITS) {
-		addr_bytes = (data->current->flags & I2C_MSG_READ) ? 3U : 2U;
+		/* Worst-case: 10-bit master receive requires a repeated header. */
+		addr_bytes = 3U;
 	} else {
 		addr_bytes = 1U;
 	}
 
-	bytes_total = (uint64_t)data->xfer_len + addr_bytes;
+	seg_cnt = 1U;
+	for (uint8_t i = 1U; i < num_msgs; i++) {
+		if ((msgs[i].flags & I2C_MSG_RESTART) != 0U) {
+			seg_cnt++;
+		}
+	}
+
+	bytes_total = 0U;
+	for (uint8_t i = 0U; i < num_msgs; i++) {
+		bytes_total += msgs[i].len;
+	}
+	bytes_total += (uint64_t)addr_bytes * seg_cnt;
 	per_byte_us = (9ULL * 1000000ULL + (bitrate_bps - 1U)) / bitrate_bps;
 	per_byte_budget_us = MAX(I2C_GD32_SYNC_TIMEOUT_PER_BYTE_MIN_US,
 				 per_byte_us * I2C_GD32_SYNC_TIMEOUT_PER_BYTE_FACTOR);
@@ -163,6 +196,121 @@ static uint32_t i2c_gd32_sync_timeout_ms(const struct device *dev)
 	}
 
 	return (uint32_t)timeout_ms;
+}
+
+static void i2c_gd32_segment_configure(const struct device *dev)
+{
+	struct i2c_gd32_data *data = dev->data;
+	const struct i2c_gd32_config *cfg = dev->config;
+	bool is_read = (data->current->flags & I2C_MSG_READ) != 0U;
+
+	I2C_CTL1(cfg->reg) &= ~(I2C_CTL1_DMAON | I2C_CTL1_DMALST);
+	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_POAP;
+
+	I2C_CTL0(cfg->reg) |= I2C_CTL0_ACKEN;
+
+	data->addr_is_read = is_read;
+	data->is_restart = false;
+	data->waiting_for_start = false;
+
+	if (is_read) {
+#ifdef CONFIG_I2C_GD32_DMA
+		if (!data->dma_active && (data->xfer_len == 2U)) {
+#else
+		if (data->xfer_len == 2U) {
+#endif
+			I2C_CTL0(cfg->reg) |= I2C_CTL0_POAP;
+		}
+
+		if (data->dev_config & I2C_ADDR_10_BITS) {
+			/*
+			 * 10-bit master receive requires an address phase with W, then a repeated START
+			 * and an address phase with R (GD32 RM 20.3.9).
+			 */
+			data->is_restart = true;
+			data->addr_is_read = false;
+		}
+	}
+
+#ifdef CONFIG_I2C_GD32_DMA
+	if (data->dma_active) {
+		i2c_gd32_enable_interrupts_dma(cfg);
+	} else {
+		i2c_gd32_enable_interrupts(cfg);
+	}
+#else
+	i2c_gd32_enable_interrupts(cfg);
+#endif
+}
+
+static int i2c_gd32_segment_init(const struct device *dev, uint8_t start_idx, enum i2c_gd32_seg_end *seg_end)
+{
+	struct i2c_gd32_data *data = dev->data;
+	struct i2c_msg *msgs = data->msgs;
+	uint8_t idx = start_idx;
+
+	data->current = &msgs[start_idx];
+	data->xfer_len = 0U;
+
+	while (idx < data->num_msgs) {
+		data->xfer_len += msgs[idx].len;
+		idx++;
+		if (idx >= data->num_msgs) {
+			break;
+		}
+		if ((msgs[idx].flags & I2C_MSG_RESTART) != 0U) {
+			break;
+		}
+		if ((msgs[idx].flags & I2C_MSG_RW_MASK) != (msgs[start_idx].flags & I2C_MSG_RW_MASK)) {
+			break;
+		}
+	}
+
+	data->seg_next = idx;
+	*seg_end = (idx >= data->num_msgs) ? I2C_GD32_SEG_END_STOP : I2C_GD32_SEG_END_RESTART;
+	i2c_gd32_segment_configure(dev);
+
+	return 0;
+}
+
+static void i2c_gd32_segment_complete(const struct device *dev, enum i2c_gd32_seg_end seg_end)
+{
+	struct i2c_gd32_data *data = dev->data;
+	const struct i2c_gd32_config *cfg = dev->config;
+
+	if (data->sync_done) {
+		return;
+	}
+
+	if (data->errs != 0U) {
+		data->sync_done = true;
+		k_sem_give(&data->sync_sem);
+		return;
+	}
+
+	if (seg_end == I2C_GD32_SEG_END_STOP) {
+		I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+		data->sync_done = true;
+		k_sem_give(&data->sync_sem);
+		return;
+	}
+
+	if (data->waiting_for_start) {
+		return;
+	}
+
+	if (data->seg_next >= data->num_msgs) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+		data->sync_done = true;
+		k_sem_give(&data->sync_sem);
+		return;
+	}
+
+	enum i2c_gd32_seg_end next_end;
+	(void)i2c_gd32_segment_init(dev, data->seg_next, &next_end);
+	data->waiting_for_start = true;
+	I2C_CTL0(cfg->reg) |= I2C_CTL0_START;
 }
 
 static int i2c_gd32_wait_not_busy(const struct i2c_gd32_config *cfg, uint32_t timeout_ms)
@@ -229,18 +377,22 @@ static void i2c_gd32_handle_rbne(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	enum i2c_gd32_seg_end seg_end;
 
 	switch (data->xfer_len) {
 	case 0:
 		/* Unwanted data received, ignore it. */
-		k_sem_give(&data->sync_sem);
+		seg_end = (data->seg_next >= data->num_msgs) ? I2C_GD32_SEG_END_STOP
+							     : I2C_GD32_SEG_END_RESTART;
+		i2c_gd32_segment_complete(dev, seg_end);
 		break;
 	case 1:
 		/* If total_read_length == 1, read the data directly. */
 		data->xfer_len--;
 		i2c_gd32_xfer_read(data, cfg);
-
-		k_sem_give(&data->sync_sem);
+		seg_end = (data->seg_next >= data->num_msgs) ? I2C_GD32_SEG_END_STOP
+							     : I2C_GD32_SEG_END_RESTART;
+		i2c_gd32_segment_complete(dev, seg_end);
 
 		break;
 	case 2:
@@ -269,6 +421,7 @@ static void i2c_gd32_handle_tbe(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	enum i2c_gd32_seg_end seg_end;
 
 	if (data->xfer_len > 0U) {
 		data->xfer_len--;
@@ -282,10 +435,9 @@ static void i2c_gd32_handle_tbe(const struct device *dev)
 		i2c_gd32_xfer_write(data, cfg);
 
 	} else {
-		/* Enter stop condition */
-		I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
-
-		k_sem_give(&data->sync_sem);
+		seg_end = (data->seg_next >= data->num_msgs) ? I2C_GD32_SEG_END_STOP
+							     : I2C_GD32_SEG_END_RESTART;
+		i2c_gd32_segment_complete(dev, seg_end);
 	}
 }
 
@@ -293,21 +445,24 @@ static void i2c_gd32_handle_btc(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	enum i2c_gd32_seg_end seg_end = (data->seg_next >= data->num_msgs) ? I2C_GD32_SEG_END_STOP
+									   : I2C_GD32_SEG_END_RESTART;
 
 	if (data->current->flags & I2C_MSG_READ) {
 		uint32_t counter = 0U;
 
 		switch (data->xfer_len) {
 		case 2:
-			/* Stop condition must be generated before reading the last two bytes. */
-			I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+			if (seg_end == I2C_GD32_SEG_END_STOP) {
+				/* Stop condition must be generated before reading the last two bytes. */
+				I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+			}
 
 			for (counter = 2U; counter > 0; counter--) {
 				data->xfer_len--;
 				i2c_gd32_xfer_read(data, cfg);
 			}
-
-			k_sem_give(&data->sync_sem);
+			i2c_gd32_segment_complete(dev, seg_end);
 
 			break;
 		case 3:
@@ -331,6 +486,8 @@ static void i2c_gd32_handle_addsend(const struct device *dev)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
+	enum i2c_gd32_seg_end seg_end = (data->seg_next >= data->num_msgs) ? I2C_GD32_SEG_END_STOP
+									   : I2C_GD32_SEG_END_RESTART;
 
 	if ((data->current->flags & I2C_MSG_READ) && (data->xfer_len <= 2U)) {
 		I2C_CTL0(cfg->reg) &= ~I2C_CTL0_ACKEN;
@@ -342,15 +499,16 @@ static void i2c_gd32_handle_addsend(const struct device *dev)
 
 	if (data->is_restart) {
 		data->is_restart = false;
-		data->current->flags &= ~I2C_MSG_RW_MASK;
-		data->current->flags |= I2C_MSG_READ;
+		data->addr_is_read = true;
+		data->waiting_for_start = true;
 		/* Enter repeated start condition */
 		I2C_CTL0(cfg->reg) |= I2C_CTL0_START;
 
 		return;
 	}
 
-	if ((data->current->flags & I2C_MSG_READ) && (data->xfer_len == 1U)) {
+	if ((seg_end == I2C_GD32_SEG_END_STOP) && (data->current->flags & I2C_MSG_READ) &&
+	    (data->xfer_len == 1U)) {
 		/* Enter stop condition */
 		I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
 	}
@@ -362,10 +520,19 @@ static void i2c_gd32_event_isr(const struct device *dev)
 	const struct i2c_gd32_config *cfg = dev->config;
 	uint32_t stat;
 
+	if (data->sync_done) {
+		return;
+	}
+
 	stat = I2C_STAT0(cfg->reg);
 
+	if (data->waiting_for_start && ((stat & I2C_STAT0_SBSEND) == 0U)) {
+		return;
+	}
+
 	if (stat & I2C_STAT0_SBSEND) {
-		if (data->current->flags & I2C_MSG_READ) {
+		data->waiting_for_start = false;
+		if (data->addr_is_read) {
 			I2C_DATA(cfg->reg) = (data->addr1 << 1U) | 1U;
 		} else {
 			I2C_DATA(cfg->reg) = (data->addr1 << 1U) | 0U;
@@ -374,7 +541,7 @@ static void i2c_gd32_event_isr(const struct device *dev)
 		I2C_DATA(cfg->reg) = data->addr2;
 	} else if (stat & I2C_STAT0_ADDSEND) {
 #ifdef CONFIG_I2C_GD32_DMA
-		if (data->dma_active) {
+			if (data->dma_active) {
 			/*
 			 * DMAON must be set after clearing ADDSEND (GD32 RM 20.3.9).
 			 * The read data phase for 10-bit addressing starts after the
@@ -388,14 +555,14 @@ static void i2c_gd32_event_isr(const struct device *dev)
 			I2C_STAT0(cfg->reg);
 			I2C_STAT1(cfg->reg);
 
-			if (data->is_restart) {
-				data->is_restart = false;
-				data->current->flags &= ~I2C_MSG_RW_MASK;
-				data->current->flags |= I2C_MSG_READ;
-				/* Enter repeated start condition */
-				I2C_CTL0(cfg->reg) |= I2C_CTL0_START;
-				return;
-			}
+				if (data->is_restart) {
+					data->is_restart = false;
+					data->addr_is_read = true;
+					data->waiting_for_start = true;
+					/* Enter repeated start condition */
+					I2C_CTL0(cfg->reg) |= I2C_CTL0_START;
+					return;
+				}
 
 			if (data->dma_is_read && (data->xfer_len >= 2U)) {
 				I2C_CTL1(cfg->reg) |= I2C_CTL1_DMALST;
@@ -403,12 +570,16 @@ static void i2c_gd32_event_isr(const struct device *dev)
 				I2C_CTL1(cfg->reg) &= ~I2C_CTL1_DMALST;
 			}
 
-			if (data->dma_is_read && (data->xfer_len == 1U)) {
-				/* Enter stop condition */
-				I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
-			}
+				enum i2c_gd32_seg_end seg_end = (data->seg_next >= data->num_msgs)
+									? I2C_GD32_SEG_END_STOP
+									: I2C_GD32_SEG_END_RESTART;
+				if ((seg_end == I2C_GD32_SEG_END_STOP) && data->dma_is_read &&
+				    (data->xfer_len == 1U)) {
+					/* Enter stop condition */
+					I2C_CTL0(cfg->reg) |= I2C_CTL0_STOP;
+				}
 
-			I2C_CTL1(cfg->reg) |= I2C_CTL1_DMAON;
+				I2C_CTL1(cfg->reg) |= I2C_CTL1_DMAON;
 		} else
 #endif
 		{
@@ -503,6 +674,7 @@ static void i2c_gd32_error_isr(const struct device *dev)
 		}
 #endif
 
+		data->sync_done = true;
 		k_sem_give(&data->sync_sem);
 	}
 }
@@ -812,45 +984,9 @@ static void i2c_gd32_xfer_begin(const struct device *dev)
 	k_sem_reset(&data->sync_sem);
 
 	data->errs = 0U;
-	data->is_restart = false;
-
-	I2C_CTL1(cfg->reg) &= ~(I2C_CTL1_DMAON | I2C_CTL1_DMALST);
-	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_POAP;
-
-	/* Default to set ACKEN bit. */
-	I2C_CTL0(cfg->reg) |= I2C_CTL0_ACKEN;
-
-	if (data->current->flags & I2C_MSG_READ) {
-		/* For 2 bytes read, use POAP bit to give NACK for the last data receiving. */
-#ifdef CONFIG_I2C_GD32_DMA
-		if (!data->dma_active && (data->xfer_len == 2U)) {
-#else
-		if (data->xfer_len == 2U) {
-#endif
-			I2C_CTL0(cfg->reg) |= I2C_CTL0_POAP;
-		}
-
-		/*
-		 * For read on 10 bits address mode, start condition will happen twice.
-		 * Transfer sequence as below:
-		 *   S addr1+W addr2 S addr1+R
-		 * Use a is_restart flag to cover this case.
-		 */
-		if (data->dev_config & I2C_ADDR_10_BITS) {
-			data->is_restart = true;
-			data->current->flags &= ~I2C_MSG_RW_MASK;
-		}
-	}
-
-#ifdef CONFIG_I2C_GD32_DMA
-	if (data->dma_active) {
-		i2c_gd32_enable_interrupts_dma(cfg);
-	} else {
-		i2c_gd32_enable_interrupts(cfg);
-	}
-#else
-	i2c_gd32_enable_interrupts(cfg);
-#endif
+	data->sync_done = false;
+	data->waiting_for_start = true;
+	i2c_gd32_segment_configure(dev);
 
 	/* Enter repeated start condition */
 	I2C_CTL0(cfg->reg) |= I2C_CTL0_START;
@@ -883,90 +1019,28 @@ static int i2c_gd32_xfer_end(const struct device *dev)
 	return 0;
 }
 
-static int i2c_gd32_msg_read(const struct device *dev)
-{
-	struct i2c_gd32_data *data = dev->data;
-	const struct i2c_gd32_config *cfg = dev->config;
-	uint32_t timeout_ms;
-
-	if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-		data->errs = I2C_GD32_ERR_BUSY;
-		return -EBUSY;
-	}
-
-	timeout_ms = i2c_gd32_sync_timeout_ms(dev);
-	i2c_gd32_xfer_begin(dev);
-
-	if (k_sem_take(&data->sync_sem, K_MSEC(timeout_ms)) != 0) {
-		data->errs |= I2C_GD32_ERR_TIMEOUT;
-		(void)i2c_gd32_recover_bus_locked(dev);
-	}
-
-	return i2c_gd32_xfer_end(dev);
-}
-
-static int i2c_gd32_msg_write(const struct device *dev)
-{
-	struct i2c_gd32_data *data = dev->data;
-	const struct i2c_gd32_config *cfg = dev->config;
-	uint32_t timeout_ms;
-
-	if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-		data->errs = I2C_GD32_ERR_BUSY;
-		return -EBUSY;
-	}
-
-	timeout_ms = i2c_gd32_sync_timeout_ms(dev);
-	i2c_gd32_xfer_begin(dev);
-
-	if (k_sem_take(&data->sync_sem, K_MSEC(timeout_ms)) != 0) {
-		data->errs |= I2C_GD32_ERR_TIMEOUT;
-		(void)i2c_gd32_recover_bus_locked(dev);
-	}
-
-	return i2c_gd32_xfer_end(dev);
-}
-
 static int i2c_gd32_transfer(const struct device *dev, struct i2c_msg *msgs, uint8_t num_msgs,
 			     uint16_t addr)
 {
 	struct i2c_gd32_data *data = dev->data;
 	const struct i2c_gd32_config *cfg = dev->config;
-	struct i2c_msg *current, *next;
-	uint8_t itr;
+	enum i2c_gd32_seg_end seg_end;
 	int err = 0;
+	uint32_t timeout_ms;
 
-	current = msgs;
-
-	/* First message flags implicitly contain I2C_MSG_RESTART flag. */
-	current->flags |= I2C_MSG_RESTART;
-
-	for (uint8_t i = 1; i <= num_msgs; i++) {
-
-		if (i < num_msgs) {
-			next = current + 1;
-
-			/*
-			 * If there have a R/W transfer state change between messages,
-			 * An explicit I2C_MSG_RESTART flag is needed for the second message.
-			 */
-			if ((current->flags & I2C_MSG_RW_MASK) != (next->flags & I2C_MSG_RW_MASK)) {
-				if ((next->flags & I2C_MSG_RESTART) == 0U) {
-					return -EINVAL;
-				}
+	for (uint8_t i = 0U; i < num_msgs; i++) {
+		if ((msgs[i].buf == NULL) || (msgs[i].len == 0U)) {
+			return -EINVAL;
+		}
+		if (i < (num_msgs - 1U)) {
+			if ((msgs[i].flags & I2C_MSG_STOP) != 0U) {
+				return -EINVAL;
 			}
-
-			/* Only the last message need I2C_MSG_STOP flag to free the Bus. */
-			if (current->flags & I2C_MSG_STOP) {
+			if (((msgs[i].flags & I2C_MSG_RW_MASK) != (msgs[i + 1U].flags & I2C_MSG_RW_MASK)) &&
+			    ((msgs[i + 1U].flags & I2C_MSG_RESTART) == 0U)) {
 				return -EINVAL;
 			}
 		}
-
-		if ((current->buf == NULL) || (current->len == 0U)) {
-			return -EINVAL;
-		}
-
-		current++;
 	}
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
@@ -981,55 +1055,51 @@ static int i2c_gd32_transfer(const struct device *dev, struct i2c_msg *msgs, uin
 		data->addr1 = addr & BITS(0, 6);
 	}
 
-	for (uint8_t i = 0; i < num_msgs; i = itr) {
-		data->current = &msgs[i];
-		data->xfer_len = msgs[i].len;
+	data->msgs = msgs;
+	data->num_msgs = num_msgs;
 
-		for (itr = i + 1; itr < num_msgs; itr++) {
-			if ((data->current->flags & I2C_MSG_RW_MASK) !=
-			    (msgs[itr].flags & I2C_MSG_RW_MASK)) {
-				break;
-			}
-			data->xfer_len += msgs[itr].len;
-		}
-
+	if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
+		(void)i2c_gd32_wait_not_busy(cfg, I2C_GD32_STOP_TIMEOUT_MS);
 		if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-			(void)i2c_gd32_wait_not_busy(cfg, I2C_GD32_STOP_TIMEOUT_MS);
-			if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-				(void)i2c_gd32_recover_bus_locked(dev);
-			}
-			if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
-				data->errs = I2C_GD32_ERR_BUSY;
-				err = -EBUSY;
-				i2c_gd32_log_err(data);
-				break;
-			}
+			(void)i2c_gd32_recover_bus_locked(dev);
 		}
-
-#ifdef CONFIG_I2C_GD32_DMA
-		data->dma_active = false;
-		if ((itr - i) == 1U) {
-			bool is_read = (data->current->flags & I2C_MSG_READ) != 0U;
-			bool use_dma = is_read ? i2c_gd32_dma_available(&cfg->dma_rx)
-					       : i2c_gd32_dma_available(&cfg->dma_tx);
-			if (use_dma) {
-				(void)i2c_gd32_dma_setup(dev, is_read);
-			}
-		}
-#endif
-
-		if (data->current->flags & I2C_MSG_READ) {
-			err = i2c_gd32_msg_read(dev);
-		} else {
-			err = i2c_gd32_msg_write(dev);
-		}
-
-		if (err < 0) {
+		if (I2C_STAT1(cfg->reg) & I2C_STAT1_I2CBSY) {
+			data->errs = I2C_GD32_ERR_BUSY;
+			err = -EBUSY;
 			i2c_gd32_log_err(data);
-			break;
+			goto out;
 		}
 	}
 
+#ifdef CONFIG_I2C_GD32_DMA
+	data->dma_active = false;
+	if (num_msgs == 1U) {
+		bool is_read = (msgs[0].flags & I2C_MSG_READ) != 0U;
+		bool use_dma = is_read ? i2c_gd32_dma_available(&cfg->dma_rx)
+				       : i2c_gd32_dma_available(&cfg->dma_tx);
+		if (use_dma) {
+			data->current = &msgs[0];
+			data->xfer_len = msgs[0].len;
+			(void)i2c_gd32_dma_setup(dev, is_read);
+		}
+	}
+#endif
+
+	(void)i2c_gd32_segment_init(dev, 0U, &seg_end);
+	timeout_ms = i2c_gd32_sync_timeout_ms_xfer(dev, msgs, num_msgs);
+	i2c_gd32_xfer_begin(dev);
+
+	if (k_sem_take(&data->sync_sem, K_MSEC(timeout_ms)) != 0) {
+		data->errs |= I2C_GD32_ERR_TIMEOUT;
+		(void)i2c_gd32_recover_bus_locked(dev);
+	}
+
+	err = i2c_gd32_xfer_end(dev);
+	if (err < 0) {
+		i2c_gd32_log_err(data);
+	}
+
+out:
 	/* Disable I2C device */
 	I2C_CTL0(cfg->reg) &= ~I2C_CTL0_I2CEN;
 
