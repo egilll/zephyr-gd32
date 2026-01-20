@@ -8,6 +8,7 @@ if(CONFIG_USE_SEGGER_RTT)
   )
   zephyr_library_sources(
     ${SEGGER_DIR}/SEGGER/SEGGER_RTT.c
+    ${SEGGER_DIR}/SEGGER/SEGGER_RTT_printf.c
     SEGGER_RTT_zephyr.c
   )
   zephyr_library_sources_ifdef(CONFIG_SEGGER_SYSTEMVIEW ${SEGGER_DIR}/SEGGER/SEGGER_SYSVIEW.c)
