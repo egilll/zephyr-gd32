@@ -31,6 +31,7 @@
 #include <zephyr/mem_mgmt/mem_attr.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/irq.h>
+#include <zephyr/sys/atomic.h>
 
 /* GD32 HAL (provided by the SoC HAL module) */
 #include <gd32_sdio.h>
@@ -79,6 +80,7 @@ enum gd32_sdhc_xfer_err {
 	GD32_SDHC_ERR_TX_UNDERRUN = BIT(4),
 	GD32_SDHC_ERR_RX_OVERRUN = BIT(5),
 	GD32_SDHC_ERR_START_BIT = BIT(6),
+	GD32_SDHC_ERR_CARD_REMOVED = BIT(7),
 };
 
 struct gd32_sdhc_dma_chan {
@@ -132,11 +134,54 @@ struct gd32_sdhc_data {
 
 	struct gpio_callback cd_cb;
 	const struct device *dev;
+	bool cd_present;
+	atomic_t card_removed;
 
 	uint32_t cmd13_count;
 	uint32_t last_cmd13_r1;
 	uint32_t last_r1_err_flags;
 };
+
+static void gd32_sdhc_abort_io(const struct device *dev);
+
+static inline bool gd32_sdhc_is_card_removed(const struct gd32_sdhc_data *data)
+{
+	return atomic_get(&data->card_removed) != 0;
+}
+
+static void gd32_sdhc_signal_card_removed(struct gd32_sdhc_data *data)
+{
+	atomic_set(&data->card_removed, 1);
+	k_sem_give(&data->cmd_sem);
+	k_sem_give(&data->data_sem);
+	k_sem_give(&data->dma_sem);
+}
+
+static void gd32_sdhc_signal_card_inserted(struct gd32_sdhc_data *data)
+{
+	atomic_set(&data->card_removed, 0);
+}
+
+static int gd32_sdhc_cd_irq_arm(const struct device *dev)
+{
+	struct gd32_sdhc_data *data = dev->data;
+	const struct gd32_sdhc_config *cfg = dev->config;
+
+	if (cfg->cd_gpio.port == NULL) {
+		return -ENOTSUP;
+	}
+
+	int v = gpio_pin_get_dt(&cfg->cd_gpio);
+	if (v < 0) {
+		return v;
+	}
+
+	data->cd_present = (v > 0);
+	atomic_set(&data->card_removed, data->cd_present ? 0 : 1);
+	return gpio_pin_interrupt_configure_dt(&cfg->cd_gpio,
+					       data->cd_present ? GPIO_INT_EDGE_TO_INACTIVE
+								: GPIO_INT_EDGE_TO_ACTIVE);
+}
 
 static void gd32_cd_gpio_cb(const struct device *port, struct gpio_callback *cb,
 			    gpio_port_pins_t pins)
@@ -157,13 +202,25 @@ static void gd32_cd_gpio_cb(const struct device *port, struct gpio_callback *cb,
 	}
 
 	int v = gpio_pin_get_dt(&cfg->cd_gpio);
-	bool present = (v > 0);
+	if (v < 0) {
+		return;
+	}
 
-	if ((cfg->cd_gpio.dt_flags & GPIO_ACTIVE_LOW) != 0U) {
-		present = !present;
+	bool present = (v > 0);
+	if (present == data->cd_present) {
+		return;
+	}
+	data->cd_present = present;
+
+	if (!present) {
+		gd32_sdhc_signal_card_removed(data);
+	} else {
+		gd32_sdhc_signal_card_inserted(data);
 	}
 
 	data->card_cb(dev, present ? SDHC_INT_INSERTED : SDHC_INT_REMOVED, data->card_cb_user_data);
+	(void)gpio_pin_interrupt_configure_dt(&cfg->cd_gpio,
+					      present ? GPIO_INT_EDGE_TO_INACTIVE : GPIO_INT_EDGE_TO_ACTIVE);
 }
 
 static void gd32_sdhc_dump_hw_state(const char *tag)
@@ -213,6 +270,9 @@ static void gd32_sdhc_log_data_error(uint32_t data_err, int dma_status)
 
 static const char *gd32_sdhc_primary_error_str(uint32_t cmd_err, uint32_t data_err, int dma_status)
 {
+	if ((cmd_err & GD32_SDHC_ERR_CARD_REMOVED) != 0U || (data_err & GD32_SDHC_ERR_CARD_REMOVED) != 0U) {
+		return "Card removed";
+	}
 	if (dma_status < 0) {
 		return "DMA error";
 	}
@@ -245,6 +305,9 @@ static const char *gd32_sdhc_primary_error_str(uint32_t cmd_err, uint32_t data_e
 
 static uint32_t gd32_sdhc_retry_delay_ms(uint32_t cmd_err, uint32_t data_err, int dma_status)
 {
+	if ((cmd_err & GD32_SDHC_ERR_CARD_REMOVED) != 0U || (data_err & GD32_SDHC_ERR_CARD_REMOVED) != 0U) {
+		return 0U;
+	}
 	if (dma_status < 0) {
 		return 10U;
 	}
@@ -676,24 +739,28 @@ out:
 static int gd32_sdhc_get_card_present(const struct device *dev)
 {
 	const struct gd32_sdhc_config *cfg = dev->config;
+	struct gd32_sdhc_data *data = dev->data;
 
 	if (cfg->cd_gpio.port == NULL) {
 		LOG_DBG("No CD GPIO, assuming present");
+		gd32_sdhc_signal_card_inserted(data);
 		return 1;
 	}
 
 	int v = gpio_pin_get_dt(&cfg->cd_gpio);
 	if (v < 0) {
 		LOG_WRN("CD gpio_pin_get_dt failed (%d), assuming present", v);
+		gd32_sdhc_signal_card_inserted(data);
 		return 1;
 	}
 	bool present = (v > 0);
 
-	if ((cfg->cd_gpio.dt_flags & GPIO_ACTIVE_LOW) != 0U) {
-		present = !present;
-	}
-
 	LOG_DBG("CD raw=%d present=%d flags=0x%x", v, present ? 1 : 0, cfg->cd_gpio.dt_flags);
+	if (present) {
+		gd32_sdhc_signal_card_inserted(data);
+	} else {
+		gd32_sdhc_signal_card_removed(data);
+	}
 	return present ? 1 : 0;
 }
 
@@ -745,7 +812,11 @@ static int gd32_sdhc_enable_interrupt(const struct device *dev, sdhc_interrupt_c
 
 	if ((cfg->cd_gpio.port != NULL) &&
 	    ((sources & (SDHC_INT_INSERTED | SDHC_INT_REMOVED)) != 0)) {
-		(void)gpio_pin_interrupt_configure_dt(&cfg->cd_gpio, GPIO_INT_EDGE_BOTH);
+		int rc = gd32_sdhc_cd_irq_arm(dev);
+		if (rc < 0) {
+			LOG_ERR("failed to arm CD interrupt: %d", rc);
+			return rc;
+		}
 	}
 
 	return 0;
@@ -836,6 +907,11 @@ static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd
 	bool wait_cmdsend = gd32_sdhc_cmd_needs_cmdsend(cmd->response_type);
 	bool resp_has_crc = gd32_sdhc_resp_has_crc(cmd->response_type);
 
+	if (gd32_sdhc_is_card_removed(data)) {
+		data->cmd_err = GD32_SDHC_ERR_CARD_REMOVED;
+		return -ENODEV;
+	}
+
 	LOG_DBG("CMD%u arg=0x%08x resp=%u timeout=%d", cmd->opcode, cmd->arg,
 		(unsigned int)(cmd->response_type & SDHC_NATIVE_RESPONSE_MASK), cmd->timeout_ms);
 
@@ -870,6 +946,12 @@ static int gd32_sdhc_send_cmd(const struct device *dev, struct sdhc_command *cmd
 	int ret = k_sem_take(&data->cmd_sem, gd32_ms_to_timeout(cmd->timeout_ms));
 
 	sdio_interrupt_disable(GD32_SDIO_INT_CMD_MASK);
+
+	if (gd32_sdhc_is_card_removed(data)) {
+		data->cmd_err |= GD32_SDHC_ERR_CARD_REMOVED;
+		gd32_sdhc_abort_io(dev);
+		return -ENODEV;
+	}
 
 	if (ret != 0) {
 		LOG_ERR("CMD%u timed out", cmd->opcode);
@@ -1150,6 +1232,11 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 	const struct gd32_sdhc_config *cfg = dev->config;
 	bool need_dtblkend = (gd32_sdhc_data_mode(cmd) == SDIO_TRANSMODE_BLOCK);
 
+	if (gd32_sdhc_is_card_removed(data)) {
+		data->data_err = GD32_SDHC_ERR_CARD_REMOVED;
+		return -ENODEV;
+	}
+
 	int64_t deadline_ms = INT64_MAX;
 	if (xfer->timeout_ms != SDHC_TIMEOUT_FOREVER) {
 		deadline_ms = k_uptime_get() + (int64_t)xfer->timeout_ms;
@@ -1179,6 +1266,12 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 				SDIO_STAT, SDIO_INTEN, SDIO_DATACNT);
 			gd32_sdhc_dump_hw_state("DATA SDIO timeout");
 			return -ETIMEDOUT;
+		}
+
+		if (gd32_sdhc_is_card_removed(data)) {
+			data->data_err |= GD32_SDHC_ERR_CARD_REMOVED;
+			gd32_sdhc_abort_io(dev);
+			return -ENODEV;
 		}
 
 		if (write && ((data->data_err & GD32_SDHC_ERR_DATA_TIMEOUT) != 0U) &&
@@ -1219,6 +1312,12 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 	 * SDIO DTEND/DTBLKEND events (+ DATACNT==0) as the completion condition.
 	 */
 	for (;;) {
+		if (gd32_sdhc_is_card_removed(data)) {
+			data->data_err |= GD32_SDHC_ERR_CARD_REMOVED;
+			gd32_sdhc_abort_io(dev);
+			return -ENODEV;
+		}
+
 		int sem_ret = k_sem_take(&data->dma_sem, K_NO_WAIT);
 		if (sem_ret == 0) {
 			break;
@@ -1278,6 +1377,10 @@ static int gd32_sdhc_wait_data_done(const struct device *dev, const struct sdhc_
 
 static bool gd32_sdhc_is_transient_data_failure(uint32_t data_err, int dma_status)
 {
+	if ((data_err & GD32_SDHC_ERR_CARD_REMOVED) != 0U) {
+		return false;
+	}
+
 	if (dma_status < 0) {
 		return true;
 	}
@@ -1413,6 +1516,10 @@ static int gd32_sdhc_transfer_data_chunk_with_retries(const struct device *dev,
 
 	for (int attempt = 1;; ++attempt) {
 		attempts_used = attempt;
+		if (gd32_sdhc_is_card_removed(data)) {
+			ret = -ENODEV;
+			break;
+		}
 		gd32_sdhc_abort_io(dev);
 		gd32_sdhc_wait_idle_ms(20U);
 
@@ -1424,6 +1531,9 @@ static int gd32_sdhc_transfer_data_chunk_with_retries(const struct device *dev,
 		last_dma_status = data->dma_status;
 
 		if (ret == 0) {
+			break;
+		}
+		if (ret == -ENODEV) {
 			break;
 		}
 
@@ -1451,6 +1561,9 @@ static int gd32_sdhc_transfer_data_chunk_with_retries(const struct device *dev,
 	}
 
 	if (ret != 0) {
+		if (ret == -ENODEV) {
+			return ret;
+		}
 		LOG_ERR("DATA CMD%u failed after %d attempts (ret=%d cmd_err=0x%x data_err=0x%x "
 			"dma=%d)",
 			cmd->opcode, attempts_used, last_ret, last_cmd_err, last_data_err,
@@ -1476,6 +1589,11 @@ static int gd32_sdhc_request(const struct device *dev, struct sdhc_command *cmd,
 
 	k_mutex_lock(&data->lock, K_FOREVER);
 
+	if (gd32_sdhc_is_card_removed(data)) {
+		k_mutex_unlock(&data->lock);
+		return -ENODEV;
+	}
+
 	int ret = 0;
 
 	if (xfer != NULL) {
@@ -1496,6 +1614,9 @@ static int gd32_sdhc_request(const struct device *dev, struct sdhc_command *cmd,
 			if (ret == 0) {
 				break;
 			}
+			if (ret == -ENODEV) {
+				break;
+			}
 
 			if (attempt < attempts) {
 				uint32_t delay_ms = gd32_sdhc_retry_delay_ms(last_cmd_err, 0U, 0);
@@ -1511,6 +1632,10 @@ static int gd32_sdhc_request(const struct device *dev, struct sdhc_command *cmd,
 		}
 
 		if (ret != 0) {
+			if (ret == -ENODEV) {
+				k_mutex_unlock(&data->lock);
+				return ret;
+			}
 			LOG_ERR("CMD%u failed after %d attempts (ret=%d cmd_err=0x%x)", cmd->opcode,
 				attempts, last_ret, last_cmd_err);
 			gd32_sdhc_log_cmd_error(last_cmd_err);
@@ -1580,6 +1705,7 @@ static int gd32_sdhc_init(const struct device *dev)
 				LOG_ERR("CD gpio_pin_configure_dt failed (%d)", ret);
 				return ret;
 			}
+			data->cd_present = (gpio_pin_get_dt(&cfg->cd_gpio) > 0);
 			gpio_init_callback(&data->cd_cb, gd32_cd_gpio_cb, BIT(cfg->cd_gpio.pin));
 			ret = gpio_add_callback(cfg->cd_gpio.port, &data->cd_cb);
 			if (ret < 0) {
