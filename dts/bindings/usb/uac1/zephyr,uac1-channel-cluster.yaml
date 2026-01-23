@@ -1,0 +1,20 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Audio Class 1 Audio Channel Cluster
+
+properties:
+  channels:
+    type: int
+    required: true
+    description: |
+      Number of logical channels in this cluster (bNrChannels).
+
+  channel-config:
+    type: int
+    default: 0
+    description: |
+      Audio Channel Cluster spatial locations bitmap (wChannelConfig).
+
+      Bit positions follow USB Audio Device Class 1.0 specification,
+      Section 3.7.2.3 (12 predefined spatial locations).

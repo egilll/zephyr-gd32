@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Audio Class 1 Output Terminal entity
+
+compatible: "zephyr,uac1-output-terminal"
+
+properties:
+  terminal-type:
+    type: int
+    required: true
+    description: |
+      Terminal Type constant specified in USB Audio Terminal Types.
+
+  assoc-terminal:
+    type: phandle
+    description: |
+      Associated terminal, e.g. for bidirectional terminal types.
+
+  data-source:
+    type: phandle
+    required: true
+    description: |
+      Unit or Terminal this terminal receives data from.
