@@ -96,6 +96,24 @@ static inline bool queue_is_empty(struct k_msgq *q)
 	return k_msgq_num_used_get(q) == 0;
 }
 
+static inline uint32_t gd32_i2s_add_reg(uint32_t reg)
+{
+	if (reg == SPI1) {
+		return I2S1_ADD;
+	}
+	if (reg == SPI2) {
+		return I2S2_ADD;
+	}
+	return 0U;
+}
+
+static inline uint32_t gd32_i2s_rx_reg(const struct i2s_gd32_config *cfg)
+{
+	uint32_t add = gd32_i2s_add_reg(cfg->reg);
+
+	return add ? add : cfg->reg;
+}
+
 static int queue_get(struct k_msgq *q, void **mem_block, size_t *size, int32_t timeout)
 {
 	struct queue_item item;
@@ -221,11 +239,12 @@ static uint32_t gd32_i2s_dma_xfer_count(size_t bytes)
 static void gd32_i2s_rx_disable(struct stream *stream)
 {
 	const struct i2s_gd32_config *cfg = stream->dev->config;
+	const uint32_t rx_reg = gd32_i2s_rx_reg(cfg);
 
-	spi_dma_disable(cfg->reg, SPI_DMA_RECEIVE);
+	spi_dma_disable(rx_reg, SPI_DMA_RECEIVE);
 	(void)dma_stop(stream->dma_dev, stream->dma_channel);
 	SPI_CTL1(cfg->reg) &= ~SPI_CTL1_ERRIE;
-	i2s_disable(cfg->reg);
+	i2s_disable(rx_reg);
 
 	if (stream->mem_block != NULL) {
 		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
@@ -315,6 +334,8 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	}
 
 	if (stream->dir == I2S_DIR_RX) {
+		const uint32_t rx_reg = gd32_i2s_rx_reg(cfg);
+
 		void *filled_block = stream->mem_block;
 
 		__ASSERT_NO_MSG(filled_block != NULL);
@@ -347,7 +368,7 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 		}
 
 		const uint32_t count = gd32_i2s_dma_xfer_count(stream->cfg.block_size);
-		(void)dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)&SPI_DATA(cfg->reg),
+		(void)dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)&SPI_DATA(rx_reg),
 				 (uint32_t)stream->mem_block, count);
 		(void)dma_start(stream->dma_dev, stream->dma_channel);
 		k_spin_unlock(&data->lock, key);
@@ -499,6 +520,8 @@ static int gd32_i2s_stream_start(struct stream *stream)
 	stream->dma_cfg.dest_data_size = 2U;
 
 	if (stream->dir == I2S_DIR_RX) {
+		const uint32_t rx_reg = gd32_i2s_rx_reg(cfg);
+
 		ret = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block, K_NO_WAIT);
 		if (ret < 0) {
 			return -ENOMEM;
@@ -507,7 +530,7 @@ static int gd32_i2s_stream_start(struct stream *stream)
 		stream->mem_block_size = stream->cfg.block_size;
 
 		stream->dma_cfg.channel_direction = PERIPHERAL_TO_MEMORY;
-		stream->dma_blk.source_address = (uint32_t)&SPI_DATA(cfg->reg);
+		stream->dma_blk.source_address = (uint32_t)&SPI_DATA(rx_reg);
 		stream->dma_blk.dest_address = (uint32_t)stream->mem_block;
 		stream->dma_blk.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
 		stream->dma_blk.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
@@ -527,8 +550,8 @@ static int gd32_i2s_stream_start(struct stream *stream)
 		}
 
 		SPI_CTL1(cfg->reg) |= SPI_CTL1_ERRIE;
-		spi_dma_enable(cfg->reg, SPI_DMA_RECEIVE);
-		i2s_enable(cfg->reg);
+		spi_dma_enable(rx_reg, SPI_DMA_RECEIVE);
+		i2s_enable(rx_reg);
 		return 0;
 	}
 
@@ -605,8 +628,9 @@ static void i2s_gd32_isr(const struct device *dev)
 	struct i2s_gd32_data *data = dev->data;
 	const uint32_t err_mask = SPI_STAT_RXORERR | SPI_STAT_TXURERR | SPI_STAT_CONFERR |
 				  SPI_STAT_FERR;
+	const uint32_t stat = SPI_STAT(cfg->reg);
 
-	if ((SPI_STAT(cfg->reg) & err_mask) == 0U) {
+	if ((stat & err_mask) == 0U) {
 		return;
 	}
 
@@ -644,6 +668,8 @@ static int i2s_gd32_configure(const struct device *dev, enum i2s_dir dir, const 
 	uint32_t ckpl = I2S_CKPL_LOW;
 	uint32_t mode;
 	uint32_t frameformat;
+	const uint32_t add_reg = gd32_i2s_add_reg(cfg->reg);
+	const bool has_add = add_reg != 0U;
 	int ret;
 
 	if (dir == I2S_DIR_RX) {
@@ -714,12 +740,16 @@ static int i2s_gd32_configure(const struct device *dev, enum i2s_dir dir, const 
 		mode = stream->master ? I2S_MODE_MASTERRX : I2S_MODE_SLAVERX;
 	}
 
-	i2s_disable(cfg->reg);
-	spi_dma_disable(cfg->reg, SPI_DMA_RECEIVE);
-	spi_dma_disable(cfg->reg, SPI_DMA_TRANSMIT);
-	SPI_CTL1(cfg->reg) &= ~SPI_CTL1_ERRIE;
+	if (!(has_add && dir == I2S_DIR_RX && data->tx.state != I2S_STATE_NOT_READY)) {
+		i2s_disable(cfg->reg);
+		spi_dma_disable(cfg->reg, SPI_DMA_RECEIVE);
+		spi_dma_disable(cfg->reg, SPI_DMA_TRANSMIT);
+		SPI_CTL1(cfg->reg) &= ~SPI_CTL1_ERRIE;
+	}
 
-	i2s_init(cfg->reg, mode, std, ckpl);
+	if (!(has_add && dir == I2S_DIR_RX && data->tx.state != I2S_STATE_NOT_READY)) {
+		i2s_init(cfg->reg, mode, std, ckpl);
+	}
 
 	if (stream->master) {
 		ret = gd32_i2s_psc_config(cfg->reg, i2s_cfg->frame_clk_freq, frameformat,
@@ -729,12 +759,18 @@ static int i2s_gd32_configure(const struct device *dev, enum i2s_dir dir, const 
 			return ret;
 		}
 	} else {
-		gd32_i2s_frameformat_apply(cfg->reg, frameformat);
-		if (cfg->mck_enabled) {
-			SPI_I2SPSC(cfg->reg) |= SPI_I2SPSC_MCKOEN;
-		} else {
-			SPI_I2SPSC(cfg->reg) &= ~SPI_I2SPSC_MCKOEN;
+		if (!(has_add && dir == I2S_DIR_RX && data->tx.state != I2S_STATE_NOT_READY)) {
+			gd32_i2s_frameformat_apply(cfg->reg, frameformat);
+			if (cfg->mck_enabled) {
+				SPI_I2SPSC(cfg->reg) |= SPI_I2SPSC_MCKOEN;
+			} else {
+				SPI_I2SPSC(cfg->reg) &= ~SPI_I2SPSC_MCKOEN;
+			}
 		}
+	}
+
+	if (has_add && dir == I2S_DIR_TX) {
+		i2s_full_duplex_mode_config(add_reg, mode, std, ckpl, frameformat);
 	}
 
 	key = k_spin_lock(&data->lock);

@@ -624,6 +624,11 @@ static int dma_gd32_start(const struct device *dev, uint32_t ch)
 		return -EINVAL;
 	}
 
+	/* Clear any stale flags before starting a new transfer. */
+	gd32_dma_interrupt_flag_clear(cfg->reg, ch,
+				      DMA_FLAG_FTF | DMA_FLAG_HTF |
+				      GD32_DMA_FLAG_ERRORS);
+
 	gd32_dma_interrupt_enable(cfg->reg, ch,
 				  DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS |
 				  (data->channels[ch].cyclic ? DMA_CHXCTL_HTFIE : 0));
