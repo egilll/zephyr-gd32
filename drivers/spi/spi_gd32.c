@@ -14,6 +14,7 @@
 #include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/spi/rtio.h>
+#include <zephyr/sys/util.h>
 #ifdef CONFIG_SPI_GD32_DMA
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_gd32.h>
@@ -31,6 +32,15 @@ LOG_MODULE_REGISTER(spi_gd32);
 #define SPI_GD32_ERR_MASK	(SPI_STAT_RXORERR | SPI_STAT_CONFERR | SPI_STAT_CRCERR)
 
 #define GD32_SPI_PSC_MAX	0x7U
+
+/*
+ * Per-flag wait timeout:
+ * - bounded (no infinite spins),
+ * - scaled by configured SPI frequency to support slow busses.
+ */
+#define SPI_GD32_WAIT_FLAG_MIN_US	100U
+#define SPI_GD32_WAIT_FLAG_MAX_US	1000000U
+#define SPI_GD32_WAIT_FLAG_FUDGE_US	50U
 
 #ifdef CONFIG_SPI_GD32_DMA
 
@@ -119,6 +129,93 @@ static bool spi_gd32_transfer_ongoing(struct spi_gd32_data *data)
 	       spi_context_rx_on(&data->ctx);
 }
 
+static uint32_t spi_gd32_calc_frame_timeout_us(const struct spi_config *config)
+{
+	uint32_t bits = SPI_WORD_SIZE_GET(config->operation);
+	uint32_t hz = config->frequency;
+	uint64_t frame_us;
+	uint64_t timeout_us;
+
+	if ((bits == 0U) || (hz == 0U)) {
+		return SPI_GD32_WAIT_FLAG_MAX_US;
+	}
+
+	frame_us = DIV_ROUND_UP((uint64_t)bits * 1000000ULL, (uint64_t)hz);
+
+	/* A few frame-times + margin to tolerate pauses, IRQ latency, etc. */
+	timeout_us = (frame_us * 4ULL) + SPI_GD32_WAIT_FLAG_FUDGE_US;
+
+	return (uint32_t)CLAMP(timeout_us, (uint64_t)SPI_GD32_WAIT_FLAG_MIN_US,
+			       (uint64_t)SPI_GD32_WAIT_FLAG_MAX_US);
+}
+
+static void spi_gd32_flush_rx(uint32_t reg)
+{
+	/* RX buffer is 1-deep; cap reads to avoid any pathological infinite loop. */
+	for (int i = 0; i < 32 && ((SPI_STAT(reg) & SPI_STAT_RBNE) != 0U); i++) {
+		(void)SPI_DATA(reg);
+	}
+}
+
+static void spi_gd32_clear_errors(uint32_t reg)
+{
+	uint32_t stat = SPI_STAT(reg);
+
+	/*
+	 * Clear methods (see GD32 SPI/I2S reference):
+	 * - RXORERR: read SPI_DATA then read SPI_STAT
+	 * - CONFERR: read/write SPI_STAT then write SPI_CTL0
+	 * - CRCERR: write 0 to CRCERR bit
+	 */
+	if ((stat & SPI_STAT_RXORERR) != 0U) {
+		(void)SPI_DATA(reg);
+		(void)SPI_STAT(reg);
+	}
+
+	if ((stat & SPI_STAT_CRCERR) != 0U) {
+		SPI_STAT(reg) &= ~SPI_STAT_CRCERR;
+	}
+
+	if ((stat & SPI_STAT_CONFERR) != 0U) {
+		uint32_t ctl0 = SPI_CTL0(reg);
+
+		(void)SPI_STAT(reg);
+		SPI_CTL0(reg) = ctl0;
+	}
+}
+
+static void spi_gd32_abort_and_recover(const struct device *dev, bool hard_reset)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+
+	SPI_CTL1(cfg->reg) &= ~(SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE | SPI_CTL1_ERRIE |
+				SPI_CTL1_DMATEN | SPI_CTL1_DMAREN);
+	SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
+
+	spi_gd32_flush_rx(cfg->reg);
+	spi_gd32_clear_errors(cfg->reg);
+
+	if (hard_reset) {
+		(void)reset_line_toggle_dt(&cfg->reset);
+		data->ctx.config = NULL;
+	}
+}
+
+static int spi_gd32_wait_stat(const struct device *dev, uint32_t mask, uint32_t expected,
+			      uint32_t timeout_us)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+
+	if (!WAIT_FOR(((SPI_STAT(cfg->reg) & SPI_GD32_ERR_MASK) != 0U) ||
+		      ((SPI_STAT(cfg->reg) & mask) == expected),
+		      timeout_us, k_busy_wait(1))) {
+		return -ETIMEDOUT;
+	}
+
+	return spi_gd32_get_err(cfg);
+}
+
 static int spi_gd32_configure(const struct device *dev,
 			      const struct spi_config *config)
 {
@@ -197,50 +294,82 @@ static int spi_gd32_frame_exchange(const struct device *dev)
 	const struct spi_gd32_config *cfg = dev->config;
 	struct spi_context *ctx = &data->ctx;
 	uint16_t tx_frame = 0U, rx_frame = 0U;
+	uint32_t timeout_us = spi_gd32_calc_frame_timeout_us(ctx->config);
+	uint8_t word_size = SPI_WORD_SIZE_GET(ctx->config->operation);
+	uint8_t frame_size = (word_size == 8U) ? 1U : 2U;
+	int ret;
 
-	while ((SPI_STAT(cfg->reg) & SPI_STAT_TBE) == 0) {
-		/* NOP */
+	ret = spi_gd32_wait_stat(dev, SPI_STAT_TBE, SPI_STAT_TBE, timeout_us);
+	if (ret < 0) {
+		if (ret == -ETIMEDOUT) {
+			spi_gd32_abort_and_recover(dev, true);
+		} else {
+			spi_gd32_abort_and_recover(dev, false);
+		}
+		return ret;
 	}
 
-	if (SPI_WORD_SIZE_GET(ctx->config->operation) == 8) {
-		if (spi_context_tx_buf_on(ctx)) {
-			tx_frame = UNALIGNED_GET((uint8_t *)(data->ctx.tx_buf));
+	if (spi_context_tx_buf_on(ctx)) {
+		if (frame_size == 1U) {
+			tx_frame = UNALIGNED_GET((uint8_t *)ctx->tx_buf);
+		} else {
+			tx_frame = UNALIGNED_GET((uint16_t *)ctx->tx_buf);
 		}
-		/* For 8 bits mode, spi will forced SPI_DATA[15:8] to 0. */
-		SPI_DATA(cfg->reg) = tx_frame;
-
-		spi_context_update_tx(ctx, 1, 1);
-	} else {
-		if (spi_context_tx_buf_on(ctx)) {
-			tx_frame = UNALIGNED_GET((uint8_t *)(data->ctx.tx_buf));
-		}
-		SPI_DATA(cfg->reg) = tx_frame;
-
-		spi_context_update_tx(ctx, 2, 1);
 	}
 
-	while ((SPI_STAT(cfg->reg) & SPI_STAT_RBNE) == 0) {
-		/* NOP */
+	/* For 8-bit mode, SPI_DATA[15:8] is forced to 0 by hardware. */
+	SPI_DATA(cfg->reg) = tx_frame;
+	spi_context_update_tx(ctx, frame_size, 1);
+
+	ret = spi_gd32_wait_stat(dev, SPI_STAT_RBNE, SPI_STAT_RBNE, timeout_us);
+	if (ret < 0) {
+		if (ret == -ETIMEDOUT) {
+			spi_gd32_abort_and_recover(dev, true);
+		} else {
+			spi_gd32_abort_and_recover(dev, false);
+		}
+		return ret;
 	}
 
-	if (SPI_WORD_SIZE_GET(data->ctx.config->operation) == 8) {
-		/* For 8 bits mode, spi will forced SPI_DATA[15:8] to 0. */
-		rx_frame = SPI_DATA(cfg->reg);
-		if (spi_context_rx_buf_on(ctx)) {
-			UNALIGNED_PUT(rx_frame, (uint8_t *)data->ctx.rx_buf);
-		}
+	/* For 8-bit mode, SPI_DATA[15:8] is forced to 0 by hardware. */
+	rx_frame = SPI_DATA(cfg->reg);
 
-		spi_context_update_rx(ctx, 1, 1);
-	} else {
-		rx_frame = SPI_DATA(cfg->reg);
-		if (spi_context_rx_buf_on(ctx)) {
-			UNALIGNED_PUT(rx_frame, (uint16_t *)data->ctx.rx_buf);
+	if (spi_context_rx_buf_on(ctx)) {
+		if (frame_size == 1U) {
+			UNALIGNED_PUT(rx_frame, (uint8_t *)ctx->rx_buf);
+		} else {
+			UNALIGNED_PUT(rx_frame, (uint16_t *)ctx->rx_buf);
 		}
-
-		spi_context_update_rx(ctx, 2, 1);
 	}
 
-	return spi_gd32_get_err(cfg);
+	spi_context_update_rx(ctx, frame_size, 1);
+
+	ret = spi_gd32_get_err(cfg);
+	if (ret < 0) {
+		spi_gd32_abort_and_recover(dev, false);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void spi_gd32_prepare_transfer(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+
+	spi_gd32_flush_rx(cfg->reg);
+	spi_gd32_clear_errors(cfg->reg);
+}
+
+static int spi_gd32_wait_idle(const struct device *dev, uint32_t timeout_us)
+{
+	int ret = spi_gd32_wait_stat(dev, SPI_STAT_TBE | SPI_STAT_TRANS, SPI_STAT_TBE, timeout_us);
+
+	if (ret < 0) {
+		spi_gd32_abort_and_recover(dev, (ret == -ETIMEDOUT));
+	}
+
+	return ret;
 }
 
 #ifdef CONFIG_SPI_GD32_DMA
@@ -360,6 +489,7 @@ static int spi_gd32_transceive_impl(const struct device *dev,
 {
 	struct spi_gd32_data *data = dev->data;
 	const struct spi_gd32_config *cfg = dev->config;
+	uint32_t timeout_us = spi_gd32_calc_frame_timeout_us(config);
 	int ret;
 
 	spi_context_lock(&data->ctx, (cb != NULL), cb, userdata, config);
@@ -370,6 +500,7 @@ static int spi_gd32_transceive_impl(const struct device *dev,
 	}
 
 	SPI_CTL0(cfg->reg) |= SPI_CTL0_SPIEN;
+	spi_gd32_prepare_transfer(dev);
 
 	spi_context_buffers_setup(&data->ctx, tx_bufs, rx_bufs, 1);
 
@@ -389,8 +520,6 @@ static int spi_gd32_transceive_impl(const struct device *dev,
 	} else
 #endif
 	{
-		SPI_STAT(cfg->reg) &=
-			~(SPI_STAT_RBNE | SPI_STAT_TBE | SPI_GD32_ERR_MASK);
 		SPI_CTL1(cfg->reg) |=
 			(SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE | SPI_CTL1_ERRIE);
 	}
@@ -408,9 +537,13 @@ static int spi_gd32_transceive_impl(const struct device *dev,
 #endif
 #endif
 
-	while (!(SPI_STAT(cfg->reg) & SPI_STAT_TBE) ||
-		(SPI_STAT(cfg->reg) & SPI_STAT_TRANS)) {
-		/* Wait until last frame transfer complete. */
+	/* Before disabling SPI, ensure the on-going transfer is complete. */
+	{
+		int idle_ret = spi_gd32_wait_idle(dev, timeout_us);
+
+		if ((ret == 0) && (idle_ret < 0)) {
+			ret = idle_ret;
+		}
 	}
 
 #ifdef CONFIG_SPI_GD32_DMA
