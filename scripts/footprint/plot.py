@@ -55,12 +55,58 @@ def main():
     with open(args.input) as f:
         data = json.load(f)
 
-    totalsize = data.get('total_size')
+    root = data.get('symbols', {})
+    totalsize = data.get('total_size') or root.get('size') or 0
     ids = []
     labels = []
     parents = []
     values = []
     hovertext = []
+
+    def iter_leaf_sections(node: dict):
+        if not isinstance(node, dict):
+            return
+        children = node.get('children') or ()
+        if children:
+            for child in children:
+                iter_leaf_sections(child)
+            return
+        section = node.get('section')
+        if section:
+            sections.add(section)
+
+    def clone_subtree_for_section(node: dict, section: str):
+        if not isinstance(node, dict):
+            return None
+
+        children = node.get('children') or ()
+        if not children:
+            if node.get('section') != section:
+                return None
+            clone = dict(node)
+            identifier = clone.get('identifier')
+            if identifier is not None:
+                clone['identifier'] = f'{section}|{identifier}'
+            return clone
+
+        new_children = []
+        for child in children:
+            filtered = clone_subtree_for_section(child, section)
+            if filtered is not None:
+                new_children.append(filtered)
+
+        if not new_children:
+            return None
+
+        clone = dict(node)
+        identifier = clone.get('identifier')
+        if identifier is not None:
+            clone['identifier'] = f'{section}|{identifier}'
+        clone['children'] = new_children
+        clone['size'] = sum(c.get('size', 0) for c in new_children)
+        clone.pop('section', None)
+        clone.pop('address', None)
+        return clone
 
     def iter_node(node: dict, parent=''):
         identifier = node.get('identifier')
@@ -79,7 +125,9 @@ def main():
         parents.append(parent)
         values.append(node.get('size', 0))
 
-        details = [f'percentage: {node.get("size") / totalsize:.2%}']
+        node_size = node.get("size", 0)
+        pct = (node_size / totalsize) if totalsize else 0.0
+        details = [f'percentage: {pct:.2%}']
         if 'address' in node:
             details.append(f'address: 0x{node.get("address"):08x}')
         if 'section' in node:
@@ -90,7 +138,37 @@ def main():
         for child in node.get('children', ()):
             iter_node(child, identifier)
 
-    iter_node(data.get('symbols', {}))
+    sections = set()
+    iter_leaf_sections(root)
+
+    if sections:
+        section_nodes = []
+        for section in sorted(sections):
+            children = []
+            for child in root.get('children', ()):
+                filtered = clone_subtree_for_section(child, section)
+                if filtered is not None:
+                    children.append(filtered)
+            if not children:
+                continue
+            section_nodes.append(
+                {
+                    "name": section,
+                    "size": sum(c.get('size', 0) for c in children),
+                    "identifier": f"section:{section}",
+                    "children": children,
+                }
+            )
+
+        root_for_plot = {
+            "name": root.get("name", "Root"),
+            "size": sum(c.get('size', 0) for c in section_nodes),
+            "identifier": root.get("identifier", "root"),
+            "children": section_nodes,
+        }
+        iter_node(root_for_plot)
+    else:
+        iter_node(root)
 
     fig = go.Figure(
         go.Sunburst(
