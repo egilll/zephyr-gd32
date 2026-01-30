@@ -62,6 +62,14 @@ static void usart_gd32_dma_tx_cb(const struct device *dma_dev, void *user_data,
 #define USART_STAT USART_STAT0
 #endif
 
+/* Keep ISR bounded even if a status flag sticks high. */
+#define GD32_USART_MAX_RX_PER_ISR	16U
+#define GD32_USART_MAX_TX_PER_ISR	16U
+
+/* Polling wait timeout for a single character transfer (bounded, baud-scaled). */
+#define GD32_USART_POLL_MIN_US		100U
+#define GD32_USART_POLL_MAX_US		1000000U
+
 struct gd32_usart_config {
 	uint32_t reg;
 	uint16_t clkid;
@@ -114,6 +122,47 @@ struct gd32_usart_data {
 	size_t rx_next_buffer_len;
 #endif /* CONFIG_UART_ASYNC_API */
 };
+
+static uint32_t usart_gd32_calc_char_timeout_us(const struct device *dev)
+{
+	const struct gd32_usart_data *data = dev->data;
+	uint32_t baud = data->baud_rate;
+	uint64_t char_us;
+	uint64_t timeout_us;
+
+	if (baud == 0U) {
+		return GD32_USART_POLL_MAX_US;
+	}
+
+	/* Start + data(9 max with parity) + parity + stop ~= <= 12 bit-times. */
+	char_us = DIV_ROUND_UP(12ULL * 1000000ULL, (uint64_t)baud);
+	timeout_us = (char_us * 4ULL) + 50ULL;
+
+	return (uint32_t)CLAMP(timeout_us, (uint64_t)GD32_USART_POLL_MIN_US,
+			       (uint64_t)GD32_USART_POLL_MAX_US);
+}
+
+#ifdef CONFIG_UART_ASYNC_API
+static int usart_gd32_err_reason(uint32_t stat0)
+{
+	int reason = 0;
+
+	if ((stat0 & USART_STAT0_ORERR) != 0U) {
+		reason |= UART_ERROR_OVERRUN;
+	}
+	if ((stat0 & USART_STAT0_NERR) != 0U) {
+		reason |= UART_ERROR_NOISE;
+	}
+	if ((stat0 & USART_STAT0_FERR) != 0U) {
+		reason |= UART_ERROR_FRAMING;
+	}
+	if ((stat0 & USART_STAT0_PERR) != 0U) {
+		reason |= UART_ERROR_PARITY;
+	}
+
+	return reason;
+}
+#endif /* CONFIG_UART_ASYNC_API */
 
 #ifdef CONFIG_UART_ASYNC_API
 #define GD32_USART_DATA_REG_ADDR(base) ((uint32_t)((base) + 0x04U))
@@ -531,23 +580,7 @@ static void usart_gd32_async_isr(const struct device *dev)
 	uint32_t stat0 = USART_STAT(cfg->reg);
 
 	if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR | USART_STAT0_FERR | USART_STAT0_PERR)) {
-		int reason = 0;
-
-		if (stat0 & USART_STAT0_ORERR) {
-			reason |= UART_ERROR_OVERRUN;
-		}
-
-		if (stat0 & USART_STAT0_NERR) {
-			reason |= UART_ERROR_NOISE;
-		}
-
-		if (stat0 & USART_STAT0_FERR) {
-			reason |= UART_ERROR_FRAMING;
-		}
-
-		if (stat0 & USART_STAT0_PERR) {
-			reason |= UART_ERROR_PARITY;
-		}
+		int reason = usart_gd32_err_reason(stat0);
 
 		volatile uint32_t dummy = USART_DATA(cfg->reg);
 		ARG_UNUSED(dummy);
@@ -559,7 +592,20 @@ static void usart_gd32_async_isr(const struct device *dev)
 
 	if (!data->rx_dma_active && (data->rx.buffer_length != 0U) &&
 	    usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_RBNE)) {
-		while (usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
+		for (uint32_t i = 0; i < GD32_USART_MAX_RX_PER_ISR &&
+				     usart_flag_get(cfg->reg, USART_FLAG_RBNE);
+		     i++) {
+			stat0 = USART_STAT(cfg->reg);
+			if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR |
+				     USART_STAT0_FERR | USART_STAT0_PERR)) {
+				(void)USART_DATA(cfg->reg);
+				if (data->rx.buffer_length != 0U) {
+					usart_gd32_async_rx_stop(dev, usart_gd32_err_reason(stat0));
+					return;
+				}
+				continue;
+			}
+
 			if (data->rx.counter >= data->rx.buffer_length) {
 				usart_gd32_async_rx_buf_done(dev, true);
 				if (data->rx.buffer_length == 0U) {
@@ -581,8 +627,10 @@ static void usart_gd32_async_isr(const struct device *dev)
 
 	if (!data->tx_dma_active && (data->tx.buffer_length != 0U)) {
 		if (usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_TBE)) {
-			while (usart_flag_get(cfg->reg, USART_FLAG_TBE) &&
-			       (data->tx.counter < data->tx.buffer_length)) {
+			for (uint32_t i = 0; i < GD32_USART_MAX_TX_PER_ISR &&
+					     usart_flag_get(cfg->reg, USART_FLAG_TBE) &&
+					     (data->tx.counter < data->tx.buffer_length);
+			     i++) {
 				usart_data_transmit(cfg->reg, data->tx.buffer[data->tx.counter++]);
 			}
 
@@ -910,7 +958,9 @@ static int usart_gd32_async_rx_disable(const struct device *dev)
 	} else
 #endif
 	{
-		while (usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
+		for (uint32_t i = 0; i < GD32_USART_MAX_RX_PER_ISR &&
+				     usart_flag_get(cfg->reg, USART_FLAG_RBNE);
+		     i++) {
 			uint32_t stat0 = USART_STAT(cfg->reg);
 
 			if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR |
@@ -1098,12 +1148,15 @@ static int usart_gd32_poll_in(const struct device *dev, unsigned char *c)
 static void usart_gd32_poll_out(const struct device *dev, unsigned char c)
 {
 	const struct gd32_usart_config *const cfg = dev->config;
+	uint32_t timeout_us = usart_gd32_calc_char_timeout_us(dev);
+
+	if (!WAIT_FOR(usart_flag_get(cfg->reg, USART_FLAG_TBE) != RESET,
+		      timeout_us, k_busy_wait(1))) {
+		/* Avoid blocking logging paths forever if the peripheral is wedged. */
+		return;
+	}
 
 	usart_data_transmit(cfg->reg, c);
-
-	while (usart_flag_get(cfg->reg, USART_FLAG_TBE) == RESET) {
-		;
-	}
 }
 
 static int usart_gd32_err_check(const struct device *dev)
