@@ -18,7 +18,11 @@ Requires plotly to be installed, for example with pip:
 
 import argparse
 import json
+import os
 import sys
+import tempfile
+import webbrowser
+from pathlib import Path
 
 
 def parse_args():
@@ -106,8 +110,19 @@ def main():
         fig.write_html(args.html, auto_open=False)
         return
 
-    print("Opening the default browser to render the generated plot.")
-    fig.show(renderer="browser")
+    fd, html_path = tempfile.mkstemp(prefix="zephyr-footprint-", suffix=".html")
+    os.close(fd)
+
+    html_path = Path(html_path)
+    fig.write_html(html_path, auto_open=False)
+
+    print(f"Wrote plot to {html_path}")
+    opened = webbrowser.open(html_path.resolve().as_uri())
+    if not opened:
+        print(
+            f"Failed to open a browser automatically. Open this file manually: {html_path}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
