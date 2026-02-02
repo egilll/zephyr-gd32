@@ -90,6 +90,7 @@ struct spi_gd32_data {
 	atomic_t state;
 	bool busy;
 	bool use_dma;
+	bool hw_rx_expected;
 	uint8_t dfs;
 	size_t pending_rx;
 	int completion_status;
@@ -346,6 +347,27 @@ static void spi_gd32_prepare_transfer(const struct device *dev)
 	spi_gd32_flush_rx(cfg->reg);
 }
 
+static bool spi_gd32_hw_rx_expected(uint32_t reg)
+{
+	uint32_t ctl0 = SPI_CTL0(reg);
+
+	/* Receive-only mode always expects RX. */
+	if ((ctl0 & SPI_CTL0_RO) != 0U) {
+		return true;
+	}
+
+	/*
+	 * Bidirectional mode (BDEN=1): BDOEN selects output (transmit-only) vs input (receive).
+	 * In transmit-only bidirectional mode, the peripheral does not provide meaningful RX data.
+	 */
+	if ((ctl0 & SPI_CTL0_BDEN) != 0U) {
+		return (ctl0 & SPI_CTL0_BDOEN) == 0U;
+	}
+
+	/* 2-line full-duplex always shifts RX while transmitting. */
+	return true;
+}
+
 #ifdef CONFIG_SPI_GD32_DMA
 static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				  int status);
@@ -474,6 +496,42 @@ static k_timeout_t spi_gd32_finish_delay(const struct spi_config *config)
 }
 
 static void spi_gd32_isr(const struct device *dev);
+
+static void spi_gd32_prime_irq_xfer(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	struct spi_context *ctx = &data->ctx;
+	uint32_t stat;
+	uint16_t tx = 0U;
+
+	if (data->use_dma || atomic_get(&data->state) != SPI_GD32_XFER_ACTIVE) {
+		return;
+	}
+
+	if (!spi_gd32_transfer_ongoing(data)) {
+		return;
+	}
+
+	stat = SPI_STAT(cfg->reg);
+	if ((stat & SPI_STAT_TBE) == 0U) {
+		return;
+	}
+
+	if (spi_context_tx_buf_on(ctx)) {
+		if (data->dfs == 1U) {
+			tx = UNALIGNED_GET((uint8_t *)ctx->tx_buf);
+		} else {
+			tx = UNALIGNED_GET((uint16_t *)ctx->tx_buf);
+		}
+	}
+
+	SPI_DATA(cfg->reg) = tx;
+	spi_context_update_tx(ctx, data->dfs, 1);
+	if (data->hw_rx_expected) {
+		data->pending_rx++;
+	}
+}
 
 static uint32_t spi_gd32_xfer_timeout_ms(const struct spi_context *ctx, uint32_t effective_hz)
 {
@@ -711,6 +769,13 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 	if (!spi_gd32_transfer_ongoing(data)) {
 		data->use_dma = false;
 	}
+
+	data->hw_rx_expected = spi_gd32_hw_rx_expected(cfg->reg);
+	if (!data->hw_rx_expected) {
+		/* DMA relies on RX DMA requests; disable DMA for TX-only bidirectional mode. */
+		data->use_dma = false;
+	}
+
 	atomic_set(&data->state, SPI_GD32_XFER_ACTIVE);
 
 	spi_context_cs_control(&data->ctx, true);
@@ -727,14 +792,15 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 #endif
 		SPI_CTL1(cfg->reg) |= SPI_CTL1_ERRIE;
 	} else {
+		unsigned int key = irq_lock();
+
 		SPI_CTL1(cfg->reg) |= (SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE | SPI_CTL1_ERRIE);
-#ifdef CONFIG_SPI_GD32_INTERRUPT
 		/*
-		 * SPI_STAT.TBE resets to 1 (empty). Some parts only generate the TBE interrupt on
-		 * a 0->1 transition, so kick the ISR once to start the first write.
+		 * Some parts only generate the TBE interrupt on a 0->1 transition; prime the first
+		 * frame so the peripheral can generate a subsequent TBE edge.
 		 */
-		spi_gd32_isr(dev);
-#endif
+		spi_gd32_prime_irq_xfer(dev);
+		irq_unlock(key);
 	}
 
 	data->last_timeout_ms = spi_gd32_xfer_timeout_ms(&data->ctx, data->effective_hz);
@@ -798,17 +864,31 @@ static void spi_gd32_isr(const struct device *dev)
 	const struct spi_gd32_config *cfg = dev->config;
 	struct spi_gd32_data *data = dev->data;
 	struct spi_context *ctx = &data->ctx;
+	uint32_t stat;
+	uint32_t errs;
 
 	if (atomic_get(&data->state) != SPI_GD32_XFER_ACTIVE) {
 		spi_gd32_disable_irqs_and_dma(cfg->reg);
 		return;
 	}
 
-	if ((SPI_STAT(cfg->reg) & SPI_GD32_ERR_MASK) != 0U) {
-		spi_gd32_log_errors(dev, "isr", SPI_STAT(cfg->reg));
+	stat = SPI_STAT(cfg->reg);
+	errs = stat & SPI_GD32_ERR_MASK;
+	if (errs != 0U) {
+		bool rxor_only = (errs == SPI_STAT_RXORERR);
+		bool ignore_rxor = rxor_only && !data->use_dma &&
+				   (!data->hw_rx_expected ||
+				    (spi_context_total_rx_len(ctx) == 0U));
+
+		if (!ignore_rxor) {
+			spi_gd32_log_errors(dev, "isr", stat);
+			spi_gd32_request_finish(dev, -EIO);
+			return;
+		}
+
 		spi_gd32_clear_errors(cfg->reg);
-		spi_gd32_request_finish(dev, -EIO);
-		return;
+		spi_gd32_flush_rx(cfg->reg);
+		data->pending_rx = 0U;
 	}
 
 	/* DMA path uses DMA IRQs for data movement. */
@@ -818,19 +898,32 @@ static void spi_gd32_isr(const struct device *dev)
 
 	for (int i = 0; i < 4; i++) {
 		bool progress = false;
-		uint32_t stat = SPI_STAT(cfg->reg);
+		uint32_t stat_iter = SPI_STAT(cfg->reg);
+		uint32_t errs_iter = stat_iter & SPI_GD32_ERR_MASK;
 
-		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
-			spi_gd32_log_errors(dev, "isr", stat);
+		if (errs_iter != 0U) {
+			bool rxor_only = (errs_iter == SPI_STAT_RXORERR);
+			bool ignore_rxor = rxor_only &&
+					   (!data->hw_rx_expected ||
+					    (spi_context_total_rx_len(ctx) == 0U));
+
+			if (!ignore_rxor) {
+				spi_gd32_log_errors(dev, "isr", stat_iter);
+				spi_gd32_clear_errors(cfg->reg);
+				spi_gd32_request_finish(dev, -EIO);
+				return;
+			}
+
 			spi_gd32_clear_errors(cfg->reg);
-			spi_gd32_request_finish(dev, -EIO);
-			return;
+			spi_gd32_flush_rx(cfg->reg);
+			data->pending_rx = 0U;
+			progress = true;
 		}
 
-		if ((stat & SPI_STAT_RBNE) != 0U) {
+		if ((stat_iter & SPI_STAT_RBNE) != 0U) {
 			uint16_t rx = (uint16_t)SPI_DATA(cfg->reg);
 
-			if (data->pending_rx != 0U) {
+			if (data->hw_rx_expected && data->pending_rx != 0U) {
 				data->pending_rx--;
 			}
 
@@ -846,7 +939,8 @@ static void spi_gd32_isr(const struct device *dev)
 			progress = true;
 		}
 
-		if ((stat & SPI_STAT_TBE) != 0U && data->pending_rx == 0U &&
+		if ((stat_iter & SPI_STAT_TBE) != 0U &&
+		    (!data->hw_rx_expected || data->pending_rx == 0U) &&
 		    spi_gd32_transfer_ongoing(data)) {
 			uint16_t tx = 0U;
 
@@ -860,7 +954,9 @@ static void spi_gd32_isr(const struct device *dev)
 
 			SPI_DATA(cfg->reg) = tx;
 			spi_context_update_tx(ctx, data->dfs, 1);
-			data->pending_rx++;
+			if (data->hw_rx_expected) {
+				data->pending_rx++;
+			}
 			progress = true;
 		}
 
