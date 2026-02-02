@@ -152,7 +152,12 @@ static void spi_gd32_flush_rx(uint32_t reg)
 {
 	/* RX buffer is 1-deep; cap reads to avoid any pathological infinite loop. */
 	for (int i = 0; i < 32 && ((SPI_STAT(reg) & SPI_STAT_RBNE) != 0U); i++) {
+		/*
+		 * The RXORERR clear sequence is SPI_DATA read followed by SPI_STAT read.
+		 * Reading SPI_STAT after draining ensures we don't leave RXORERR latched.
+		 */
 		(void)SPI_DATA(reg);
+		(void)SPI_STAT(reg);
 	}
 }
 
@@ -337,8 +342,8 @@ static void spi_gd32_prepare_transfer(const struct device *dev)
 {
 	const struct spi_gd32_config *cfg = dev->config;
 
-	spi_gd32_flush_rx(cfg->reg);
 	spi_gd32_clear_errors(cfg->reg);
+	spi_gd32_flush_rx(cfg->reg);
 }
 
 #ifdef CONFIG_SPI_GD32_DMA
@@ -495,6 +500,18 @@ static uint32_t spi_gd32_xfer_timeout_ms(const struct spi_context *ctx, uint32_t
 
 static void spi_gd32_request_finish(const struct device *dev, int status);
 
+static void spi_gd32_log_errors(const struct device *dev, const char *where, uint32_t stat)
+{
+	if ((stat & SPI_GD32_ERR_MASK) == 0U) {
+		return;
+	}
+
+	LOG_INF("%s: %s: SPI error stat=0x%08x (rxor=%u conf=%u crc=%u ferr=%u txur=%u)", dev->name,
+		where, stat, (stat & SPI_STAT_RXORERR) != 0U, (stat & SPI_STAT_CONFERR) != 0U,
+		(stat & SPI_STAT_CRCERR) != 0U, (stat & SPI_STAT_FERR) != 0U,
+		(stat & SPI_STAT_TXURERR) != 0U);
+}
+
 static void spi_gd32_timeout_work_handler(struct k_work *work)
 {
 	struct spi_gd32_data *data = CONTAINER_OF(work, struct spi_gd32_data, timeout_work.work);
@@ -516,9 +533,18 @@ static void spi_gd32_request_finish(const struct device *dev, int status)
 {
 	const struct spi_gd32_config *cfg = dev->config;
 	struct spi_gd32_data *data = dev->data;
+	uint32_t stat = SPI_STAT(cfg->reg);
 
 	if (!atomic_cas(&data->state, SPI_GD32_XFER_ACTIVE, SPI_GD32_XFER_FINISHING)) {
 		return;
+	}
+
+	if (status != 0) {
+		spi_gd32_log_errors(dev, "finish request", stat);
+		LOG_DBG("%s: finish request status=%d (use_dma=%u, pending_rx=%u, tx_on=%u, "
+			"rx_on=%u, stat=0x%08x)",
+			dev->name, status, data->use_dma, data->pending_rx,
+			spi_context_tx_on(&data->ctx), spi_context_rx_on(&data->ctx), stat);
 	}
 
 	data->completion_status = status;
@@ -540,8 +566,7 @@ static void spi_gd32_finish_work_handler(struct k_work *work)
 		return;
 	}
 
-	spi_gd32_flush_rx(cfg->reg);
-	spi_gd32_clear_errors(cfg->reg);
+	spi_gd32_prepare_transfer(dev);
 
 	if ((SPI_STAT(cfg->reg) & SPI_STAT_TRANS) != 0U && data->finish_attempts++ < 10U) {
 		(void)k_work_schedule(&data->finish_work, spi_gd32_finish_delay(data->ctx.config));
@@ -549,6 +574,7 @@ static void spi_gd32_finish_work_handler(struct k_work *work)
 	}
 
 	if ((SPI_STAT(cfg->reg) & SPI_STAT_TRANS) != 0U) {
+		LOG_INF("%s: SPI transfer stuck (TRANS=1); resetting peripheral", dev->name);
 		SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
 		(void)reset_line_toggle_dt(&cfg->reset);
 		spi_gd32_prepare_transfer(dev);
@@ -582,6 +608,12 @@ static void spi_gd32_abort(const struct device *dev)
 {
 	const struct spi_gd32_config *cfg = dev->config;
 	struct spi_gd32_data *data = dev->data;
+	uint32_t stat = SPI_STAT(cfg->reg);
+
+	spi_gd32_log_errors(dev, "abort", stat);
+	LOG_DBG("%s: abort (use_dma=%u, pending_rx=%u, tx_on=%u, rx_on=%u, stat=0x%08x)", dev->name,
+		data->use_dma, data->pending_rx, spi_context_tx_on(&data->ctx),
+		spi_context_rx_on(&data->ctx), stat);
 
 	atomic_set(&data->state, SPI_GD32_XFER_ABORTED);
 	(void)k_work_cancel_delayable(&data->finish_work);
@@ -773,6 +805,7 @@ static void spi_gd32_isr(const struct device *dev)
 	}
 
 	if ((SPI_STAT(cfg->reg) & SPI_GD32_ERR_MASK) != 0U) {
+		spi_gd32_log_errors(dev, "isr", SPI_STAT(cfg->reg));
 		spi_gd32_clear_errors(cfg->reg);
 		spi_gd32_request_finish(dev, -EIO);
 		return;
@@ -788,6 +821,7 @@ static void spi_gd32_isr(const struct device *dev)
 		uint32_t stat = SPI_STAT(cfg->reg);
 
 		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
+			spi_gd32_log_errors(dev, "isr", stat);
 			spi_gd32_clear_errors(cfg->reg);
 			spi_gd32_request_finish(dev, -EIO);
 			return;
