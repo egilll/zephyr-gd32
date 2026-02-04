@@ -122,12 +122,4 @@ config ETH_GD32_TX_THRESHOLD_16
 
 endchoice
 
-config ETH_GD32_AUTO_PADCRC_DROP
-	bool "Auto strip padding/CRC on Rx"
-	default y
-	help
-	  Enables the MAC automatic padding and CRC drop feature so the DMA writes
-	  fewer bytes to memory on receive. When disabled, the driver strips the
-	  trailing 4-byte FCS in software.
-
 endif

@@ -455,14 +455,6 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 		enet_descriptors_struct *end_desc = &eth0_dma.rx_desc[idx];
 		uint32_t frame_len = GET_RDES0_FRML(end_desc->status);
 
-		if (!IS_ENABLED(CONFIG_ETH_GD32_AUTO_PADCRC_DROP)) {
-			if (frame_len >= 4U) {
-				frame_len -= 4U;
-			} else {
-				frame_len = 0U;
-			}
-		}
-
 		bool rx_ok = (frame_len > 0U) && (frame_len <= GD32_ETH_FRAME_SIZE_MAX);
 		rx_ok = rx_ok && ((end_desc->status & ENET_RDES0_ERRS) == 0U);
 
@@ -1196,9 +1188,12 @@ static void eth_gd32_mac_dma_default_config(void)
 	 * Keep checksum offload disabled: enabling IP checksum checking in the
 	 * receiver can drop valid frames on this SoC (see errata in project docs).
 	 */
-	if (IS_ENABLED(CONFIG_ETH_GD32_AUTO_PADCRC_DROP)) {
-		mac_cfg |= ENET_MAC_CFG_APCD;
-	}
+	/*
+	 * Always strip padding/FCS in hardware so the network stack receives
+	 * Ethernet frames without the trailing 4-byte FCS (as other Zephyr
+	 * Ethernet drivers do).
+	 */
+	mac_cfg |= ENET_MAC_CFG_APCD | ENET_MAC_CFG_TFCD;
 	ENET_MAC_CFG = mac_cfg;
 
 	/*

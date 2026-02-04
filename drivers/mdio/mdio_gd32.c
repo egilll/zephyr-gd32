@@ -161,8 +161,14 @@ static void mdio_gd32_hw_enable(const struct device *dev)
 {
 	const struct mdio_gd32_config *cfg = dev->config;
 
-	/* ENET clocks must be enabled for the management station interface. */
+	/*
+	 * ENET clocks must be enabled for the management station interface.
+	 * On GD32F4xx, enabling only RCU_ENET can leave the MDIO busy bit stuck
+	 * (PB never clears); enable TX/RX domains as well.
+	 */
 	rcu_periph_clock_enable(RCU_ENET);
+	rcu_periph_clock_enable(RCU_ENETTX);
+	rcu_periph_clock_enable(RCU_ENETRX);
 
 	k_sleep(K_MSEC(1));
 
