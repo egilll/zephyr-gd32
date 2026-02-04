@@ -21,6 +21,8 @@
 
 LOG_MODULE_REGISTER(mdio_gd32, CONFIG_MDIO_LOG_LEVEL);
 
+#define MDIO_GD32_OP_TIMEOUT_MS 10
+
 struct mdio_gd32_config {
 	const struct pinctrl_dev_config *pincfg;
 	uint32_t mdc_freq;
@@ -31,6 +33,60 @@ struct mdio_gd32_config {
 struct mdio_gd32_data {
 	struct k_sem sem;
 };
+
+static int mdio_gd32_wait_ready(void)
+{
+	int64_t deadline = k_uptime_get() + MDIO_GD32_OP_TIMEOUT_MS;
+
+	while ((ENET_MAC_PHY_CTL & ENET_MAC_PHY_CTL_PB) != 0U) {
+		if (k_uptime_get() > deadline) {
+			return -ETIMEDOUT;
+		}
+
+		k_usleep(10);
+	}
+
+	return 0;
+}
+
+static int mdio_gd32_clause22_read(uint8_t prtad, uint8_t regad, uint16_t *data)
+{
+	uint32_t clk_bits = ENET_MAC_PHY_CTL & ENET_MAC_PHY_CTL_CLR;
+	int ret;
+
+	ret = mdio_gd32_wait_ready();
+	if (ret < 0) {
+		return ret;
+	}
+
+	ENET_MAC_PHY_CTL = clk_bits | MAC_PHY_CTL_PA(prtad & 0x1FU) | MAC_PHY_CTL_PR(regad & 0x1FU) |
+			   ENET_MAC_PHY_CTL_PB;
+
+	ret = mdio_gd32_wait_ready();
+	if (ret < 0) {
+		return ret;
+	}
+
+	*data = (uint16_t)(ENET_MAC_PHY_DATA & 0xFFFFU);
+	return 0;
+}
+
+static int mdio_gd32_clause22_write(uint8_t prtad, uint8_t regad, uint16_t data)
+{
+	uint32_t clk_bits = ENET_MAC_PHY_CTL & ENET_MAC_PHY_CTL_CLR;
+	int ret;
+
+	ret = mdio_gd32_wait_ready();
+	if (ret < 0) {
+		return ret;
+	}
+
+	ENET_MAC_PHY_DATA = (uint32_t)data;
+	ENET_MAC_PHY_CTL = clk_bits | MAC_PHY_CTL_PA(prtad & 0x1FU) | MAC_PHY_CTL_PR(regad & 0x1FU) |
+			   ENET_MAC_PHY_CTL_PW | ENET_MAC_PHY_CTL_PB;
+
+	return mdio_gd32_wait_ready();
+}
 
 static void mdio_gd32_phy_clk_out_enable(void)
 {
@@ -107,8 +163,6 @@ static void mdio_gd32_hw_enable(const struct device *dev)
 
 	/* ENET clocks must be enabled for the management station interface. */
 	rcu_periph_clock_enable(RCU_ENET);
-	rcu_periph_clock_enable(RCU_ENETTX);
-	rcu_periph_clock_enable(RCU_ENETRX);
 
 	k_sleep(K_MSEC(1));
 
@@ -118,14 +172,16 @@ static void mdio_gd32_hw_enable(const struct device *dev)
 static int mdio_gd32_read(const struct device *dev, uint8_t prtad, uint8_t regad, uint16_t *data)
 {
 	struct mdio_gd32_data *d = dev->data;
-	uint16_t val = 0;
+	uint16_t val = 0U;
+	int ret;
 
 	k_sem_take(&d->sem, K_FOREVER);
-	if (enet_phy_write_read(ENET_PHY_READ, prtad, regad, &val) != SUCCESS) {
-		k_sem_give(&d->sem);
-		return -EIO;
-	}
+	ret = mdio_gd32_clause22_read(prtad, regad, &val);
 	k_sem_give(&d->sem);
+
+	if (ret < 0) {
+		return ret;
+	}
 
 	*data = val;
 	return 0;
@@ -134,15 +190,12 @@ static int mdio_gd32_read(const struct device *dev, uint8_t prtad, uint8_t regad
 static int mdio_gd32_write(const struct device *dev, uint8_t prtad, uint8_t regad, uint16_t data)
 {
 	struct mdio_gd32_data *d = dev->data;
-	uint16_t tmp = data;
+	int ret;
 
 	k_sem_take(&d->sem, K_FOREVER);
-	if (enet_phy_write_read(ENET_PHY_WRITE, prtad, regad, &tmp) != SUCCESS) {
-		k_sem_give(&d->sem);
-		return -EIO;
-	}
+	ret = mdio_gd32_clause22_write(prtad, regad, data);
 	k_sem_give(&d->sem);
-	return 0;
+	return ret;
 }
 
 static int mdio_gd32_init(const struct device *dev)

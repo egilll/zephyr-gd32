@@ -145,11 +145,14 @@ struct eth_gd32_config {
 };
 
 struct eth_gd32_data {
+	const struct device *dev;
 	struct net_if *iface;
 	uint8_t mac_addr[6];
 	struct k_mutex tx_mutex;
 	struct k_sem tx_sem;
 	struct net_pkt *tx_pkts[GD32_ETH_TX_DESC_COUNT];
+	struct k_work rx_work;
+	atomic_t rx_work_flags;
 	struct k_work recover_work;
 	atomic_t recovering;
 	atomic_t link_up;
@@ -157,6 +160,7 @@ struct eth_gd32_data {
 	struct net_stats_eth stats;
 #endif
 	struct net_buf *rx_frags[GD32_ETH_RX_DESC_COUNT];
+	uint8_t mcast_hash_refcnt[64];
 	uint16_t rx_tail;
 	uint16_t tx_head;
 	uint16_t tx_clean;
@@ -196,16 +200,12 @@ static inline bool gd32_dma_addr_ok(uintptr_t addr, size_t len)
 
 static inline void gd32_cache_invalidate(const void *addr, size_t len)
 {
-	if (IS_ENABLED(CONFIG_DCACHE)) {
-		sys_cache_data_invd_range((void *)addr, len);
-	}
+	(void)sys_cache_data_invd_range((void *)addr, len);
 }
 
 static inline void gd32_cache_clean(const void *addr, size_t len)
 {
-	if (IS_ENABLED(CONFIG_DCACHE)) {
-		sys_cache_data_flush_range((void *)addr, len);
-	}
+	(void)sys_cache_data_flush_range((void *)addr, len);
 }
 
 static inline bool rx_desc_dma_owned(const enet_descriptors_struct *desc)
@@ -255,6 +255,11 @@ static inline void eth_gd32_dma_rx_poll_demand(void)
 {
 	ENET_DMA_RPEN = GD32_DMA_POLL_DEMAND;
 }
+
+enum {
+	GD32_RX_WORK_FLAG_RBU = BIT(0),
+	GD32_RX_WORK_FLAG_KICK = BIT(1),
+};
 
 static void eth_gd32_dma_irqs_enable(void)
 {
@@ -329,6 +334,9 @@ static int eth_gd32_hw_reset_and_configure(struct eth_gd32_data *data)
 
 	eth_gd32_mac_dma_default_config();
 	enet_mac_address_set(ENET_MAC_ADDRESS0, data->mac_addr);
+#if !defined(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)
+	eth_gd32_mcast_hash_sync(data);
+#endif
 
 	eth_gd32_rings_configure(data);
 	eth_gd32_dma_irqs_enable();
@@ -403,11 +411,13 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 		uint16_t idx = data->rx_tail;
 		uint16_t cnt = 0U;
 		bool complete = false;
+		bool waiting_for_dma = false;
 
 		while (cnt < GD32_ETH_RX_DESC_COUNT) {
 			enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
 
 			if (rx_desc_dma_owned(desc)) {
+				waiting_for_dma = true;
 				break;
 			}
 
@@ -421,7 +431,25 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 		}
 
 		if (!complete) {
-			break;
+			if (waiting_for_dma) {
+				break;
+			}
+
+			/* Corrupt/oversized frame: drop and rearm what we've scanned. */
+			eth_stats_update_errors_rx(data->iface);
+
+			idx = data->rx_tail;
+			for (uint16_t n = 0U; n < cnt; n++) {
+				enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
+				struct net_buf *frag = data->rx_frags[idx];
+
+				eth_gd32_rx_buf_prepare_for_dma(frag);
+				eth_gd32_rx_desc_give_to_dma(desc, frag);
+				idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
+			}
+
+			data->rx_tail = idx;
+			continue;
 		}
 
 		enet_descriptors_struct *end_desc = &eth0_dma.rx_desc[idx];
@@ -490,16 +518,16 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 			eth_stats_update_errors_rx(data->iface);
 
 			idx = data->rx_tail;
-		for (uint16_t n = 0U; n < cnt; n++) {
-			enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
-			struct net_buf *frag = data->rx_frags[idx];
+			for (uint16_t n = 0U; n < cnt; n++) {
+				enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
+				struct net_buf *frag = data->rx_frags[idx];
 
-			eth_gd32_rx_buf_prepare_for_dma(frag);
-			eth_gd32_rx_desc_give_to_dma(desc, frag);
-			idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
-		}
+				eth_gd32_rx_buf_prepare_for_dma(frag);
+				eth_gd32_rx_desc_give_to_dma(desc, frag);
+				idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
+			}
 
-		data->rx_tail = idx;
+			data->rx_tail = idx;
 			continue;
 		}
 
@@ -539,6 +567,21 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 
 	if (rbu_seen) {
 		eth_gd32_dma_rx_poll_demand();
+	}
+}
+
+static void eth_gd32_rx_work_handler(struct k_work *work)
+{
+	struct eth_gd32_data *data = CONTAINER_OF(work, struct eth_gd32_data, rx_work);
+
+	for (;;) {
+		atomic_val_t flags = atomic_clear(&data->rx_work_flags);
+
+		eth_gd32_rx(data->dev, (flags & GD32_RX_WORK_FLAG_RBU) != 0U);
+
+		if (atomic_get(&data->rx_work_flags) == 0) {
+			break;
+		}
 	}
 }
 
@@ -589,6 +632,7 @@ out:
 
 static void eth_gd32_isr(const struct device *dev)
 {
+	struct eth_gd32_data *data = dev->data;
 	uint32_t stat = ENET_DMA_STAT;
 	uint32_t clear = 0U;
 
@@ -605,7 +649,13 @@ static void eth_gd32_isr(const struct device *dev)
 	}
 
 	if (stat & (ENET_DMA_STAT_RS | ENET_DMA_STAT_RBU)) {
-		eth_gd32_rx(dev, (stat & ENET_DMA_STAT_RBU) != 0U);
+		atomic_or(&data->rx_work_flags, GD32_RX_WORK_FLAG_KICK);
+
+		if (stat & ENET_DMA_STAT_RBU) {
+			atomic_or(&data->rx_work_flags, GD32_RX_WORK_FLAG_RBU);
+		}
+
+		(void)k_work_submit(&data->rx_work);
 	}
 
 	if (stat & ENET_DMA_STAT_TS) {
@@ -621,8 +671,6 @@ static void eth_gd32_isr(const struct device *dev)
 	}
 
 	if (stat & ENET_DMA_STAT_FBE) {
-		struct eth_gd32_data *data = dev->data;
-
 		LOG_ERR("Fatal bus error (DMA_STAT=0x%08x)", stat);
 		if (atomic_cas(&data->recovering, 0, 1)) {
 			k_work_submit(&data->recover_work);
@@ -732,6 +780,9 @@ static enum ethernet_hw_caps eth_gd32_get_capabilities(const struct device *dev)
 {
 	ARG_UNUSED(dev);
 	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE
+#if !defined(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)
+	       | ETHERNET_HW_FILTERING
+#endif
 #if defined(CONFIG_NET_LLDP)
 	       | ETHERNET_LLDP
 #endif
@@ -773,6 +824,7 @@ static void phy_link_state_changed(const struct device *phy_dev, struct phy_link
 	if (state->is_up) {
 		eth_gd32_set_mac_config(dev, state);
 		enet_enable();
+		eth_gd32_dma_rx_poll_demand();
 		if (data->iface) {
 			net_eth_carrier_on(data->iface);
 		}
@@ -792,6 +844,29 @@ static void phy_link_state_changed(const struct device *phy_dev, struct phy_link
 	}
 }
 
+static uint32_t eth_gd32_mcast_hash_index_get(const struct net_eth_addr *addr)
+{
+	uint32_t crc = __RBIT(crc32_ieee(addr->addr, sizeof(addr->addr)));
+
+	return (crc >> 26) & 0x3FU;
+}
+
+static void eth_gd32_mcast_hash_sync(const struct eth_gd32_data *data)
+{
+	uint32_t hash_table[2] = {0U};
+
+	for (uint32_t i = 0U; i < ARRAY_SIZE(data->mcast_hash_refcnt); i++) {
+		if (data->mcast_hash_refcnt[i] == 0U) {
+			continue;
+		}
+
+		hash_table[i / 32U] |= BIT(i % 32U);
+	}
+
+	ENET_MAC_HLL = hash_table[0];
+	ENET_MAC_HLH = hash_table[1];
+}
+
 static int eth_gd32_set_config(const struct device *dev, enum ethernet_config_type type,
 			       const struct ethernet_config *config)
 {
@@ -801,8 +876,10 @@ static int eth_gd32_set_config(const struct device *dev, enum ethernet_config_ty
 	case ETHERNET_CONFIG_TYPE_MAC_ADDRESS:
 		memcpy(data->mac_addr, config->mac_address.addr, sizeof(data->mac_addr));
 		enet_mac_address_set(ENET_MAC_ADDRESS0, data->mac_addr);
-		net_if_set_link_addr(data->iface, data->mac_addr, sizeof(data->mac_addr),
-				     NET_LINK_ETHERNET);
+		if (data->iface) {
+			net_if_set_link_addr(data->iface, data->mac_addr, sizeof(data->mac_addr),
+					     NET_LINK_ETHERNET);
+		}
 		return 0;
 #if defined(CONFIG_NET_PROMISCUOUS_MODE)
 	case ETHERNET_CONFIG_TYPE_PROMISC_MODE: {
@@ -816,6 +893,47 @@ static int eth_gd32_set_config(const struct device *dev, enum ethernet_config_ty
 		return 0;
 	}
 #endif
+	case ETHERNET_CONFIG_TYPE_FILTER: {
+		const struct ethernet_filter *filter = &config->filter;
+		struct net_eth_addr addr = filter->mac_address;
+
+		if (IS_ENABLED(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)) {
+			return -ENOTSUP;
+		}
+
+		if (filter->type != ETHERNET_FILTER_TYPE_DST_MAC_ADDRESS) {
+			return -ENOTSUP;
+		}
+
+		if (!net_eth_is_addr_multicast(&addr) || net_eth_is_addr_broadcast(&addr)) {
+			return -EINVAL;
+		}
+
+		uint32_t hash_index = eth_gd32_mcast_hash_index_get(&addr);
+		uint32_t hash_table[2] = { ENET_MAC_HLL, ENET_MAC_HLH };
+		uint32_t bit = BIT(hash_index % 32U);
+		uint8_t *refcnt = &data->mcast_hash_refcnt[hash_index];
+
+		if (filter->set) {
+			if (*refcnt != UINT8_MAX) {
+				(*refcnt)++;
+			}
+			hash_table[hash_index / 32U] |= bit;
+		} else {
+			if (*refcnt == 0U) {
+				return -ENOENT;
+			}
+
+			(*refcnt)--;
+			if (*refcnt == 0U) {
+				hash_table[hash_index / 32U] &= ~bit;
+			}
+		}
+
+		ENET_MAC_HLL = hash_table[0];
+		ENET_MAC_HLH = hash_table[1];
+		return 0;
+	}
 	default:
 		break;
 	}
@@ -1015,13 +1133,14 @@ static void eth_iface_init(struct net_if *iface)
 
 	net_if_set_link_addr(iface, data->mac_addr, sizeof(data->mac_addr), NET_LINK_ETHERNET);
 	ethernet_init(iface);
-	net_if_carrier_off(iface);
+	net_eth_carrier_off(iface);
 	net_lldp_set_lldpdu(iface);
 
 	if (phy == NULL) {
 		LOG_WRN("No PHY device, assuming link up");
 		atomic_set(&data->link_up, 1);
 		enet_enable();
+		eth_gd32_dma_rx_poll_demand();
 		net_eth_carrier_on(iface);
 		return;
 	}
@@ -1082,16 +1201,23 @@ static void eth_gd32_mac_dma_default_config(void)
 	}
 	ENET_MAC_CFG = mac_cfg;
 
-	/* Packet filtering: accept broadcast and all multicast; unicast is perfect match. */
+	/*
+	 * Packet filtering:
+	 * - Always accept broadcast.
+	 * - Either accept all multicast frames (debug/compat) or use multicast hash filtering.
+	 */
 	uint32_t frmf = ENET_MAC_FRMF;
-	frmf &= ~(ENET_MAC_FRMF_FAR | ENET_MAC_FRMF_PM | ENET_MAC_FRMF_BFRMD | ENET_MAC_FRMF_PCFRM);
-	if (IS_ENABLED(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)) {
-		frmf |= ENET_MAC_FRMF_PM;
-	}
+	frmf &= ~(ENET_MAC_FRMF_FAR | ENET_MAC_FRMF_PM | ENET_MAC_FRMF_BFRMD | ENET_MAC_FRMF_PCFRM |
+		  ENET_MAC_FRMF_HMF | ENET_MAC_FRMF_HPFLT | ENET_MAC_FRMF_HUF | ENET_MAC_FRMF_MFD);
 	frmf |= ENET_PCFRM_PREVENT_ALL;
+	if (IS_ENABLED(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)) {
+		frmf |= ENET_MULTICAST_FILTER_PASS;
+	} else {
+		frmf |= ENET_MULTICAST_FILTER_HASH_OR_PERFECT;
+	}
 	ENET_MAC_FRMF = frmf;
 
-	/* No hash-based filtering (hash list left empty). */
+	/* Multicast hash table (64 bits). */
 	ENET_MAC_HLH = 0U;
 	ENET_MAC_HLL = 0U;
 
@@ -1174,6 +1300,15 @@ static int eth_gd32_hw_init(const struct device *dev)
 	const struct eth_gd32_config *cfg = dev->config;
 	int ret;
 
+	data->dev = dev;
+	k_mutex_init(&data->tx_mutex);
+	k_sem_init(&data->tx_sem, GD32_ETH_TX_DESC_COUNT, GD32_ETH_TX_DESC_COUNT);
+	k_work_init(&data->rx_work, eth_gd32_rx_work_handler);
+	(void)atomic_clear(&data->rx_work_flags);
+	k_work_init(&data->recover_work, eth_gd32_recover_work_handler);
+	(void)atomic_clear(&data->recovering);
+	(void)atomic_clear(&data->link_up);
+
 	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clk_mac);
 	ret |= clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clk_tx);
 	ret |= clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clk_rx);
@@ -1221,15 +1356,15 @@ static int eth_gd32_hw_init(const struct device *dev)
 		syscfg_enet_phy_interface_config(SYSCFG_ENET_PHY_MII);
 	}
 
-	#if DT_INST_PROP(0, gd_phy_clk_out)
-	{
-		uint16_t clk_gpioa = GD32_CLOCK_GPIOA;
-		(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_gpioa);
-		gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_8);
-		gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, GPIO_PIN_8);
-		gpio_af_set(GPIOA, GPIO_AF_0, GPIO_PIN_8);
-		rcu_ckout0_config(RCU_CKOUT0SRC_PLLP, RCU_CKOUT0_DIV4);
-	}
+#if DT_INST_PROP(0, gd_phy_clk_out)
+		{
+			uint16_t clk_gpioa = GD32_CLOCK_GPIOA;
+			(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_gpioa);
+			gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_8);
+			gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, GPIO_PIN_8);
+			gpio_af_set(GPIOA, GPIO_AF_0, GPIO_PIN_8);
+			rcu_ckout0_config(RCU_CKOUT0SRC_PLLP, RCU_CKOUT0_DIV4);
+		}
 #endif
 
 	if (cfg->config_func) {
@@ -1255,12 +1390,6 @@ static int eth_gd32_hw_init(const struct device *dev)
 		eth_gd32_rx_frags_free(data, GD32_ETH_RX_DESC_COUNT);
 		return -EIO;
 	}
-
-	k_mutex_init(&data->tx_mutex);
-	k_sem_init(&data->tx_sem, GD32_ETH_TX_DESC_COUNT, GD32_ETH_TX_DESC_COUNT);
-	k_work_init(&data->recover_work, eth_gd32_recover_work_handler);
-	atomic_clear(&data->recovering);
-	atomic_clear(&data->link_up);
 
 	/* Start disabled; link-up callback (PHY) enables TX/RX. */
 	enet_disable();

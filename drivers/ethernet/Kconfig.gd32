@@ -36,9 +36,11 @@ config ETH_GD32_ACCEPT_ALL_MULTICAST
 	bool "Accept all multicast frames"
 	default y
 	help
-	  The GD32 ENET MAC can filter multicast frames, but this driver does not
-	  currently implement dynamic multicast address programming. Enabling
-	  this option passes all multicast frames to the stack.
+	  When enabled, all multicast frames are passed to the network stack and
+	  multicast filter requests from the Ethernet L2 layer are ignored.
+
+	  When disabled, multicast addresses (IGMP/MLD) requested by the stack
+	  are programmed into the MAC hash filter table.
 
 config ETH_GD32_TX_OSF
 	bool "TxDMA operate on second frame (OSF)"
