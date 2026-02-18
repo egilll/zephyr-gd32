@@ -836,6 +836,7 @@ static void phy_link_state_changed(const struct device *phy_dev, struct phy_link
 	}
 }
 
+#if !defined(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)
 static uint32_t eth_gd32_mcast_hash_index_get(const struct net_eth_addr *addr)
 {
 	uint32_t crc = __RBIT(crc32_ieee(addr->addr, sizeof(addr->addr)));
@@ -858,6 +859,7 @@ static void eth_gd32_mcast_hash_sync(const struct eth_gd32_data *data)
 	ENET_MAC_HLL = hash_table[0];
 	ENET_MAC_HLH = hash_table[1];
 }
+#endif /* !CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST */
 
 static int eth_gd32_set_config(const struct device *dev, enum ethernet_config_type type,
 			       const struct ethernet_config *config)
@@ -889,10 +891,6 @@ static int eth_gd32_set_config(const struct device *dev, enum ethernet_config_ty
 		const struct ethernet_filter *filter = &config->filter;
 		struct net_eth_addr addr = filter->mac_address;
 
-		if (IS_ENABLED(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)) {
-			return -ENOTSUP;
-		}
-
 		if (filter->type != ETHERNET_FILTER_TYPE_DST_MAC_ADDRESS) {
 			return -ENOTSUP;
 		}
@@ -901,30 +899,27 @@ static int eth_gd32_set_config(const struct device *dev, enum ethernet_config_ty
 			return -EINVAL;
 		}
 
+#if defined(CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST)
+		return -ENOTSUP;
+#else
 		uint32_t hash_index = eth_gd32_mcast_hash_index_get(&addr);
-		uint32_t hash_table[2] = { ENET_MAC_HLL, ENET_MAC_HLH };
-		uint32_t bit = BIT(hash_index % 32U);
 		uint8_t *refcnt = &data->mcast_hash_refcnt[hash_index];
 
 		if (filter->set) {
 			if (*refcnt != UINT8_MAX) {
 				(*refcnt)++;
 			}
-			hash_table[hash_index / 32U] |= bit;
 		} else {
 			if (*refcnt == 0U) {
 				return -ENOENT;
 			}
 
 			(*refcnt)--;
-			if (*refcnt == 0U) {
-				hash_table[hash_index / 32U] &= ~bit;
-			}
 		}
 
-		ENET_MAC_HLL = hash_table[0];
-		ENET_MAC_HLH = hash_table[1];
+		eth_gd32_mcast_hash_sync(data);
 		return 0;
+#endif /* CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST */
 	}
 	default:
 		break;
