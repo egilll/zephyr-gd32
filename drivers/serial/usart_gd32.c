@@ -107,6 +107,7 @@ struct gd32_usart_data {
 	} tx;
 	int32_t rx_timeout;
 	struct k_work_delayable rx_timeout_work;
+	bool rx_hw_timeout_active;
 	struct k_mutex async_lock;
 #ifdef CONFIG_DMA
 	struct {
@@ -146,6 +147,48 @@ static uint32_t usart_gd32_calc_char_timeout_us(const struct device *dev)
 #define GD32_USART_DATA_REG_ADDR(base) ((uint32_t)((base) + 0x04U))
 
 static void usart_gd32_async_isr(const struct device *dev);
+
+static inline bool usart_gd32_has_receiver_timeout(uint32_t reg)
+{
+	/*
+	 * On GD32F4xx, USART_RT/STAT1/CTL3 are not available for UART3/4/6/7.
+	 * Only enable receiver timeout for peripherals that are documented to have it.
+	 * TODO: Verify for other chips
+	 */
+#ifdef USART0
+	if (reg == USART0) {
+		return true;
+	}
+#endif
+#ifdef USART1
+	if (reg == USART1) {
+		return true;
+	}
+#endif
+#ifdef USART2
+	if (reg == USART2) {
+		return true;
+	}
+#endif
+#ifdef USART5
+	if (reg == USART5) {
+		return true;
+	}
+#endif
+
+	return false;
+}
+
+static inline uint32_t usart_gd32_rt_baud_clocks_from_timeout_us(uint32_t baud, int32_t timeout_us)
+{
+	if ((timeout_us <= 0) || (timeout_us == SYS_FOREVER_US) || (baud == 0U)) {
+		return 0U;
+	}
+
+	uint64_t rt = DIV_ROUND_UP((uint64_t)timeout_us * (uint64_t)baud, 1000000ULL);
+
+	return (uint32_t)CLAMP(rt, 1ULL, 0x00FFFFFFULL);
+}
 
 static inline void usart_gd32_clear_idle_and_errors(uint32_t reg)
 {
@@ -423,14 +466,15 @@ static void usart_gd32_isr(const struct device *dev)
 {
 	struct gd32_usart_data *const data = dev->data;
 
-#ifdef CONFIG_UART_ASYNC_API
-	usart_gd32_async_isr(dev);
-#endif
-
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	if (data->user_cb) {
 		data->user_cb(dev, data->user_data);
+		return;
 	}
+#endif
+
+#ifdef CONFIG_UART_ASYNC_API
+	usart_gd32_async_isr(dev);
 #else
 	ARG_UNUSED(data);
 #endif
@@ -462,6 +506,9 @@ static void usart_gd32_dma_rx_cb(const struct device *dma_dev, void *user_data,
 		async_evt_rx_stopped(data, UART_ERROR_OVERRUN);
 		dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
 		usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+		usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
+		usart_interrupt_disable(cfg->reg, USART_INT_ERR);
+		usart_interrupt_disable(cfg->reg, USART_INT_PERR);
 		async_evt_rx_rdy(data);
 		async_evt_rx_buf_released(data, data->rx.buffer);
 		if (data->rx_next_buffer_len) {
@@ -509,6 +556,9 @@ static void usart_gd32_dma_rx_cb(const struct device *dma_dev, void *user_data,
 		dma_stop(data->dma_rx.dma_dev, data->dma_rx.dma_channel);
 		async_evt_rx_buf_released(data, released);
 		usart_dma_receive_config(cfg->reg, USART_DENR_DISABLE);
+		usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
+		usart_interrupt_disable(cfg->reg, USART_INT_ERR);
+		usart_interrupt_disable(cfg->reg, USART_INT_PERR);
 		data->rx.buffer = NULL;
 		data->rx.buffer_length = 0U;
 		data->rx.offset = 0U;
@@ -579,10 +629,20 @@ static void usart_gd32_async_rx_timeout_handler(struct k_work *work)
 
 	__ASSERT_NO_MSG(!k_is_in_isr());
 	k_mutex_lock(&data->async_lock, K_FOREVER);
+
+	if (data->rx_hw_timeout_active) {
+		k_mutex_unlock(&data->async_lock);
+		return;
+	}
+
+	if (data->rx_dma_active) {
+		k_mutex_unlock(&data->async_lock);
+		return;
+	}
+
 	usart_interrupt_disable(cfg->reg, USART_INT_RBNE);
 	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
 	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
-	usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
 
 	if (data->rx.counter > data->rx.offset) {
 		evt.type = UART_RX_RDY;
@@ -596,10 +656,7 @@ static void usart_gd32_async_rx_timeout_handler(struct k_work *work)
 	usart_interrupt_enable(cfg->reg, USART_INT_ERR);
 	usart_interrupt_enable(cfg->reg, USART_INT_PERR);
 	if (data->rx.buffer_length != 0U) {
-		usart_interrupt_enable(cfg->reg, USART_INT_IDLE);
-		if (!data->rx_dma_active) {
-			usart_interrupt_enable(cfg->reg, USART_INT_RBNE);
-		}
+		usart_interrupt_enable(cfg->reg, USART_INT_RBNE);
 	}
 	k_mutex_unlock(&data->async_lock);
 
@@ -635,6 +692,12 @@ static void usart_gd32_async_rx_buf_done(const struct device *dev, bool request_
 	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
 	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
 	usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
+	if (data->rx_hw_timeout_active && usart_gd32_has_receiver_timeout(cfg->reg)) {
+		usart_interrupt_disable(cfg->reg, USART_INT_RT);
+		usart_receiver_timeout_disable(cfg->reg);
+		usart_flag_clear(cfg->reg, USART_FLAG_RT);
+		data->rx_hw_timeout_active = false;
+	}
 	data->rx.buffer = NULL;
 	data->rx.buffer_length = 0U;
 	data->rx.offset = 0U;
@@ -648,10 +711,22 @@ static void usart_gd32_async_isr(const struct device *dev)
 	const struct gd32_usart_config *cfg = dev->config;
 	uint32_t stat0 = USART_STAT(cfg->reg);
 
-	if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR | USART_STAT0_FERR | USART_STAT0_PERR)) {
+	if (data->rx_dma_active &&
+	    (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR | USART_STAT0_FERR | USART_STAT0_PERR))) {
 		/*
-		 * Don't hard-stop reception on transient line errors; clear flags and continue.
-		 * Overrun/noise/framing/parity conditions are observable via uart_err_check().
+		 * Clear line error flags to avoid interrupt storms in DMA mode.
+		 * (Errors are also observable via uart_err_check().)
+		 */
+		usart_gd32_clear_idle_and_errors(cfg->reg);
+		stat0 = USART_STAT(cfg->reg);
+	}
+
+	if (!data->rx_dma_active &&
+	    (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR | USART_STAT0_FERR | USART_STAT0_PERR)) &&
+	    !usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
+		/*
+		 * Clear line errors that can latch without RBNE, to avoid repeated IRQ entry.
+		 * When RBNE is set, the loop below clears errors as part of draining DATA.
 		 */
 		usart_gd32_clear_idle_and_errors(cfg->reg);
 	}
@@ -662,9 +737,11 @@ static void usart_gd32_async_isr(const struct device *dev)
 				     usart_flag_get(cfg->reg, USART_FLAG_RBNE);
 		     i++) {
 			stat0 = USART_STAT(cfg->reg);
+			uint8_t byte = (uint8_t)USART_DATA(cfg->reg);
+
 			if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR |
 				     USART_STAT0_FERR | USART_STAT0_PERR)) {
-				usart_gd32_clear_idle_and_errors(cfg->reg);
+				/* Discard bytes received with line errors. */
 				continue;
 			}
 
@@ -675,8 +752,10 @@ static void usart_gd32_async_isr(const struct device *dev)
 				}
 			}
 
-			data->rx.buffer[data->rx.counter++] = (uint8_t)usart_data_receive(cfg->reg);
-			async_timer_start(&data->rx_timeout_work, data->rx_timeout);
+			data->rx.buffer[data->rx.counter++] = byte;
+			if (!data->rx_hw_timeout_active) {
+				async_timer_start(&data->rx_timeout_work, data->rx_timeout);
+			}
 
 			if (data->rx.counter >= data->rx.buffer_length) {
 				usart_gd32_async_rx_buf_done(dev, true);
@@ -687,40 +766,20 @@ static void usart_gd32_async_isr(const struct device *dev)
 		}
 	}
 
-	if ((data->rx.buffer_length != 0U) &&
-	    usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_IDLE)) {
-		if (!data->rx_dma_active && usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
-			volatile uint32_t dummy = USART_STAT(cfg->reg);
-			uint8_t byte = (uint8_t)USART_DATA(cfg->reg);
-
-			ARG_UNUSED(dummy);
-
-			if (data->rx.counter >= data->rx.buffer_length) {
-				usart_gd32_async_rx_buf_done(dev, true);
-				if (data->rx.buffer_length == 0U) {
-					goto tx;
-				}
-			}
-
-			if (data->rx.counter < data->rx.buffer_length) {
-				data->rx.buffer[data->rx.counter++] = byte;
-			}
-		} else {
-			usart_gd32_clear_idle_and_errors(cfg->reg);
-		}
-
-#ifdef CONFIG_DMA
-		if (data->rx_dma_active) {
-			usart_gd32_async_dma_rx_flush(dev, 0);
-		} else
-#endif
-		{
-			(void)k_work_cancel_delayable(&data->rx_timeout_work);
-			(void)async_evt_rx_rdy_if_pending(data);
-		}
+	if (!data->rx_dma_active && data->rx_hw_timeout_active &&
+	    usart_gd32_has_receiver_timeout(cfg->reg) &&
+	    (data->rx.buffer_length != 0U) &&
+	    usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_RT)) {
+		usart_flag_clear(cfg->reg, USART_FLAG_RT);
+		(void)async_evt_rx_rdy_if_pending(data);
 	}
 
-tx:
+	if (data->rx_dma_active && (data->rx.buffer_length != 0U) &&
+	    usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_IDLE)) {
+		usart_gd32_clear_idle_and_errors(cfg->reg);
+		usart_gd32_async_dma_rx_flush(dev, 0);
+	}
+
 	if (!data->tx_dma_active && (data->tx.buffer_length != 0U)) {
 		if (usart_interrupt_flag_get(cfg->reg, USART_INT_FLAG_TBE)) {
 			for (uint32_t i = 0; i < GD32_USART_MAX_TX_PER_ISR &&
@@ -891,6 +950,7 @@ static int usart_gd32_async_rx_enable(const struct device *dev, uint8_t *buf,
 	struct gd32_usart_data *data = dev->data;
 	const struct gd32_usart_config *cfg = dev->config;
 	int ret = 0;
+	bool request_next = true;
 
 	__ASSERT_NO_MSG(!k_is_in_isr());
 	k_mutex_lock(&data->async_lock, K_FOREVER);
@@ -909,6 +969,11 @@ static int usart_gd32_async_rx_enable(const struct device *dev, uint8_t *buf,
 	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
 	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
 	usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
+	if (usart_gd32_has_receiver_timeout(cfg->reg)) {
+		usart_interrupt_disable(cfg->reg, USART_INT_RT);
+		usart_receiver_timeout_disable(cfg->reg);
+		usart_flag_clear(cfg->reg, USART_FLAG_RT);
+	}
 
 	data->rx.buffer = buf;
 	data->rx.buffer_length = len;
@@ -918,6 +983,7 @@ static int usart_gd32_async_rx_enable(const struct device *dev, uint8_t *buf,
 	data->rx_next_buffer = NULL;
 	data->rx_next_buffer_len = 0U;
 	data->rx_dma_active = false;
+	data->rx_hw_timeout_active = false;
 
 #ifdef CONFIG_DMA
 	if (data->dma_rx.dma_dev != NULL) {
@@ -959,15 +1025,26 @@ static int usart_gd32_async_rx_enable(const struct device *dev, uint8_t *buf,
 	usart_interrupt_enable(cfg->reg, USART_INT_ERR);
 	usart_interrupt_enable(cfg->reg, USART_INT_PERR);
 
-	usart_gd32_clear_idle_and_errors(cfg->reg);
-	usart_interrupt_enable(cfg->reg, USART_INT_IDLE);
-
-	if (!data->rx_dma_active) {
+	if (data->rx_dma_active) {
+		usart_gd32_clear_idle_and_errors(cfg->reg);
+		usart_interrupt_enable(cfg->reg, USART_INT_IDLE);
+	} else {
 		usart_interrupt_enable(cfg->reg, USART_INT_RBNE);
+
+		if (usart_gd32_has_receiver_timeout(cfg->reg)) {
+			uint32_t rt = usart_gd32_rt_baud_clocks_from_timeout_us(data->baud_rate, timeout);
+
+			if (rt != 0U) {
+				usart_receiver_timeout_threshold_config(cfg->reg, rt);
+				usart_flag_clear(cfg->reg, USART_FLAG_RT);
+				usart_receiver_timeout_enable(cfg->reg);
+				usart_interrupt_enable(cfg->reg, USART_INT_RT);
+				data->rx_hw_timeout_active = true;
+			}
+		}
 	}
 
 	k_mutex_unlock(&data->async_lock);
-	bool request_next = true;
 
 #ifdef CONFIG_DMA
 	if (data->rx_dma_active && data->dma_rx.dma_cfg.cyclic) {
@@ -984,7 +1061,6 @@ static int usart_gd32_async_rx_enable(const struct device *dev, uint8_t *buf,
 static int usart_gd32_rx_buf_rsp(const struct device *dev, uint8_t *buf, size_t len)
 {
 	struct gd32_usart_data *data = dev->data;
-	const struct gd32_usart_config *cfg = dev->config;
 	int ret = 0;
 
 	__ASSERT_NO_MSG(!k_is_in_isr());
@@ -1012,26 +1088,11 @@ static int usart_gd32_rx_buf_rsp(const struct device *dev, uint8_t *buf, size_t 
 		goto out;
 	}
 
-	usart_interrupt_disable(cfg->reg, USART_INT_RBNE);
-	usart_interrupt_disable(cfg->reg, USART_INT_ERR);
-	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
-	usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
 	unsigned int key = irq_lock();
 
 	data->rx_next_buffer = buf;
 	data->rx_next_buffer_len = len;
 	irq_unlock(key);
-	usart_interrupt_enable(cfg->reg, USART_INT_ERR);
-	usart_interrupt_enable(cfg->reg, USART_INT_PERR);
-	if (data->rx.buffer_length != 0U) {
-		if (!data->rx_dma_active) {
-			usart_interrupt_enable(cfg->reg, USART_INT_RBNE);
-		}
-		if (!usart_flag_get(cfg->reg, USART_FLAG_RBNE)) {
-			usart_gd32_clear_idle_and_errors(cfg->reg);
-		}
-		usart_interrupt_enable(cfg->reg, USART_INT_IDLE);
-	}
 
 out:
 	k_mutex_unlock(&data->async_lock);
@@ -1062,7 +1123,16 @@ static int usart_gd32_async_rx_disable(const struct device *dev)
 	usart_interrupt_disable(cfg->reg, USART_INT_PERR);
 	usart_interrupt_disable(cfg->reg, USART_INT_IDLE);
 
-	(void)k_work_cancel_delayable(&data->rx_timeout_work);
+	if (usart_gd32_has_receiver_timeout(cfg->reg)) {
+		usart_interrupt_disable(cfg->reg, USART_INT_RT);
+		usart_receiver_timeout_disable(cfg->reg);
+		usart_flag_clear(cfg->reg, USART_FLAG_RT);
+	}
+	data->rx_hw_timeout_active = false;
+
+	struct k_work_sync sync;
+
+	(void)k_work_cancel_delayable_sync(&data->rx_timeout_work, &sync);
 
 #ifdef CONFIG_DMA
 	if (data->rx_dma_active) {
@@ -1131,20 +1201,20 @@ static int usart_gd32_async_rx_disable(const struct device *dev)
 	} else
 #endif
 	{
-		for (uint32_t i = 0; i < GD32_USART_MAX_RX_PER_ISR &&
-				     usart_flag_get(cfg->reg, USART_FLAG_RBNE);
-		     i++) {
+		const size_t max_reads = MIN(data->rx.buffer_length + data->rx_next_buffer_len + 32U,
+					     512U);
+
+		for (size_t i = 0; i < max_reads && usart_flag_get(cfg->reg, USART_FLAG_RBNE); i++) {
 			uint32_t stat0 = USART_STAT(cfg->reg);
+			uint8_t byte = (uint8_t)USART_DATA(cfg->reg);
 
 			if (stat0 & (USART_STAT0_ORERR | USART_STAT0_NERR |
 				     USART_STAT0_FERR | USART_STAT0_PERR)) {
-				(void)usart_data_receive(cfg->reg);
 				continue;
 			}
 
 			if (data->rx.counter >= data->rx.buffer_length) {
 				if (data->rx_next_buffer_len == 0U) {
-					(void)usart_data_receive(cfg->reg);
 					continue;
 				}
 
@@ -1160,7 +1230,7 @@ static int usart_gd32_async_rx_disable(const struct device *dev)
 				data->rx_next_buffer_len = 0U;
 			}
 
-			data->rx.buffer[data->rx.counter++] = (uint8_t)usart_data_receive(cfg->reg);
+			data->rx.buffer[data->rx.counter++] = byte;
 		}
 	}
 
@@ -1273,6 +1343,12 @@ static int usart_gd32_init(const struct device *dev)
 	data->rx_timeout = 0;
 	data->rx_dma_active = false;
 	data->tx_dma_active = false;
+	data->rx_hw_timeout_active = false;
+	if (usart_gd32_has_receiver_timeout(cfg->reg)) {
+		usart_interrupt_disable(cfg->reg, USART_INT_RT);
+		usart_receiver_timeout_disable(cfg->reg);
+		usart_flag_clear(cfg->reg, USART_FLAG_RT);
+	}
 	k_mutex_init(&data->async_lock);
 	k_work_init_delayable(&data->rx_timeout_work, usart_gd32_async_rx_timeout_handler);
 #ifdef CONFIG_DMA
