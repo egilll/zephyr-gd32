@@ -12,6 +12,8 @@
 extern "C" {
 #endif
 
+#define TCP_INFO        ZSOCK_TCP_INFO
+
 #ifdef __cplusplus
 }
 #endif

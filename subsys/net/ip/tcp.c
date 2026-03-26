@@ -18,6 +18,7 @@ LOG_MODULE_REGISTER(net_tcp, CONFIG_NET_TCP_LOG_LEVEL);
 #endif
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/net_context.h>
+#include <zephyr/net/socket.h>
 #include <zephyr/net/udp.h>
 #include "ipv4.h"
 #include "ipv6.h"
@@ -83,6 +84,7 @@ static enum net_verdict tcp_in(struct tcp *conn, struct net_pkt *pkt);
 static bool is_destination_local(struct net_pkt *pkt);
 static void tcp_out(struct tcp *conn, uint8_t flags);
 static const char *tcp_state_to_str(enum tcp_state state, bool prefix);
+static bool tcp_window_full(struct tcp *conn);
 
 int (*tcp_send_cb)(struct net_pkt *pkt) = NULL;
 size_t (*tcp_recv_cb)(struct tcp *conn, struct net_pkt *pkt) = NULL;
@@ -1448,6 +1450,139 @@ static int get_tcp_nodelay(struct tcp *conn, void *value, uint32_t *len)
 	if (len) {
 		*len = sizeof(int);
 	}
+	return 0;
+}
+
+static uint32_t tcp_get_unacked_len(const struct tcp *conn)
+{
+	return conn->unacked_len > 0 ? (uint32_t)conn->unacked_len : 0U;
+}
+
+static uint32_t tcp_get_snd_una(const struct tcp *conn)
+{
+	uint32_t snduna = conn->seq;
+
+	/* SYN-RECEIVED and FIN-bearing states can have one control byte
+	 * outstanding even when conn->seq already points past it.
+	 */
+	if ((conn->state == TCP_SYN_RECEIVED) || (conn->state == TCP_FIN_WAIT_1) ||
+	    (conn->state == TCP_CLOSING) || (conn->state == TCP_LAST_ACK)) {
+		snduna -= 1U;
+	}
+
+	return snduna;
+}
+
+static uint32_t tcp_get_notsent_bytes(const struct tcp *conn)
+{
+	uint32_t unacked = tcp_get_unacked_len(conn);
+
+	if (unacked >= conn->send_data_total) {
+		return 0U;
+	}
+
+	return (uint32_t)MIN(conn->send_data_total - unacked, (size_t)UINT32_MAX);
+}
+
+static uint8_t tcp_get_ca_state(const struct tcp *conn)
+{
+#ifdef CONFIG_NET_TCP_CONGESTION_AVOIDANCE
+	/* Zephyr does not track the full Linux/FreeBSD CA state machine.
+	 * Report only states that can be derived directly from current send
+	 * side recovery bookkeeping.
+	 */
+	if (conn->ca.pending_fast_retransmit_bytes > 0U) {
+		return ZSOCK_TCP_CA_RECOVERY;
+	}
+#endif
+
+	if (conn->data_mode == TCP_DATA_MODE_RESEND) {
+		return ZSOCK_TCP_CA_LOSS;
+	}
+
+	return ZSOCK_TCP_CA_OPEN;
+}
+
+static uint8_t tcp_get_info_state(const struct tcp *conn)
+{
+	switch (conn->state) {
+	case TCP_ESTABLISHED:
+		return ZSOCK_TCP_ESTABLISHED;
+	case TCP_SYN_SENT:
+		return ZSOCK_TCP_SYN_SENT;
+	case TCP_SYN_RECEIVED:
+		return ZSOCK_TCP_SYN_RECV;
+	case TCP_FIN_WAIT_1:
+		return ZSOCK_TCP_FIN_WAIT1;
+	case TCP_FIN_WAIT_2:
+		return ZSOCK_TCP_FIN_WAIT2;
+	case TCP_TIME_WAIT:
+		return ZSOCK_TCP_TIME_WAIT;
+	case TCP_CLOSE_WAIT:
+		return ZSOCK_TCP_CLOSE_WAIT;
+	case TCP_CLOSING:
+		return ZSOCK_TCP_CLOSING;
+	case TCP_LAST_ACK:
+		return ZSOCK_TCP_LAST_ACK;
+	case TCP_LISTEN:
+		return ZSOCK_TCP_LISTEN;
+	case TCP_CLOSED:
+	case TCP_UNUSED:
+	default:
+		return ZSOCK_TCP_CLOSE;
+	}
+}
+
+static int get_tcp_info(struct tcp *conn, void *value, uint32_t *len)
+{
+	struct zsock_tcp_info *info;
+
+	if (conn == NULL || value == NULL || len == NULL ||
+	    *len < sizeof(struct zsock_tcp_info)) {
+		return -EINVAL;
+	}
+
+	info = value;
+	memset(info, 0, sizeof(*info));
+	info->tcpi_state = tcp_get_info_state(conn);
+	info->tcpi_ca_state = tcp_get_ca_state(conn);
+	info->tcpi_retransmits = conn->send_data_retries;
+#ifdef CONFIG_NET_TCP_RANDOMIZED_RTO
+	info->tcpi_rto = (uint32_t)conn->rto * USEC_PER_MSEC;
+#else
+	info->tcpi_rto = (uint32_t)tcp_rto * USEC_PER_MSEC;
+#endif
+	info->tcpi_snd_mss = conn_mss(conn);
+#ifdef CONFIG_NET_TCP_CONGESTION_AVOIDANCE
+	info->tcpi_snd_ssthresh = conn->ca.ssthresh;
+	info->tcpi_snd_cwnd = conn->ca.cwnd;
+#endif
+	info->tcpi_rcv_space = conn->recv_win_sent;
+	info->tcpi_snd_wnd = conn->send_win;
+	info->tcpi_snd_una = tcp_get_snd_una(conn);
+	info->tcpi_snd_nxt = conn->seq + tcp_get_unacked_len(conn);
+	info->tcpi_snd_max = conn->seq + (uint32_t)MIN(conn->send_data_total, (size_t)UINT32_MAX);
+	info->tcpi_rcv_nxt = conn->ack;
+	info->tcpi_notsent_bytes = tcp_get_notsent_bytes(conn);
+#ifdef CONFIG_NET_TCP_FAST_RETRANSMIT
+	info->tcpi_dupacks = conn->dup_ack_cnt;
+#endif
+	*len = sizeof(*info);
+	return 0;
+}
+
+static int get_tcp_outq(struct tcp *conn, void *value, uint32_t *len)
+{
+	int outq;
+
+	if (value == NULL || len == NULL || *len < sizeof(outq)) {
+		return -EINVAL;
+	}
+
+	outq = (int)MIN(conn->send_data_total, (size_t)INT_MAX);
+	*(int *)value = outq;
+	*len = sizeof(outq);
+
 	return 0;
 }
 
@@ -4603,9 +4738,17 @@ static uint16_t get_ipv4_destination_mtu(struct net_if *iface,
 uint16_t net_tcp_get_supported_mss(const struct tcp *conn)
 {
 	net_sa_family_t family = net_context_get_family(conn->context);
+	struct net_if *iface = conn->iface;
+
+	if (iface == NULL && conn->context != NULL) {
+		iface = net_context_get_iface(conn->context);
+	}
+
+	if (iface == NULL) {
+		return 0;
+	}
 
 	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
-		struct net_if *iface = net_context_get_iface(conn->context);
 		uint16_t dest_mtu;
 
 		dest_mtu = get_ipv4_destination_mtu(iface, &conn->dst.sin.sin_addr);
@@ -4614,7 +4757,6 @@ uint16_t net_tcp_get_supported_mss(const struct tcp *conn)
 		return dest_mtu - NET_IPV4TCPH_LEN;
 
 	} else if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
-		struct net_if *iface = net_context_get_iface(conn->context);
 		uint16_t dest_mtu;
 
 		dest_mtu = get_ipv6_destination_mtu(iface, &conn->dst.sin6.sin6_addr);
@@ -4708,6 +4850,11 @@ int net_tcp_set_option(struct net_context *context,
 	case TCP_OPT_KEEPCNT:
 		ret = set_tcp_keep_cnt(conn, value, len);
 		break;
+	case TCP_OPT_INFO:
+	case TCP_OPT_OUTQ:
+	default:
+		ret = -ENOPROTOOPT;
+		break;
 	}
 
 	k_mutex_unlock(&conn->lock);
@@ -4744,6 +4891,12 @@ int net_tcp_get_option(struct net_context *context,
 		break;
 	case TCP_OPT_KEEPCNT:
 		ret = get_tcp_keep_cnt(conn, value, len);
+		break;
+	case TCP_OPT_INFO:
+		ret = get_tcp_info(conn, value, len);
+		break;
+	case TCP_OPT_OUTQ:
+		ret = get_tcp_outq(conn, value, len);
 		break;
 	}
 

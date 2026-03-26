@@ -50,6 +50,8 @@ enum tcp_conn_option {
 	TCP_OPT_KEEPIDLE = 3,
 	TCP_OPT_KEEPINTVL = 4,
 	TCP_OPT_KEEPCNT = 5,
+	TCP_OPT_INFO = 6,
+	TCP_OPT_OUTQ = 7,
 };
 
 /**
