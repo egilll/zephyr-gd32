@@ -278,6 +278,37 @@ static bool domain_is_valid(const char *domain)
 	return domain_size;
 }
 
+static bool hostname_is_valid(const char *hostname)
+{
+	size_t hostname_size;
+
+	if (hostname == NULL) {
+		NET_DBG("hostname is NULL");
+		return false;
+	}
+
+	hostname_size = strlen(hostname);
+	if (hostname_size < DNS_LABEL_MIN_SIZE) {
+		NET_DBG("hostname '%s' is too small (%zu, min: %u)",
+			hostname, hostname_size, DNS_LABEL_MIN_SIZE);
+		return false;
+	}
+
+	if (hostname_size > DNS_LABEL_MAX_SIZE) {
+		NET_DBG("hostname '%s' is too big (%zu, max: %u)",
+			hostname, hostname_size, DNS_LABEL_MAX_SIZE);
+		return false;
+	}
+
+	if (!label_is_valid(hostname, hostname_size)) {
+		NET_DBG("hostname '%s' contains invalid characters",
+			hostname);
+		return false;
+	}
+
+	return true;
+}
+
 /**
  * Check DNS SD Record for validity
  *
@@ -596,8 +627,8 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	}
 
 	host = net_hostname_get();
-	if (host == NULL || host[0] == '\0') {
-		host = inst->instance;
+	if (!hostname_is_valid(host)) {
+		return -EINVAL;
 	}
 
 	label_size = strlen(host);
@@ -607,7 +638,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		/* pointer to .<Instance>.<Service>.<Protocol>.local. */
 		DNS_POINTER_SIZE + sizeof(*rr)
 		+ sizeof(*rdata)
-		/* .<Instance> */
+		/* .<hostname> */
 		+ DNS_LABEL_LEN_SIZE
 		+ label_size
 		/* pointer to .local. */
@@ -630,7 +661,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	rr->type = net_htons(DNS_RR_TYPE_SRV);
 	rr->class_ = net_htons(DNS_CLASS_IN | DNS_CLASS_FLUSH);
 	rr->ttl = net_htonl(ttl);
-	/* .<Instance>.local. */
+	/* .<hostname>.local. */
 	rr->rdlength = net_htons(sizeof(*rdata) + DNS_LABEL_LEN_SIZE
 			     + label_size +
 			     DNS_POINTER_SIZE);
