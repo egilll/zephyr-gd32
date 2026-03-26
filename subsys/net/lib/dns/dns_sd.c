@@ -15,6 +15,7 @@
 #include <zephyr/net/net_context.h>
 #include <zephyr/net/net_core.h>
 #include <zephyr/net/dns_sd.h>
+#include <zephyr/net/hostname.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/kernel.h>
 
@@ -578,6 +579,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	struct dns_rr *rr;
 	struct dns_srv_rdata *rdata;
 	size_t label_size;
+	const char *host;
 	uint16_t inst_offs;
 	uint16_t offset = buf_offset;
 
@@ -593,6 +595,13 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		return -E2BIG;
 	}
 
+	host = net_hostname_get();
+	if (host == NULL || host[0] == '\0') {
+		host = inst->instance;
+	}
+
+	label_size = strlen(host);
+
 	/* First, calculate that there is enough space in the buffer */
 	total_size =
 		/* pointer to .<Instance>.<Service>.<Protocol>.local. */
@@ -600,7 +609,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		+ sizeof(*rdata)
 		/* .<Instance> */
 		+ DNS_LABEL_LEN_SIZE
-		+ strlen(inst->instance)
+		+ label_size
 		/* pointer to .local. */
 		+ DNS_POINTER_SIZE;
 
@@ -623,7 +632,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	rr->ttl = net_htonl(ttl);
 	/* .<Instance>.local. */
 	rr->rdlength = net_htons(sizeof(*rdata) + DNS_LABEL_LEN_SIZE
-			     + strlen(inst->instance) +
+			     + label_size +
 			     DNS_POINTER_SIZE);
 	offset += sizeof(*rr);
 
@@ -635,9 +644,8 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 
 	*host_offset = offset;
 
-	label_size = strlen(inst->instance);
 	buf[offset++] = label_size;
-	memcpy(&buf[offset], inst->instance, label_size);
+	memcpy(&buf[offset], host, label_size);
 	offset += label_size;
 
 	domain_offset |= DNS_SD_PTR_MASK;
