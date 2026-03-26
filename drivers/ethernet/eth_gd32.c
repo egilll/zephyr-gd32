@@ -697,6 +697,9 @@ static int eth_gd32_tx(const struct device *dev, struct net_pkt *pkt)
 	}
 
 	if (frag_cnt == 0U || frag_cnt > GD32_ETH_TX_DESC_COUNT) {
+		if (frag_cnt > GD32_ETH_TX_DESC_COUNT) {
+			LOG_ERR("Attempted to send more fragments than available descriptors. You have to increase GD32_ETH_TX_DESC_COUNT");
+		}
 		return -EINVAL;
 	}
 
