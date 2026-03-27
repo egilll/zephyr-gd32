@@ -3,12 +3,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * GD32 ENET is used as a zero-copy Ethernet driver:
- * - RxDMA writes into `net_buf` fragments (one per DMA descriptor) reserved
- *   from Zephyr's RX buffer pool, and received frames are passed to the stack
- *   as a fragment chain.
- * - TxDMA reads directly from `net_pkt` fragments; buffers must be DMA
- *   accessible.
+ * GD32 ENET uses:
+ * - private DMA-owned RX buffers, copied into Zephyr packets before frames
+ *   are handed to the stack, and
+ * - zero-copy TX, where DMA reads directly from `net_pkt` fragments.
  *
  * Notes about the vendor HAL (`gd32f4xx_enet.c`):
  * - We do not call `enet_init()` because it mixes PHY management and long
@@ -20,6 +18,9 @@
  */
 
 #define DT_DRV_COMPAT gd_gd32_ethernet
+
+// TODO: doesn't build with CONFIG_ETH_GD32_ACCEPT_ALL_MULTICAST=n
+// TODO: doesn't work with dynamic net bufs
 
 #include <zephyr/device.h>
 #include <zephyr/cache.h>
@@ -102,6 +103,8 @@ struct eth_gd32_dma_rings {
 };
 
 static struct eth_gd32_dma_rings eth0_dma __nocache __aligned(4);
+static uint8_t eth0_rx_dma_buf[GD32_ETH_RX_DESC_COUNT][GD32_ETH_RX_BUF_SIZE]
+	__nocache __aligned(4);
 
 void eth_gd32_delay(uint32_t ticks)
 {
@@ -159,7 +162,6 @@ struct eth_gd32_data {
 #if defined(CONFIG_NET_STATISTICS_ETHERNET)
 	struct net_stats_eth stats;
 #endif
-	struct net_buf *rx_frags[GD32_ETH_RX_DESC_COUNT];
 	uint8_t mcast_hash_refcnt[64];
 	uint16_t rx_tail;
 	uint16_t tx_head;
@@ -173,16 +175,6 @@ static void eth_gd32_rings_configure(struct eth_gd32_data *data);
 static void eth_gd32_dma_irqs_enable(void);
 static void eth_gd32_dma_irqs_clear_all(void);
 static int eth_gd32_hw_reset_and_configure(struct eth_gd32_data *data);
-
-static void eth_gd32_rx_frags_free(struct eth_gd32_data *data, uint16_t count)
-{
-	for (uint16_t i = 0U; i < count; i++) {
-		if (data->rx_frags[i]) {
-			net_buf_unref(data->rx_frags[i]);
-			data->rx_frags[i] = NULL;
-		}
-	}
-}
 
 static inline bool gd32_dma_addr_ok(uintptr_t addr, size_t len)
 {
@@ -224,20 +216,19 @@ static inline uint16_t modulo_inc(uint16_t idx, uint16_t max)
 	return (idx < max) ? idx : 0U;
 }
 
-static inline void eth_gd32_rx_buf_prepare_for_dma(struct net_buf *buf)
+static inline void eth_gd32_rx_buf_prepare_for_dma(void *buf, size_t len)
 {
 	/*
 	 * DMA writes RX data into the buffer; discard any cached lines so that:
 	 * - we don't write back stale data over the DMA writes later, and
 	 * - subsequent CPU reads see the freshly received bytes.
 	 */
-	net_buf_reset(buf);
-	gd32_cache_invalidate(buf->data, buf->size);
+	gd32_cache_invalidate(buf, len);
 }
 
-static inline void eth_gd32_rx_desc_give_to_dma(enet_descriptors_struct *desc, struct net_buf *buf)
+static inline void eth_gd32_rx_desc_give_to_dma(enet_descriptors_struct *desc, void *buf)
 {
-	desc->buffer1_addr = (uint32_t)(uintptr_t)buf->data;
+	desc->buffer1_addr = (uint32_t)(uintptr_t)buf;
 	barrier_dmem_fence_full();
 	desc->status = ENET_RDES0_DAV;
 }
@@ -297,8 +288,8 @@ static void eth_gd32_rings_configure(struct eth_gd32_data *data)
 			(uint32_t)(uintptr_t)&eth0_dma
 				.rx_desc[modulo_inc(i, GD32_ETH_RX_DESC_COUNT)];
 
-		eth_gd32_rx_buf_prepare_for_dma(data->rx_frags[i]);
-		eth_gd32_rx_desc_give_to_dma(desc, data->rx_frags[i]);
+		eth_gd32_rx_buf_prepare_for_dma(eth0_rx_dma_buf[i], GD32_ETH_RX_BUF_SIZE);
+		eth_gd32_rx_desc_give_to_dma(desc, eth0_rx_dma_buf[i]);
 	}
 
 	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
@@ -345,17 +336,6 @@ static int eth_gd32_hw_reset_and_configure(struct eth_gd32_data *data)
 	return 0;
 }
 
-static struct net_buf *eth_gd32_rx_buf_reserve(k_timeout_t timeout)
-{
-	struct net_buf *buf = net_pkt_get_reserve_rx_data(GD32_ETH_RX_BUF_SIZE, timeout);
-
-	if (buf) {
-		eth_gd32_rx_buf_prepare_for_dma(buf);
-	}
-
-	return buf;
-}
-
 static void eth_gd32_reclaim_tx(const struct device *dev)
 {
 	struct eth_gd32_data *data = dev->data;
@@ -399,10 +379,9 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 		}
 
 		if ((start_desc->status & ENET_RDES0_FDES) == 0U) {
-			struct net_buf *frag = data->rx_frags[data->rx_tail];
-
-			eth_gd32_rx_buf_prepare_for_dma(frag);
-			eth_gd32_rx_desc_give_to_dma(start_desc, frag);
+			eth_gd32_rx_buf_prepare_for_dma(eth0_rx_dma_buf[data->rx_tail],
+							GD32_ETH_RX_BUF_SIZE);
+			eth_gd32_rx_desc_give_to_dma(start_desc, eth0_rx_dma_buf[data->rx_tail]);
 
 			data->rx_tail = modulo_inc(data->rx_tail, GD32_ETH_RX_DESC_COUNT);
 			continue;
@@ -441,10 +420,10 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 			idx = data->rx_tail;
 			for (uint16_t n = 0U; n < cnt; n++) {
 				enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
-				struct net_buf *frag = data->rx_frags[idx];
 
-				eth_gd32_rx_buf_prepare_for_dma(frag);
-				eth_gd32_rx_desc_give_to_dma(desc, frag);
+				eth_gd32_rx_buf_prepare_for_dma(eth0_rx_dma_buf[idx],
+								GD32_ETH_RX_BUF_SIZE);
+				eth_gd32_rx_desc_give_to_dma(desc, eth0_rx_dma_buf[idx]);
 				idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
 			}
 
@@ -459,50 +438,16 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 		rx_ok = rx_ok && ((end_desc->status & ENET_RDES0_ERRS) == 0U);
 
 		struct net_pkt *pkt = NULL;
-		struct net_buf *repl[GD32_ETH_RX_DESC_COUNT] = {0};
 
 		if (rx_ok) {
-			pkt = net_pkt_rx_alloc_on_iface(data->iface, K_NO_WAIT);
+			pkt = net_pkt_rx_alloc_with_buffer(data->iface, frame_len, NET_AF_UNSPEC, 0,
+							   K_NO_WAIT);
 			if (!pkt) {
 				rx_ok = false;
 			}
 		}
 
-		if (rx_ok) {
-			idx = data->rx_tail;
-			uint32_t needed = frame_len;
-			for (uint16_t n = 0U; n < cnt; n++) {
-				struct net_buf *new_frag = eth_gd32_rx_buf_reserve(K_NO_WAIT);
-
-				if (!new_frag) {
-					rx_ok = false;
-					break;
-				}
-
-				if (((uintptr_t)new_frag->data & 0x3U) != 0U ||
-				    !gd32_dma_addr_ok((uintptr_t)new_frag->data, new_frag->size)) {
-					net_buf_unref(new_frag);
-					rx_ok = false;
-					break;
-				}
-
-				repl[n] = new_frag;
-				needed -= MIN((uint32_t)GD32_ETH_RX_BUF_SIZE, needed);
-				idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
-			}
-
-			if (needed != 0U) {
-				rx_ok = false;
-			}
-		}
-
 		if (!rx_ok) {
-			for (uint16_t n = 0U; n < cnt; n++) {
-				if (repl[n]) {
-					net_buf_unref(repl[n]);
-				}
-			}
-
 			if (pkt) {
 				net_pkt_unref(pkt);
 			}
@@ -512,10 +457,10 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 			idx = data->rx_tail;
 			for (uint16_t n = 0U; n < cnt; n++) {
 				enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
-				struct net_buf *frag = data->rx_frags[idx];
 
-				eth_gd32_rx_buf_prepare_for_dma(frag);
-				eth_gd32_rx_desc_give_to_dma(desc, frag);
+				eth_gd32_rx_buf_prepare_for_dma(eth0_rx_dma_buf[idx],
+								GD32_ETH_RX_BUF_SIZE);
+				eth_gd32_rx_desc_give_to_dma(desc, eth0_rx_dma_buf[idx]);
 				idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
 			}
 
@@ -523,35 +468,28 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 			continue;
 		}
 
-		struct net_buf *last = NULL;
 		uint32_t copied = 0U;
 		idx = data->rx_tail;
 
 		for (uint16_t n = 0U; n < cnt; n++) {
 			enet_descriptors_struct *desc = &eth0_dma.rx_desc[idx];
-			struct net_buf *frag = data->rx_frags[idx];
 			uint32_t frag_len = MIN((uint32_t)GD32_ETH_RX_BUF_SIZE, frame_len - copied);
+			void *rx_buf = eth0_rx_dma_buf[idx];
 
-			gd32_cache_invalidate(frag->data, frag_len);
-			net_buf_add(frag, frag_len);
-
-			if (!last) {
-				net_pkt_frag_insert(pkt, frag);
-			} else {
-				net_buf_frag_insert(last, frag);
+			gd32_cache_invalidate(rx_buf, frag_len);
+			if (net_pkt_write(pkt, rx_buf, frag_len) != 0) {
+				rx_ok = false;
 			}
-			last = frag;
-
-			data->rx_frags[idx] = repl[n];
-			eth_gd32_rx_desc_give_to_dma(desc, repl[n]);
 
 			copied += frag_len;
+			eth_gd32_rx_buf_prepare_for_dma(rx_buf, GD32_ETH_RX_BUF_SIZE);
+			eth_gd32_rx_desc_give_to_dma(desc, rx_buf);
 			idx = modulo_inc(idx, GD32_ETH_RX_DESC_COUNT);
 		}
 
 		data->rx_tail = idx;
 
-		if (net_recv_data(data->iface, pkt) < 0) {
+		if (!rx_ok || copied != frame_len || net_recv_data(data->iface, pkt) < 0) {
 			eth_stats_update_errors_rx(data->iface);
 			net_pkt_unref(pkt);
 		}
@@ -1365,22 +1303,13 @@ static int eth_gd32_hw_init(const struct device *dev)
 	}
 
 	for (uint16_t i = 0U; i < GD32_ETH_RX_DESC_COUNT; i++) {
-		struct net_buf *buf = eth_gd32_rx_buf_reserve(K_NO_WAIT);
-		if (!buf) {
-			eth_gd32_rx_frags_free(data, i);
-			return -ENOBUFS;
-		}
-		if (((uintptr_t)buf->data & 0x3U) != 0U ||
-		    !gd32_dma_addr_ok((uintptr_t)buf->data, buf->size)) {
-			net_buf_unref(buf);
-			eth_gd32_rx_frags_free(data, i);
+		if (((uintptr_t)eth0_rx_dma_buf[i] & 0x3U) != 0U ||
+		    !gd32_dma_addr_ok((uintptr_t)eth0_rx_dma_buf[i], GD32_ETH_RX_BUF_SIZE)) {
 			return -EFAULT;
 		}
-		data->rx_frags[i] = buf;
 	}
 
 	if (eth_gd32_hw_reset_and_configure(data) != 0) {
-		eth_gd32_rx_frags_free(data, GD32_ETH_RX_DESC_COUNT);
 		return -EIO;
 	}
 
