@@ -152,8 +152,9 @@ struct eth_gd32_data {
 	struct net_if *iface;
 	uint8_t mac_addr[6];
 	struct k_mutex tx_mutex;
-	struct k_sem tx_sem;
-	struct net_pkt *tx_pkts[GD32_ETH_TX_DESC_COUNT];
+	struct k_sem tx_desc_sem;
+	struct k_spinlock tx_ring_lock;
+	struct net_pkt *tx_pkt_refs[GD32_ETH_TX_DESC_COUNT];
 	struct k_work rx_work;
 	atomic_t rx_work_flags;
 	struct k_work recover_work;
@@ -164,10 +165,16 @@ struct eth_gd32_data {
 #endif
 	uint8_t mcast_hash_refcnt[64];
 	uint16_t rx_tail;
-	uint16_t tx_head;
-	uint16_t tx_clean;
-	uint16_t tx_pending;
+	uint16_t tx_next_to_use;
+	uint16_t tx_next_to_clean;
+	uint16_t tx_descs_in_use;
 	bool hw_ready;
+};
+
+struct eth_gd32_tx_reclaim {
+	struct net_pkt *pkts[GD32_ETH_TX_DESC_COUNT];
+	uint16_t pkt_count;
+	uint16_t desc_count;
 };
 
 static void eth_gd32_mac_dma_default_config(void);
@@ -175,6 +182,7 @@ static void eth_gd32_rings_configure(struct eth_gd32_data *data);
 static void eth_gd32_dma_irqs_enable(void);
 static void eth_gd32_dma_irqs_clear_all(void);
 static int eth_gd32_hw_reset_and_configure(struct eth_gd32_data *data);
+static void eth_gd32_reclaim_tx(const struct device *dev);
 
 static inline bool gd32_dma_addr_ok(uintptr_t addr, size_t len)
 {
@@ -247,6 +255,113 @@ static inline void eth_gd32_dma_rx_poll_demand(void)
 	ENET_DMA_RPEN = GD32_DMA_POLL_DEMAND;
 }
 
+static inline void eth_gd32_tx_desc_reset(enet_descriptors_struct *desc)
+{
+	desc->status = ENET_TDES0_TCHM;
+	desc->control_buffer_size = 0U;
+	desc->buffer1_addr = 0U;
+}
+
+static void eth_gd32_tx_reclaim_flush(struct eth_gd32_data *data,
+				      const struct eth_gd32_tx_reclaim *reclaim)
+{
+	for (uint16_t i = 0U; i < reclaim->pkt_count; i++) {
+		net_pkt_unref(reclaim->pkts[i]);
+	}
+
+	for (uint16_t i = 0U; i < reclaim->desc_count; i++) {
+		k_sem_give(&data->tx_desc_sem);
+	}
+}
+
+static void eth_gd32_tx_reclaim_completed(struct eth_gd32_data *data,
+					  struct eth_gd32_tx_reclaim *reclaim)
+{
+	k_spinlock_key_t key = k_spin_lock(&data->tx_ring_lock);
+
+	__ASSERT_NO_MSG(data->tx_descs_in_use <= GD32_ETH_TX_DESC_COUNT);
+
+	while (data->tx_descs_in_use > 0U) {
+		uint16_t idx = data->tx_next_to_clean;
+		enet_descriptors_struct *desc = &eth0_dma.tx_desc[idx];
+
+		if (tx_desc_dma_owned(desc)) {
+			break;
+		}
+
+		if (data->tx_pkt_refs[idx] != NULL) {
+			__ASSERT_NO_MSG(reclaim->pkt_count < ARRAY_SIZE(reclaim->pkts));
+			reclaim->pkts[reclaim->pkt_count++] = data->tx_pkt_refs[idx];
+			data->tx_pkt_refs[idx] = NULL;
+		}
+
+		eth_gd32_tx_desc_reset(desc);
+		data->tx_next_to_clean = modulo_inc(idx, GD32_ETH_TX_DESC_COUNT);
+		data->tx_descs_in_use--;
+		reclaim->desc_count++;
+	}
+
+	k_spin_unlock(&data->tx_ring_lock, key);
+}
+
+static void eth_gd32_tx_desc_unreserve(struct eth_gd32_data *data, uint16_t desc_count)
+{
+	for (uint16_t i = 0U; i < desc_count; i++) {
+		k_sem_give(&data->tx_desc_sem);
+	}
+}
+
+static int eth_gd32_tx_desc_reserve(const struct device *dev, uint16_t desc_count)
+{
+	struct eth_gd32_data *data = dev->data;
+	uint16_t reserved = 0U;
+
+	while (reserved < desc_count) {
+		if (k_sem_take(&data->tx_desc_sem, K_MSEC(GD32_ETH_TX_TIMEOUT_MS)) == 0) {
+			reserved++;
+			continue;
+		}
+
+		eth_gd32_reclaim_tx(dev);
+		if (k_sem_take(&data->tx_desc_sem, K_NO_WAIT) == 0) {
+			reserved++;
+			continue;
+		}
+
+		eth_gd32_tx_desc_unreserve(data, reserved);
+		return -ENOBUFS;
+	}
+
+	return 0;
+}
+
+static void eth_gd32_tx_reset(struct eth_gd32_data *data)
+{
+	struct eth_gd32_tx_reclaim reclaim = {0};
+	k_spinlock_key_t key = k_spin_lock(&data->tx_ring_lock);
+
+	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
+		if (data->tx_pkt_refs[i] != NULL) {
+			__ASSERT_NO_MSG(reclaim.pkt_count < ARRAY_SIZE(reclaim.pkts));
+			reclaim.pkts[reclaim.pkt_count++] = data->tx_pkt_refs[i];
+			data->tx_pkt_refs[i] = NULL;
+		}
+	}
+
+	data->tx_next_to_use = 0U;
+	data->tx_next_to_clean = 0U;
+	data->tx_descs_in_use = 0U;
+
+	k_spin_unlock(&data->tx_ring_lock, key);
+
+	k_sem_reset(&data->tx_desc_sem);
+	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
+		k_sem_give(&data->tx_desc_sem);
+	}
+
+	eth_gd32_tx_reclaim_flush(data, &reclaim);
+}
+
 enum {
 	GD32_RX_WORK_FLAG_RBU = BIT(0),
 	GD32_RX_WORK_FLAG_KICK = BIT(1),
@@ -295,19 +410,17 @@ static void eth_gd32_rings_configure(struct eth_gd32_data *data)
 	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
 		enet_descriptors_struct *desc = &eth0_dma.tx_desc[i];
 
-		desc->status = ENET_TDES0_TCHM;
-		desc->control_buffer_size = 0U;
-		desc->buffer1_addr = 0U;
+		eth_gd32_tx_desc_reset(desc);
 		desc->buffer2_next_desc_addr =
 			(uint32_t)(uintptr_t)&eth0_dma
 				.tx_desc[modulo_inc(i, GD32_ETH_TX_DESC_COUNT)];
-		data->tx_pkts[i] = NULL;
+		data->tx_pkt_refs[i] = NULL;
 	}
 
 	data->rx_tail = 0U;
-	data->tx_head = 0U;
-	data->tx_clean = 0U;
-	data->tx_pending = 0U;
+	data->tx_next_to_use = 0U;
+	data->tx_next_to_clean = 0U;
+	data->tx_descs_in_use = 0U;
 
 	ENET_DMA_RDTADDR = (uint32_t)(uintptr_t)eth0_dma.rx_desc;
 	ENET_DMA_TDTADDR = (uint32_t)(uintptr_t)eth0_dma.tx_desc;
@@ -339,32 +452,10 @@ static int eth_gd32_hw_reset_and_configure(struct eth_gd32_data *data)
 static void eth_gd32_reclaim_tx(const struct device *dev)
 {
 	struct eth_gd32_data *data = dev->data;
-	uint16_t idx = data->tx_clean;
+	struct eth_gd32_tx_reclaim reclaim = {0};
 
-	/*
-	 * TX descriptors are arranged in a DMA-owned chain, but we still keep a
-	 * software head/clean index. Do not rely on (tx_head == tx_clean) to
-	 * imply "ring empty" because the ring can be completely full; instead
-	 * use tx_pending to disambiguate.
-	 */
-	while (data->tx_pending > 0U) {
-		enet_descriptors_struct *desc = &eth0_dma.tx_desc[idx];
-
-		if (tx_desc_dma_owned(desc)) {
-			break;
-		}
-
-		if (data->tx_pkts[idx]) {
-			net_pkt_unref(data->tx_pkts[idx]);
-			data->tx_pkts[idx] = NULL;
-		}
-
-		k_sem_give(&data->tx_sem);
-		idx = modulo_inc(idx, GD32_ETH_TX_DESC_COUNT);
-		data->tx_pending--;
-	}
-
-	data->tx_clean = idx;
+	eth_gd32_tx_reclaim_completed(data, &reclaim);
+	eth_gd32_tx_reclaim_flush(data, &reclaim);
 }
 
 static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
@@ -525,23 +616,8 @@ static void eth_gd32_recover_work_handler(struct k_work *work)
 	enet_disable();
 
 	k_mutex_lock(&data->tx_mutex, K_FOREVER);
-
-	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
-		if (data->tx_pkts[i]) {
-			net_pkt_unref(data->tx_pkts[i]);
-			data->tx_pkts[i] = NULL;
-		}
-	}
-
-	k_sem_reset(&data->tx_sem);
-	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
-		k_sem_give(&data->tx_sem);
-	}
-
+	eth_gd32_tx_reset(data);
 	data->rx_tail = 0U;
-	data->tx_head = 0U;
-	data->tx_clean = 0U;
-	data->tx_pending = 0U;
 
 	if (eth_gd32_hw_reset_and_configure(data) != 0) {
 		LOG_ERR("ENET re-init failed");
@@ -612,6 +688,12 @@ static int eth_gd32_tx(const struct device *dev, struct net_pkt *pkt)
 {
 	struct eth_gd32_data *data = dev->data;
 	uint16_t frag_cnt = 0U;
+	struct net_pkt *tx_pkt;
+	k_spinlock_key_t key;
+	uint16_t idx;
+	uint16_t first_idx;
+	uint16_t last_idx = 0U;
+	uint16_t remaining;
 
 	if (!data->hw_ready || (data->iface == NULL) || (atomic_get(&data->link_up) == 0)) {
 		return -ENETDOWN;
@@ -632,6 +714,8 @@ static int eth_gd32_tx(const struct device *dev, struct net_pkt *pkt)
 			LOG_ERR("TX buffer not DMA accessible");
 			return -EFAULT;
 		}
+
+		gd32_cache_clean(frag->data, frag->len);
 	}
 
 	if (frag_cnt == 0U || frag_cnt > GD32_ETH_TX_DESC_COUNT) {
@@ -643,62 +727,66 @@ static int eth_gd32_tx(const struct device *dev, struct net_pkt *pkt)
 
 	k_mutex_lock(&data->tx_mutex, K_FOREVER);
 
-	for (uint16_t i = 0U; i < frag_cnt; i++) {
-		if (k_sem_take(&data->tx_sem, K_MSEC(GD32_ETH_TX_TIMEOUT_MS)) != 0) {
-			eth_gd32_reclaim_tx(dev);
-			if (k_sem_take(&data->tx_sem, K_NO_WAIT) != 0) {
-				for (uint16_t j = 0U; j < i; j++) {
-					k_sem_give(&data->tx_sem);
-				}
-				k_mutex_unlock(&data->tx_mutex);
-				return -ENOBUFS;
-			}
-		}
+	if (eth_gd32_tx_desc_reserve(dev, frag_cnt) != 0) {
+		k_mutex_unlock(&data->tx_mutex);
+		return -ENOBUFS;
 	}
 
-	uint16_t idx = data->tx_head;
-	enet_descriptors_struct *first_desc = &eth0_dma.tx_desc[idx];
-	uint16_t remaining = frag_cnt;
+	tx_pkt = net_pkt_ref(pkt);
 
+	key = k_spin_lock(&data->tx_ring_lock);
+	first_idx = data->tx_next_to_use;
+	idx = first_idx;
+	remaining = frag_cnt;
+
+	/*
+	 * Publish the whole frame to the ring while TX completion is blocked by
+	 * tx_ring_lock. The first descriptor is handed to DMA last.
+	 */
 	for (struct net_buf *frag = pkt->frags; frag; frag = frag->frags) {
+		uint32_t status;
+		enet_descriptors_struct *desc;
+
 		if (frag->len == 0U) {
 			continue;
 		}
 
-		enet_descriptors_struct *desc = &eth0_dma.tx_desc[idx];
+		desc = &eth0_dma.tx_desc[idx];
+		status = ENET_TDES0_TCHM | ENET_CHECKSUM_DISABLE;
 
-		gd32_cache_clean(frag->data, frag->len);
-
-		uint32_t status = ENET_TDES0_TCHM | ENET_CHECKSUM_DISABLE;
-
-		if (desc == first_desc) {
+		if (idx == first_idx) {
 			status |= ENET_TDES0_FSG;
 		}
 		if (remaining == 1U) {
 			status |= ENET_TDES0_LSG | ENET_TDES0_INTC;
+			last_idx = idx;
 		}
 
 		desc->control_buffer_size = (uint32_t)frag->len & ENET_TDES1_TB1S;
 		desc->buffer1_addr = (uint32_t)(uintptr_t)frag->data;
-
-		barrier_dmem_fence_full();
-
-		if (desc != first_desc) {
-			desc->status = status | ENET_TDES0_DAV;
-		} else {
-			desc->status = status;
-		}
-
-		data->tx_pkts[idx] = (remaining == 1U) ? net_pkt_ref(pkt) : NULL;
+		desc->status = status;
+		data->tx_pkt_refs[idx] = NULL;
 		idx = modulo_inc(idx, GD32_ETH_TX_DESC_COUNT);
 		remaining--;
 	}
 
-	data->tx_head = idx;
-	data->tx_pending += frag_cnt;
+	data->tx_pkt_refs[last_idx] = tx_pkt;
+	data->tx_next_to_use = idx;
+	data->tx_descs_in_use += frag_cnt;
+
+	__ASSERT_NO_MSG(data->tx_descs_in_use <= GD32_ETH_TX_DESC_COUNT);
 
 	barrier_dmem_fence_full();
-	first_desc->status |= ENET_TDES0_DAV;
+
+	idx = modulo_inc(first_idx, GD32_ETH_TX_DESC_COUNT);
+	for (uint16_t i = 1U; i < frag_cnt; i++) {
+		eth0_dma.tx_desc[idx].status |= ENET_TDES0_DAV;
+		idx = modulo_inc(idx, GD32_ETH_TX_DESC_COUNT);
+	}
+
+	barrier_dmem_fence_full();
+	eth0_dma.tx_desc[first_idx].status |= ENET_TDES0_DAV;
+	k_spin_unlock(&data->tx_ring_lock, key);
 
 	if (ENET_DMA_STAT & (ENET_DMA_STAT_TBU | ENET_DMA_STAT_TU)) {
 		ENET_DMA_STAT = ENET_DMA_STAT_TBU | ENET_DMA_STAT_TU;
@@ -1233,7 +1321,7 @@ static int eth_gd32_hw_init(const struct device *dev)
 
 	data->dev = dev;
 	k_mutex_init(&data->tx_mutex);
-	k_sem_init(&data->tx_sem, GD32_ETH_TX_DESC_COUNT, GD32_ETH_TX_DESC_COUNT);
+	k_sem_init(&data->tx_desc_sem, GD32_ETH_TX_DESC_COUNT, GD32_ETH_TX_DESC_COUNT);
 	k_work_init(&data->rx_work, eth_gd32_rx_work_handler);
 	(void)atomic_clear(&data->rx_work_flags);
 	k_work_init(&data->recover_work, eth_gd32_recover_work_handler);
