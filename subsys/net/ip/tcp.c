@@ -102,6 +102,31 @@ static void tcp_backlog_inc(struct tcp *conn)
 	atomic_inc(&conn->backlog);
 }
 
+static void tcp_inherit_listener_socket_options(struct tcp *child,
+						const struct tcp *listener)
+{
+#if defined(CONFIG_NET_CONTEXT_RCVBUF)
+	int rcvbuf_opt = 0;
+
+	if (listener == NULL) {
+		return;
+	}
+
+	if (net_context_get_option(listener->context, NET_OPT_RCVBUF,
+				   &rcvbuf_opt, NULL) == 0 &&
+	    rcvbuf_opt > 0) {
+		(void)net_context_set_option(child->context, NET_OPT_RCVBUF,
+					     &rcvbuf_opt, sizeof(rcvbuf_opt));
+		child->recv_win_max = rcvbuf_opt;
+		child->recv_win = child->recv_win_max;
+		child->recv_win_sent = child->recv_win_max;
+	}
+#else
+	ARG_UNUSED(child);
+	ARG_UNUSED(listener);
+#endif
+}
+
 void net_tcp_conn_accepted(struct net_context *child_ctx)
 {
 	struct tcp *conn = child_ctx->tcp;
@@ -2290,7 +2315,7 @@ static struct tcp *tcp_conn_search(struct net_pkt *pkt)
 	return found ? conn : NULL;
 }
 
-static struct tcp *tcp_conn_new(struct net_pkt *pkt);
+static struct tcp *tcp_conn_new(struct net_pkt *pkt, struct tcp *listener);
 
 static enum net_verdict tcp_recv(struct net_conn *net_conn,
 				 struct net_pkt *pkt,
@@ -2323,13 +2348,11 @@ static enum net_verdict tcp_recv(struct net_conn *net_conn,
 			goto out;
 		}
 
-		conn = tcp_conn_new(pkt);
+		conn = tcp_conn_new(pkt, conn_old);
 		if (!conn) {
 			NET_ERR("Cannot allocate a new TCP connection");
 			goto in;
 		}
-
-		conn->accepted_conn = conn_old;
 	}
 in:
 	if (conn) {
@@ -2453,7 +2476,7 @@ static uint32_t tcp_init_isn(struct net_sockaddr *saddr, struct net_sockaddr *da
 /* Create a new tcp connection, as a part of it, create and register
  * net_context
  */
-static struct tcp *tcp_conn_new(struct net_pkt *pkt)
+static struct tcp *tcp_conn_new(struct net_pkt *pkt, struct tcp *listener)
 {
 	struct tcp *conn = NULL;
 	struct net_context *context = NULL;
@@ -2468,8 +2491,10 @@ static struct tcp *tcp_conn_new(struct net_pkt *pkt)
 	}
 
 	conn = context->tcp;
+	conn->accepted_conn = listener;
 	conn->iface = pkt->iface;
 	tcp_derive_rto(conn);
+	tcp_inherit_listener_socket_options(conn, listener);
 
 	net_context_set_family(conn->context, net_pkt_family(pkt));
 
