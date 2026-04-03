@@ -1,0 +1,29 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig I2S_GD32
+	bool "GigaDevice GD32 I2S driver"
+	default y
+	depends on DT_HAS_GD_GD32_I2S_ENABLED
+	select PINCTRL
+	select DMA
+	select CACHE_MANAGEMENT if CPU_HAS_DCACHE
+	select USE_GD32_SPI
+	help
+	  Enable the GD32 I2S driver. Only DMA transfers are supported.
+
+if I2S_GD32
+
+config I2S_GD32_RX_BLOCK_COUNT
+	int "RX queue block count"
+	default 2
+	help
+	  Number of RX blocks that can be queued internally.
+
+config I2S_GD32_TX_BLOCK_COUNT
+	int "TX queue block count"
+	default 2
+	help
+	  Number of TX blocks that can be queued internally.
+
+endif # I2S_GD32

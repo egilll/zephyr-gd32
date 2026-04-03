@@ -1,0 +1,36 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+include: [i2s-controller.yaml, pinctrl-device.yaml]
+
+compatible: "gd,gd32-i2s"
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clocks:
+    required: true
+
+  resets:
+    type: phandle-array
+    required: false
+
+  dmas:
+    required: true
+
+  dma-names:
+    required: true
+
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true
+
+  mck-enabled:
+    type: boolean
+    description: Enable master clock (MCK) output when in master mode.
