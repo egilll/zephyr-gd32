@@ -144,6 +144,10 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-names = "default";
 
+	/* DMA1 ch0: RX, ch6: TX, sub-peripheral slot 1 */
+	dmas = <&dma1 0 1 0 0>, <&dma1 6 1 0 0>;
+	dma-names = "rx", "tx";
+
 	eeprom0: eeprom@50 {
 		compatible = "atmel,at24";
 		reg = <0x50>;
