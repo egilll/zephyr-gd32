@@ -16,6 +16,7 @@
 #include <zephyr/net/net_core.h>
 #include <zephyr/net/net_log.h>
 #include <zephyr/net/dns_sd.h>
+#include <zephyr/net/hostname.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/kernel.h>
 
@@ -276,6 +277,37 @@ static bool domain_is_valid(const char *domain)
 	}
 
 	return domain_size;
+}
+
+static bool hostname_is_valid(const char *hostname)
+{
+	size_t hostname_size;
+
+	if (hostname == NULL) {
+		NET_DBG("hostname is NULL");
+		return false;
+	}
+
+	hostname_size = strlen(hostname);
+	if (hostname_size < DNS_LABEL_MIN_SIZE) {
+		NET_DBG("hostname '%s' is too small (%zu, min: %u)",
+			hostname, hostname_size, DNS_LABEL_MIN_SIZE);
+		return false;
+	}
+
+	if (hostname_size > DNS_LABEL_MAX_SIZE) {
+		NET_DBG("hostname '%s' is too big (%zu, max: %u)",
+			hostname, hostname_size, DNS_LABEL_MAX_SIZE);
+		return false;
+	}
+
+	if (!label_is_valid(hostname, hostname_size)) {
+		NET_DBG("hostname '%s' contains invalid characters",
+			hostname);
+		return false;
+	}
+
+	return true;
 }
 
 /**
@@ -687,6 +719,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	struct dns_rr *rr;
 	struct dns_srv_rdata *rdata;
 	size_t label_size;
+	const char *host;
 	uint16_t inst_offs;
 	uint16_t offset = buf_offset;
 
@@ -702,14 +735,21 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		return -E2BIG;
 	}
 
+	host = net_hostname_get();
+	if (!hostname_is_valid(host)) {
+		return -EINVAL;
+	}
+
+	label_size = strlen(host);
+
 	/* First, calculate that there is enough space in the buffer */
 	total_size =
 		/* pointer to .<Instance>.<Service>.<Protocol>.local. */
 		DNS_POINTER_SIZE + sizeof(*rr)
 		+ sizeof(*rdata)
-		/* .<Instance> */
+		/* .<hostname> */
 		+ DNS_LABEL_LEN_SIZE
-		+ strlen(inst->instance)
+		+ label_size
 		/* pointer to .local. */
 		+ DNS_POINTER_SIZE;
 
@@ -730,9 +770,9 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	rr->type = net_htons(DNS_RR_TYPE_SRV);
 	rr->class_ = net_htons(DNS_CLASS_IN | DNS_CLASS_FLUSH);
 	rr->ttl = net_htonl(ttl);
-	/* .<Instance>.local. */
+	/* .<hostname>.local. */
 	rr->rdlength = net_htons(sizeof(*rdata) + DNS_LABEL_LEN_SIZE
-			     + strlen(inst->instance) +
+			     + label_size +
 			     DNS_POINTER_SIZE);
 	offset += sizeof(*rr);
 
@@ -744,9 +784,8 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 
 	*host_offset = offset;
 
-	label_size = strlen(inst->instance);
 	buf[offset++] = label_size;
-	memcpy(&buf[offset], inst->instance, label_size);
+	memcpy(&buf[offset], host, label_size);
 	offset += label_size;
 
 	domain_offset |= DNS_SD_PTR_MASK;
