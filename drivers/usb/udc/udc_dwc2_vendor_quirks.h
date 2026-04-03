@@ -714,6 +714,227 @@ DT_INST_FOREACH_STATUS_OKAY(QUIRK_ESP32_USB_OTG_DEFINE)
 
 #endif /*DT_HAS_COMPAT_STATUS_OKAY(espressif_esp32_usb_otg) */
 
+
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbfs) || DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbhs)
+
+#include <zephyr/sys/sys_io.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/clock_control/gd32.h>
+#include <zephyr/drivers/reset.h>
+#include <zephyr/dt-bindings/clock/gd32f4xx-clocks.h>
+
+/* USBFS/USBHS Global Core Configuration register (GCCFG), offset 0x0038. */
+#define USB_DWC2_GCCFG_GD32_PWRON	BIT(16)
+#define USB_DWC2_GCCFG_GD32_VBUSACEN	BIT(18)
+#define USB_DWC2_GCCFG_GD32_VBUSBCEN	BIT(19)
+#define USB_DWC2_GCCFG_GD32_VBUSIG	BIT(21)
+
+/* RCU_ADDCTL bits used to provide a stable 48 MHz clock for the embedded PHY. */
+#define GD32_RCU_ADDCTL_IRC48MEN	BIT(16)
+#define GD32_RCU_ADDCTL_IRC48MSTB	BIT(17)
+
+static inline int gd32_usb_wait_irc48m_stable(void)
+{
+#if DT_NODE_EXISTS(DT_NODELABEL(rcu))
+	mem_addr_t addctl_reg = (mem_addr_t)(DT_REG_ADDR(DT_NODELABEL(rcu)) + GD32_ADDCTL_OFFSET);
+	k_timepoint_t timeout;
+
+	/* If IRC48M is not enabled, there is nothing to wait for. */
+	if ((sys_read32(addctl_reg) & GD32_RCU_ADDCTL_IRC48MEN) == 0U) {
+		return 0;
+	}
+
+	timeout = sys_timepoint_calc(K_MSEC(10));
+	while ((sys_read32(addctl_reg) & GD32_RCU_ADDCTL_IRC48MSTB) == 0U) {
+		if (sys_timepoint_expired(timeout)) {
+			return -ETIMEDOUT;
+		}
+
+		k_usleep(50);
+	}
+#endif
+
+	return 0;
+}
+
+static inline int gd32_usb_enable_embedded_phy(const struct device *dev, bool vbus_sensing)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	mem_addr_t gccfg_reg = (mem_addr_t)&config->base->ggpio;
+	uint32_t gccfg_bits = USB_DWC2_GCCFG_GD32_PWRON |
+			      USB_DWC2_GCCFG_GD32_VBUSACEN |
+			      USB_DWC2_GCCFG_GD32_VBUSBCEN;
+
+	/*
+	 * Reference: GD32_28_USBFS.md and GD32_29_USBHS.md document USBx_GCCFG
+	 * fields (PWRON/VBUSACEN/VBUSBCEN/VBUSIG) and that VBUSIG can be set to
+	 * ignore VBUS in device mode.
+	 */
+	if (!vbus_sensing) {
+		gccfg_bits |= USB_DWC2_GCCFG_GD32_VBUSIG;
+	}
+
+	sys_set_bits(gccfg_reg, gccfg_bits);
+
+	/* Vendor reference uses ~20ms delay after transceiver power-on. */
+	k_msleep(20);
+
+	return 0;
+}
+
+static inline int gd32_usb_disable_embedded_phy(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	mem_addr_t gccfg_reg = (mem_addr_t)&config->base->ggpio;
+
+	sys_clear_bits(gccfg_reg, USB_DWC2_GCCFG_GD32_PWRON);
+
+	return 0;
+}
+
+static inline int gd32_usbhs_init_caps(const struct device *dev)
+{
+	struct udc_data *data = dev->data;
+
+	data->caps.hs = true;
+
+	return 0;
+}
+
+/*
+ * TODO EGILL!
+ * GD32 USBFS appears to assert IN endpoint "NAK effective" (INEPNAKEFF) as a
+ * level condition that can lead to an interrupt storm when masked/enabled like
+ * other DWC2 integrations do. Mask it out and clear any latched INEPNAKEFF
+ * flags after ISR handling.
+ */
+static inline int gd32_dwc2_irq_clear(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	struct usb_dwc2_reg *const base = config->base;
+	mem_addr_t diepmsk_reg = (mem_addr_t)&base->diepmsk;
+
+	sys_clear_bits(diepmsk_reg, USB_DWC2_DIEPINT_INEPNAKEFF);
+
+	/* Clear any latched INEPNAKEFF for all configured IN endpoints. */
+	for (size_t i = 0; i < config->num_in_eps; i++) {
+		sys_write32(USB_DWC2_DIEPINT_INEPNAKEFF,
+			    (mem_addr_t)&base->in_ep[i].diepint);
+	}
+
+	return 0;
+}
+
+#define _GD32_DWC2_CLK_ON(node_id, prop, idx)					\
+	do {									\
+		uint16_t clk_id = DT_CLOCKS_CELL_BY_IDX(node_id, idx, id);	\
+		ret = clock_control_on(GD32_CLOCK_CONTROLLER,			\
+				       (clock_control_subsys_t)&clk_id);	\
+		if (ret) {							\
+			return ret;						\
+		}								\
+	} while (0);
+
+#define QUIRK_GD32_USBFS_DEFINE(n)						\
+	static const struct reset_dt_spec reset_##n =				\
+		RESET_DT_SPEC_INST_GET_OR(n, {0});				\
+										\
+	static int gd32_usbfs_pre_enable_##n(const struct device *dev)		\
+	{									\
+		const struct udc_dwc2_config *const config = dev->config;	\
+		int ret;							\
+										\
+		/* Enable all clocks listed in devicetree. */			\
+		DT_INST_FOREACH_PROP_ELEM(n, clocks,				\
+			_GD32_DWC2_CLK_ON)					\
+										\
+		ret = gd32_usb_wait_irc48m_stable();				\
+		if (ret) {							\
+			return ret;						\
+		}								\
+										\
+		if (reset_##n.dev != NULL && device_is_ready(reset_##n.dev)) {	\
+			ret = reset_line_toggle_dt(&reset_##n);			\
+			if (ret && ret != -ENOSYS) {				\
+				return ret;					\
+			}							\
+		}								\
+										\
+		/* Ensure PHY clock is not gated. */				\
+		sys_write32(0, (mem_addr_t)&config->base->pcgcctl);		\
+		return 0;							\
+	}									\
+										\
+	static int gd32_usbfs_post_enable_##n(const struct device *dev)		\
+	{									\
+		return gd32_usb_enable_embedded_phy(dev,				\
+						    DT_INST_PROP(n, vbus_sensing));\
+	}									\
+										\
+	const struct dwc2_vendor_quirks dwc2_vendor_quirks_##n = {		\
+		.pre_enable = gd32_usbfs_pre_enable_##n,			\
+		.post_enable = gd32_usbfs_post_enable_##n,			\
+		.disable = gd32_usb_disable_embedded_phy,			\
+		.irq_clear = gd32_dwc2_irq_clear,					\
+	};
+
+#define QUIRK_GD32_USBHS_DEFINE(n)						\
+	static const struct reset_dt_spec reset_##n =				\
+		RESET_DT_SPEC_INST_GET_OR(n, {0});				\
+										\
+	static int gd32_usbhs_pre_enable_##n(const struct device *dev)		\
+	{									\
+		const struct udc_dwc2_config *const config = dev->config;	\
+		int ret;							\
+										\
+		/* Enable all clocks listed in devicetree. */			\
+		DT_INST_FOREACH_PROP_ELEM(n, clocks,				\
+			_GD32_DWC2_CLK_ON)					\
+										\
+		if (reset_##n.dev != NULL && device_is_ready(reset_##n.dev)) {	\
+			ret = reset_line_toggle_dt(&reset_##n);			\
+			if (ret && ret != -ENOSYS) {				\
+				return ret;					\
+			}							\
+		}								\
+										\
+		/* Ensure PHY clock is not gated. */				\
+		sys_write32(0, (mem_addr_t)&config->base->pcgcctl);		\
+		return 0;							\
+	}									\
+										\
+	static int gd32_usbhs_post_enable_##n(const struct device *dev)		\
+	{									\
+		bool ulpi = (DT_INST_NUM_CLOCKS(n) > 1) &&			\
+			    (DT_INST_CLOCKS_CELL_BY_IDX(n, 1, id) == GD32_CLOCK_USBHSULPI);\
+										\
+		if (ulpi) {							\
+			return 0;						\
+		}								\
+										\
+		return gd32_usb_enable_embedded_phy(dev,				\
+						    DT_INST_PROP(n, vbus_sensing));\
+	}									\
+										\
+	const struct dwc2_vendor_quirks dwc2_vendor_quirks_##n = {		\
+		.pre_enable = gd32_usbhs_pre_enable_##n,			\
+		.post_enable = gd32_usbhs_post_enable_##n,			\
+		.caps = gd32_usbhs_init_caps,					\
+		.irq_clear = gd32_dwc2_irq_clear,					\
+	};
+
+#define QUIRK_GD32_DWC2_DEFINE(n)						\
+	COND_CODE_1(DT_INST_NODE_HAS_COMPAT(n, gd_gd32_usbfs),			\
+		    (QUIRK_GD32_USBFS_DEFINE(n)),				\
+		    (COND_CODE_1(DT_INST_NODE_HAS_COMPAT(n, gd_gd32_usbhs),	\
+				 (QUIRK_GD32_USBHS_DEFINE(n)), ())))
+
+DT_INST_FOREACH_STATUS_OKAY(QUIRK_GD32_DWC2_DEFINE)
+
+#endif /* DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbfs) || DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbhs) */
+
 /* Add next vendor quirks definition above this line */
 
 #endif /* ZEPHYR_DRIVERS_USB_UDC_DWC2_VENDOR_QUIRKS_H */

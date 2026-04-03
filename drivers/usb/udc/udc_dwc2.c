@@ -158,6 +158,13 @@ static void udc_dwc2_ep_disable(const struct device *dev,
 				struct udc_ep_config *const cfg,
 				bool stall, bool wait);
 
+uint32_t udc_dwc2_sof_cycle_get(const struct device *dev)
+{
+	struct udc_dwc2_data *const priv = udc_get_private(dev);
+
+	return priv->sof_cycle;
+}
+
 #if defined(CONFIG_PINCTRL)
 #include <zephyr/drivers/pinctrl.h>
 
@@ -1839,6 +1846,7 @@ static int udc_dwc2_init_controller(const struct device *dev)
 	uint32_t val;
 	int ret;
 	bool hs_phy;
+	bool use_dt_ghwcfg;
 
 	ret = dwc2_core_soft_reset(dev);
 	if (ret) {
@@ -1849,10 +1857,43 @@ static int udc_dwc2_init_controller(const struct device *dev)
 	gsnpsid = sys_read32((mem_addr_t)&base->gsnpsid);
 	priv->wa_essregrestored = gsnpsid < USB_DWC2_GSNPSID_REV_5_00A;
 
-	priv->ghwcfg1 = sys_read32((mem_addr_t)&base->ghwcfg1);
-	ghwcfg2 = sys_read32((mem_addr_t)&base->ghwcfg2);
-	ghwcfg3 = sys_read32((mem_addr_t)&base->ghwcfg3);
-	ghwcfg4 = sys_read32((mem_addr_t)&base->ghwcfg4);
+	/*
+	 * Some integrations do not expose GHWCFG* registers in the register
+	 * map. Use devicetree-provided values in that case.
+	 */
+	use_dt_ghwcfg = config->force_ghwcfg ||
+			IS_ENABLED(CONFIG_UDC_DWC2_FORCE_GHWCFG_FROM_DT);
+
+	if (use_dt_ghwcfg) {
+		priv->ghwcfg1 = config->ghwcfg1;
+		ghwcfg2 = config->ghwcfg2;
+		ghwcfg3 = config->ghwcfg3;
+		ghwcfg4 = config->ghwcfg4;
+		if (ghwcfg3 == 0U) {
+			LOG_ERR("GHWCFG3 must be provided when forcing devicetree GHWCFG values");
+			return -EINVAL;
+		}
+	} else {
+		priv->ghwcfg1 = sys_read32((mem_addr_t)&base->ghwcfg1);
+		ghwcfg2 = sys_read32((mem_addr_t)&base->ghwcfg2);
+		ghwcfg3 = sys_read32((mem_addr_t)&base->ghwcfg3);
+		ghwcfg4 = sys_read32((mem_addr_t)&base->ghwcfg4);
+
+		if ((ghwcfg2 == 0U) && (ghwcfg4 == 0U)) {
+			LOG_WRN("GHWCFG registers unreadable, using devicetree values");
+			priv->ghwcfg1 = config->ghwcfg1;
+			ghwcfg2 = config->ghwcfg2;
+			ghwcfg4 = config->ghwcfg4;
+			if (config->ghwcfg3 != 0U) {
+				ghwcfg3 = config->ghwcfg3;
+			}
+		}
+	}
+
+	LOG_WRN("ghwcfg1 value 0x%x",sys_read32((mem_addr_t)&base->ghwcfg1));
+	LOG_WRN("ghwcfg2 value 0x%x",sys_read32((mem_addr_t)&base->ghwcfg2));
+	LOG_WRN("ghwcfg3 value 0x%x",sys_read32((mem_addr_t)&base->ghwcfg3));
+	LOG_WRN("ghwcfg4 value 0x%x",sys_read32((mem_addr_t)&base->ghwcfg4));
 
 	if (!(ghwcfg4 & USB_DWC2_GHWCFG4_DEDFIFOMODE)) {
 		LOG_ERR("Only dedicated TX FIFO mode is supported");
@@ -2981,6 +3022,8 @@ static void udc_dwc2_isr_handler(const struct device *dev)
 			/* Clear USB SOF interrupt. */
 			sys_write32(USB_DWC2_GINTSTS_SOF, gintsts_reg);
 
+			priv->sof_cycle = k_cycle_get_32();
+
 			dsts = sys_read32((mem_addr_t)&base->dsts);
 			priv->sof_num = usb_dwc2_get_dsts_soffn(dsts);
 			udc_submit_sof_event(dev);
@@ -3333,7 +3376,7 @@ static const struct udc_api udc_dwc2_api = {
 #define UDC_DWC2_DEVICE_DEFINE(n)						\
 	UDC_DWC2_PINCTRL_DT_INST_DEFINE(n);					\
 										\
-	K_THREAD_STACK_DEFINE(udc_dwc2_stack_##n, CONFIG_UDC_DWC2_STACK_SIZE);	\
+	K_THREAD_STACK_DEFINE(udc_dwc2_stack_##n, 2000);	\
 										\
 	static void udc_dwc2_thread_##n(void *dev, void *arg1, void *arg2)	\
 	{									\
@@ -3375,7 +3418,9 @@ static const struct udc_api udc_dwc2_api = {
 		.quirks = UDC_DWC2_VENDOR_QUIRK_GET(n),				\
 		.ghwcfg1 = DT_INST_PROP(n, ghwcfg1),				\
 		.ghwcfg2 = DT_INST_PROP(n, ghwcfg2),				\
+		.ghwcfg3 = DT_INST_PROP_OR(n, ghwcfg3, 0),			\
 		.ghwcfg4 = DT_INST_PROP(n, ghwcfg4),				\
+		.force_ghwcfg = DT_INST_PROP_OR(n, snps_force_ghwcfg, false),	\
 	};									\
 										\
 	static struct udc_dwc2_data udc_priv_##n = {				\
