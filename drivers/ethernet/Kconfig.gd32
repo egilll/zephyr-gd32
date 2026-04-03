@@ -1,0 +1,125 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig ETH_GD32
+	bool "GD32 Ethernet MAC (ENET) driver"
+	depends on DT_HAS_GD_GD32_ETHERNET_ENABLED
+	default y
+	select USE_GD32_ENET
+	select USE_GD32_RCU
+	select USE_GD32_GPIO
+	select USE_GD32_SYSCFG
+	select HWINFO
+	select CRC
+	help
+	  Enable the Ethernet MAC driver for GD32 SoCs.
+
+if ETH_GD32
+
+config ETH_GD32_RX_DESC_COUNT
+	int "RX DMA descriptor count"
+	range 8 128
+	default 32
+	help
+	  Number of RX descriptors in the ENET DMA chain. The driver reserves one
+	  RX `net_buf` per descriptor from the global RX buffer pool.
+
+config ETH_GD32_TX_DESC_COUNT
+	int "TX DMA descriptor count"
+	range 4 64
+	default 16
+	help
+	  Number of TX descriptors in the ENET DMA ring. TX is zero-copy and may
+	  consume multiple descriptors per frame depending on fragmentation.
+
+config ETH_GD32_ACCEPT_ALL_MULTICAST
+	bool "Accept all multicast frames"
+	default y
+	help
+	  When enabled, all multicast frames are passed to the network stack and
+	  multicast filter requests from the Ethernet L2 layer are ignored.
+
+	  When disabled, multicast addresses (IGMP/MLD) requested by the stack
+	  are programmed into the MAC hash filter table.
+
+config ETH_GD32_TX_OSF
+	bool "TxDMA operate on second frame (OSF)"
+	default y
+	help
+	  Enable TxDMA "operate on second frame" mode. This allows TxDMA to start
+	  fetching the next frame early, improving throughput when the AHB clock
+	  is much faster than the MAC clock.
+
+config ETH_GD32_RX_STORE_FORWARD
+	bool "Rx store-and-forward"
+	default n
+	help
+	  When enabled, RxDMA transfers a frame from the RxFIFO to memory only
+	  after the full frame is received into the FIFO. Disabling enables
+	  cut-through mode, which can reduce latency but may forward frames with
+	  errors (see the reference manual for details).
+
+choice
+	prompt "Rx cut-through threshold"
+	depends on !ETH_GD32_RX_STORE_FORWARD
+	default ETH_GD32_RX_THRESHOLD_64
+	help
+	  RxFIFO threshold that triggers cut-through forwarding to memory.
+
+config ETH_GD32_RX_THRESHOLD_64
+	bool "64 bytes"
+
+config ETH_GD32_RX_THRESHOLD_32
+	bool "32 bytes"
+
+config ETH_GD32_RX_THRESHOLD_96
+	bool "96 bytes"
+
+config ETH_GD32_RX_THRESHOLD_128
+	bool "128 bytes"
+
+endchoice
+
+config ETH_GD32_TX_STORE_FORWARD
+	bool "Tx store-and-forward"
+	default n
+	help
+	  When enabled, transmission on the wire starts after the entire frame is
+	  transferred into the TxFIFO. Disabling enables cut-through mode, which
+	  starts transmitting once the TxFIFO reaches a threshold.
+
+choice
+	prompt "Tx cut-through threshold"
+	depends on !ETH_GD32_TX_STORE_FORWARD
+	default ETH_GD32_TX_THRESHOLD_64
+	help
+	  TxFIFO byte threshold that triggers transmission when Tx store-and-forward
+	  is disabled.
+
+config ETH_GD32_TX_THRESHOLD_64
+	bool "64 bytes"
+
+config ETH_GD32_TX_THRESHOLD_128
+	bool "128 bytes"
+
+config ETH_GD32_TX_THRESHOLD_192
+	bool "192 bytes"
+
+config ETH_GD32_TX_THRESHOLD_256
+	bool "256 bytes"
+
+config ETH_GD32_TX_THRESHOLD_40
+	bool "40 bytes"
+
+config ETH_GD32_TX_THRESHOLD_32
+	bool "32 bytes"
+
+config ETH_GD32_TX_THRESHOLD_24
+	bool "24 bytes"
+
+config ETH_GD32_TX_THRESHOLD_16
+	bool "16 bytes"
+
+endchoice
+
+endif

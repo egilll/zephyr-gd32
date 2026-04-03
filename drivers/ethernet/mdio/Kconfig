@@ -28,6 +28,7 @@ config MDIO_SHELL
 rsource "Kconfig.adin2111"
 rsource "Kconfig.dwcxgmac"
 rsource "Kconfig.esp32"
+rsource "Kconfig.gd32"
 rsource "Kconfig.gpio"
 rsource "Kconfig.intel_igc"
 rsource "Kconfig.lan865x"

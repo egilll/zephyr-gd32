@@ -1,0 +1,13 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config MDIO_GD_GD32
+	bool "GD32 MDIO controller"
+	depends on DT_HAS_GD_GD32_MDIO_ENABLED
+	default y
+	select USE_GD32_ENET
+	select USE_GD32_RCU
+	select USE_GD32_SYSCFG
+	help
+	  Enable MDIO controller support for GD32 ENET. Provides a Clause 22
+	  MDIO bus backed by the on-chip ENET MAC MII management interface.
