@@ -23,6 +23,8 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: babblesim
       url-base: https://github.com/BabbleSim
+    - name: egilll
+      url-base: https://github.com/egilll
 
   group-filter: [-babblesim, -optional, -testing]
 
@@ -183,7 +185,9 @@ manifest:
       groups:
         - hal
     - name: hal_gigadevice
-      revision: ee0e31302c21b2a465dc303b3ced8c606c2167c8
+      remote: egilll
+      repo-path: hal_gigadevice_tmp_fork
+      revision: enet
       path: modules/hal/gigadevice
       groups:
         - hal
