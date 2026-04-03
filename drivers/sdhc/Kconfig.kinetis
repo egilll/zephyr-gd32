@@ -1,0 +1,26 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config SDHC_KINETIS
+	bool "NXP Kinetis SDHC driver"
+	default y
+	depends on DT_HAS_NXP_KINETIS_SDHC_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	select PINCTRL
+	help
+	  Enable the NXP Kinetis SDHC host controller driver.
+
+if SDHC_KINETIS
+
+# ADMA2 needs word-aligned buffers.
+config SDHC_BUFFER_ALIGNMENT
+	default 4
+
+config SDHC_KINETIS_ADMA_TABLE_SIZE
+	int "ADMA descriptor table size (bytes)"
+	default 512
+	help
+	  Size in bytes of the static ADMA descriptor table used by the Kinetis
+	  SDHC driver.
+
+endif # SDHC_KINETIS

@@ -386,6 +386,14 @@
 			status = "disabled";
 		};
 
+		sdhc0: sdhc@400b1000 {
+			compatible = "nxp,kinetis-sdhc";
+			reg = <0x400b1000 0x1000>;
+			interrupts = <81 0>;
+			clocks = <&sim KINETIS_SIM_BUS_CLK 0x1030 17>;
+			status = "disabled";
+		};
+
 		wdog: watchdog@40052000 {
 			compatible = "nxp,kinetis-wdog";
 			reg = <0x40052000 16>;

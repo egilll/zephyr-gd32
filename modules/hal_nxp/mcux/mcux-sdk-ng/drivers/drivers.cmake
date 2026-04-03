@@ -127,6 +127,7 @@ set_variable_ifdef(CONFIG_MIPI_DSI_MCUX         CONFIG_MCUX_COMPONENT_driver.mip
 set_variable_ifdef(CONFIG_MIPI_DSI_MCUX_2L      CONFIG_MCUX_COMPONENT_driver.mipi_dsi)
 set_variable_ifdef(CONFIG_MIPI_DSI_NXP_DWC      CONFIG_MCUX_COMPONENT_driver.mipi_dsi_imx)
 set_variable_ifdef(CONFIG_MCUX_SDIF             CONFIG_MCUX_COMPONENT_driver.sdif)
+set_variable_ifdef(CONFIG_SDHC_KINETIS          CONFIG_MCUX_COMPONENT_driver.sdhc)
 set_variable_ifdef(CONFIG_MCUX_XBARA            CONFIG_MCUX_COMPONENT_driver.xbara)
 set_variable_ifdef(CONFIG_MCUX_XBARB            CONFIG_MCUX_COMPONENT_driver.xbarb)
 set_variable_ifdef(CONFIG_QDC_MCUX              CONFIG_MCUX_COMPONENT_driver.qdc)
