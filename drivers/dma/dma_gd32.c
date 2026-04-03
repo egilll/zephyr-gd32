@@ -25,7 +25,11 @@
 #define GD32_DMA_CHXCTL_DIR	  BIT(6)
 #define GD32_DMA_CHXCTL_M2M	  BIT(7)
 #define GD32_DMA_INTERRUPT_ERRORS (DMA_CHXCTL_SDEIE | DMA_CHXCTL_TAEIE)
+#if defined(DMA_FLAG_FEE)
+#define GD32_DMA_FLAG_ERRORS	  (DMA_FLAG_SDE | DMA_FLAG_TAE | DMA_FLAG_FEE)
+#else
 #define GD32_DMA_FLAG_ERRORS	  (DMA_FLAG_SDE | DMA_FLAG_TAE)
+#endif
 #else
 #define GD32_DMA_CHXCTL_DIR	  BIT(4)
 #define GD32_DMA_CHXCTL_M2M	  BIT(14)
@@ -87,6 +91,42 @@ struct dma_gd32_srcdst_config {
 	uint32_t adj;
 	uint32_t width;
 };
+
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+static inline uint32_t dma_gd32_fifo_threshold(uint16_t fifo_mode_control)
+{
+	switch (fifo_mode_control & 0x3U) {
+	case 0U:
+		return DMA_FIFO_1_WORD;
+	case 1U:
+		return DMA_FIFO_2_WORD;
+	case 2U:
+		return DMA_FIFO_3_WORD;
+	default:
+		return DMA_FIFO_4_WORD;
+	}
+}
+
+static inline int dma_gd32_burst_cfg(uint32_t burst_len, bool memory_burst, uint32_t *out)
+{
+	switch (burst_len) {
+	case 1U:
+		*out = memory_burst ? DMA_MEMORY_BURST_SINGLE : DMA_PERIPH_BURST_SINGLE;
+		return 0;
+	case 4U:
+		*out = memory_burst ? DMA_MEMORY_BURST_4_BEAT : DMA_PERIPH_BURST_4_BEAT;
+		return 0;
+	case 8U:
+		*out = memory_burst ? DMA_MEMORY_BURST_8_BEAT : DMA_PERIPH_BURST_8_BEAT;
+		return 0;
+	case 16U:
+		*out = memory_burst ? DMA_MEMORY_BURST_16_BEAT : DMA_PERIPH_BURST_16_BEAT;
+		return 0;
+	default:
+		return -ENOTSUP;
+	}
+}
+#endif
 
 /*
  * Register access functions
@@ -346,6 +386,11 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 	struct dma_gd32_srcdst_config dst_cfg;
 	struct dma_gd32_srcdst_config *memory_cfg = NULL;
 	struct dma_gd32_srcdst_config *periph_cfg = NULL;
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+	uint32_t mem_burst = 0U;
+	uint32_t periph_burst = 0U;
+	bool use_multidata = false;
+#endif
 
 	if (channel >= cfg->channels) {
 		LOG_ERR("channel must be < %" PRIu32 " (%" PRIu32 ")",
@@ -472,6 +517,45 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 				     dma_gd32_memory_width(memory_cfg->width));
 	gd32_dma_periph_width_config(cfg->reg, channel,
 				     dma_gd32_periph_width(periph_cfg->width));
+
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+	if (dma_gd32_burst_cfg(dma_cfg->source_burst_length, false, &periph_burst) != 0) {
+		LOG_ERR("unsupported source burst length: %" PRIu32, dma_cfg->source_burst_length);
+		return -ENOTSUP;
+	}
+	if (dma_gd32_burst_cfg(dma_cfg->dest_burst_length, true, &mem_burst) != 0) {
+		LOG_ERR("unsupported dest burst length: %" PRIu32, dma_cfg->dest_burst_length);
+		return -ENOTSUP;
+	}
+
+	if (dma_cfg->channel_direction == MEMORY_TO_PERIPHERAL) {
+		uint32_t tmp = mem_burst;
+		mem_burst = periph_burst;
+		periph_burst = tmp;
+	}
+
+	/*
+	 * Use multi-data mode (FIFO) when burst transfer is requested or when a FIFO threshold is
+	 * specified. This matches the vendor SDIO examples and avoids single-data mode exceptions.
+	 */
+	use_multidata = (dma_cfg->source_burst_length > 1U) || (dma_cfg->dest_burst_length > 1U) ||
+			(dma_cfg->head_block->fifo_mode_control != 0U);
+
+	if (use_multidata) {
+		DMA_CHFCTL(cfg->reg, channel) |=
+			(DMA_CHXFCTL_MDMEN |
+			 dma_gd32_fifo_threshold(dma_cfg->head_block->fifo_mode_control));
+#if defined(DMA_CHXFCTL_FEEIE)
+		DMA_CHFCTL(cfg->reg, channel) |= DMA_CHXFCTL_FEEIE;
+#endif
+
+		uint32_t ctl = GD32_DMA_CHCTL(cfg->reg, channel);
+		ctl &= ~(DMA_CHXCTL_PBURST | DMA_CHXCTL_MBURST);
+		ctl |= periph_burst | mem_burst;
+		GD32_DMA_CHCTL(cfg->reg, channel) = ctl;
+	}
+#endif
+
 	if (dma_cfg->cyclic) {
 		gd32_dma_circulation_enable(cfg->reg, channel);
 	} else {

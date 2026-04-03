@@ -268,6 +268,21 @@ __subsystem struct sdhc_driver_api {
 	int (*request)(const struct device *dev,
 		       struct sdhc_command *cmd,
 		       struct sdhc_data *data);
+	/**
+	 * @brief Optional hook to validate data buffer compatibility
+	 *
+	 * Host controllers that use DMA may have restrictions on which memory
+	 * ranges can be accessed directly. When provided, this function should
+	 * return true if the host controller can use the buffer directly for data
+	 * transfers, and false if the caller should use an internal/bounce buffer.
+	 *
+	 * If the hook is not implemented, buffers are assumed to be compatible.
+	 *
+	 * @param dev SDHC device
+	 * @param buf Data buffer pointer
+	 * @param len Data length in bytes
+	 */
+	bool (*data_buf_is_compatible)(const struct device *dev, const void *buf, size_t len);
 	int (*set_io)(const struct device *dev, struct sdhc_io *ios);
 	int (*get_card_present)(const struct device *dev);
 	int (*execute_tuning)(const struct device *dev);
@@ -279,6 +294,30 @@ __subsystem struct sdhc_driver_api {
 				int sources, void *user_data);
 	int (*disable_interrupt)(const struct device *dev, int sources);
 };
+
+/**
+ * @brief Check whether an SDHC device can use a data buffer directly
+ *
+ * This helper calls the optional @ref sdhc_driver_api::data_buf_is_compatible
+ * hook. If the hook is not implemented by the driver, it returns true.
+ *
+ * @param dev SDHC device
+ * @param buf Data buffer pointer
+ * @param len Data length in bytes
+ * @retval true Buffer can be used directly
+ * @retval false Caller should use an internal/bounce buffer
+ */
+static inline bool sdhc_data_buf_is_compatible(const struct device *dev, const void *buf,
+					       size_t len)
+{
+	const struct sdhc_driver_api *api = (const struct sdhc_driver_api *)dev->api;
+
+	if ((api == NULL) || (api->data_buf_is_compatible == NULL)) {
+		return true;
+	}
+
+	return api->data_buf_is_compatible(dev, buf, len);
+}
 
 /**
  * @brief reset SDHC controller state

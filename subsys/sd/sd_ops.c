@@ -546,6 +546,8 @@ int card_read_blocks(struct sd_card *card, uint8_t *rbuf, uint32_t start_block, 
 	uint32_t rlen;
 	uint32_t sector;
 	uint8_t *buf_offset;
+	bool use_card_buf;
+	size_t total_len;
 
 	if ((start_block + num_blocks) > card->block_count) {
 		return -EINVAL;
@@ -561,16 +563,20 @@ int card_read_blocks(struct sd_card *card, uint8_t *rbuf, uint32_t start_block, 
 	}
 
 	/*
-	 * If the buffer we are provided with is aligned, we can use it
-	 * directly. Otherwise, we need to use the card's internal buffer
-	 * and memcpy the data back out
+	 * Use the caller buffer directly when it meets the host's requirements.
+	 * Otherwise, fall back to the card's internal buffer and copy the data
+	 * out.
 	 */
-	if ((((uintptr_t)rbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) {
+	total_len = (size_t)num_blocks * (size_t)card->block_size;
+	use_card_buf = ((((uintptr_t)rbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) ||
+		       !sdhc_data_buf_is_compatible(card->sdhc, rbuf, total_len);
+
+	if (use_card_buf) {
 		/* lower bits of address are set, not aligned. Use internal buffer */
-		LOG_DBG("Unaligned buffer access to SD card may incur performance penalty");
+		LOG_DBG("Using internal SD buffer for transfer");
 		if (sizeof(card->card_buffer) < card->block_size) {
 			LOG_ERR("Card buffer size needs to be increased for "
-				"unaligned writes to work");
+				"buffered transfers to work");
 			k_mutex_unlock(&card->lock);
 			return -ENOBUFS;
 		}
@@ -578,18 +584,24 @@ int card_read_blocks(struct sd_card *card, uint8_t *rbuf, uint32_t start_block, 
 		sector = 0;
 		buf_offset = rbuf;
 		while (sector < num_blocks) {
+			uint32_t chunk = num_blocks - sector;
+
+			if (chunk > rlen) {
+				chunk = rlen;
+			}
+
 			/* Read from disk to card buffer */
-			ret = card_read(card, card->card_buffer, sector + start_block, rlen);
+			ret = card_read(card, card->card_buffer, sector + start_block, chunk);
 			if (ret) {
-				LOG_ERR("Write failed");
+				LOG_ERR("Read failed");
 				k_mutex_unlock(&card->lock);
 				return ret;
 			}
 			/* Copy data from card buffer */
-			memcpy(buf_offset, card->card_buffer, rlen * card->block_size);
+			memcpy(buf_offset, card->card_buffer, (size_t)chunk * card->block_size);
 			/* Increase sector count and buffer offset */
-			sector += rlen;
-			buf_offset += rlen * card->block_size;
+			sector += chunk;
+			buf_offset += chunk * card->block_size;
 		}
 	} else {
 		/* Aligned buffers can be used directly */
@@ -712,6 +724,8 @@ int card_write_blocks(struct sd_card *card, const uint8_t *wbuf, uint32_t start_
 	uint32_t wlen;
 	uint32_t sector;
 	const uint8_t *buf_offset;
+	bool use_card_buf;
+	size_t total_len;
 
 	if ((start_block + num_blocks) > card->block_count) {
 		return -EINVAL;
@@ -726,16 +740,20 @@ int card_write_blocks(struct sd_card *card, const uint8_t *wbuf, uint32_t start_
 		return -EBUSY;
 	}
 	/*
-	 * If the buffer we are provided with is aligned, we can use it
-	 * directly. Otherwise, we need to use the card's internal buffer
-	 * and memcpy the data back out
+	 * Use the caller buffer directly when it meets the host's requirements.
+	 * Otherwise, fall back to the card's internal buffer and copy the data
+	 * in.
 	 */
-	if ((((uintptr_t)wbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) {
+	total_len = (size_t)num_blocks * (size_t)card->block_size;
+	use_card_buf = ((((uintptr_t)wbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) ||
+		       !sdhc_data_buf_is_compatible(card->sdhc, wbuf, total_len);
+
+	if (use_card_buf) {
 		/* lower bits of address are set, not aligned. Use internal buffer */
-		LOG_DBG("Unaligned buffer access to SD card may incur performance penalty");
+		LOG_DBG("Using internal SD buffer for transfer");
 		if (sizeof(card->card_buffer) < card->block_size) {
 			LOG_ERR("Card buffer size needs to be increased for "
-				"unaligned writes to work");
+				"buffered transfers to work");
 			k_mutex_unlock(&card->lock);
 			return -ENOBUFS;
 		}
@@ -743,18 +761,24 @@ int card_write_blocks(struct sd_card *card, const uint8_t *wbuf, uint32_t start_
 		sector = 0;
 		buf_offset = wbuf;
 		while (sector < num_blocks) {
+			uint32_t chunk = num_blocks - sector;
+
+			if (chunk > wlen) {
+				chunk = wlen;
+			}
+
 			/* Copy data into card buffer */
-			memcpy(card->card_buffer, buf_offset, wlen * card->block_size);
+			memcpy(card->card_buffer, buf_offset, (size_t)chunk * card->block_size);
 			/* Write card buffer to disk */
-			ret = card_write(card, card->card_buffer, sector + start_block, wlen);
+			ret = card_write(card, card->card_buffer, sector + start_block, chunk);
 			if (ret) {
 				LOG_ERR("Write failed");
 				k_mutex_unlock(&card->lock);
 				return ret;
 			}
 			/* Increase sector count and buffer offset */
-			sector += wlen;
-			buf_offset += wlen * card->block_size;
+			sector += chunk;
+			buf_offset += chunk * card->block_size;
 		}
 	} else {
 		/* We can use aligned buffers directly */

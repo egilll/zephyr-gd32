@@ -1,0 +1,35 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: GD32 SD host controller
+
+compatible: "gd,gd32-sdhc"
+
+include: [sdhc.yaml, pinctrl-device.yaml, reset-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  bus-width:
+    type: int
+    default: 1
+    enum:
+      - 1
+      - 4
+      - 8
+    description: |
+      Maximum bus width supported by the board wiring.
+
+  dmas:
+    description: DMA channel used for data transfers (reused for RX and TX)
+    required: true
+    type: phandle-array
+
+  cd-gpios:
+    type: phandle-array
+    required: false
+    description: Optional card-detect GPIO
