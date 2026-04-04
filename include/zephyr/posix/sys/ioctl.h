@@ -10,6 +10,7 @@
 
 #define FIONBIO ZFD_IOCTL_FIONBIO
 #define FIONREAD ZFD_IOCTL_FIONREAD
+#define FIONWRITE ZFD_IOCTL_FIONWRITE
 
 #ifdef __cplusplus
 extern "C" {

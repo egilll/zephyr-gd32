@@ -2307,6 +2307,85 @@ ZTEST(net_socket_tcp, test_ioctl_fionread_v6)
 	test_ioctl_fionread_common(NET_AF_INET6);
 }
 
+static void test_ioctl_fionwrite_wait_until_empty(int sock)
+{
+	int avail = -1;
+
+	for (int i = 0; i < 300; ++i) {
+		zassert_ok(zsock_ioctl(sock, ZFD_IOCTL_FIONWRITE, &avail));
+		if (avail == 0) {
+			return;
+		}
+
+		k_msleep(10);
+	}
+
+	zassert_equal(0, avail, "exp: %d: act: %d", 0, avail);
+}
+
+static void test_ioctl_fionwrite_common(int af)
+{
+	int avail = -1;
+	int ret;
+	int fd[] = {-1, -1, -1};
+
+	test_ioctl_fionread_setup(af, fd);
+
+	/* send queue should be empty on a newly created socket */
+	zassert_ok(zsock_ioctl(fd[CLIENT], ZFD_IOCTL_FIONWRITE, &avail));
+	zassert_equal(0, avail, "exp: %d: act: %d", 0, avail);
+
+	zassert_equal(loopback_set_packet_drop_ratio(1.0f), 0,
+		      "cannot set packet loss");
+
+	ret = zsock_send(fd[CLIENT], TEST_STR_SMALL, strlen(TEST_STR_SMALL),
+			 ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, strlen(TEST_STR_SMALL), "unexpected small send %d", ret);
+
+	/* queued TCP send bytes should now be visible and not yet acknowledged */
+	avail = -1;
+	zassert_ok(zsock_ioctl(fd[CLIENT], ZFD_IOCTL_FIONWRITE, &avail));
+	zassert_equal(strlen(TEST_STR_SMALL), avail, "exp: %d: act: %d",
+		      strlen(TEST_STR_SMALL), avail);
+
+	restore_packet_loss_ratio();
+	test_ioctl_fionwrite_wait_until_empty(fd[CLIENT]);
+
+	test_close(fd[CLIENT]);
+	test_close(fd[SERVER]);
+	test_close(fd[ACCEPT]);
+	test_context_cleanup();
+}
+
+ZTEST(net_socket_tcp, test_ioctl_fionwrite_v4)
+{
+	test_ioctl_fionwrite_common(NET_AF_INET);
+}
+
+ZTEST(net_socket_tcp, test_ioctl_fionwrite_v6)
+{
+	test_ioctl_fionwrite_common(NET_AF_INET6);
+}
+
+ZTEST(net_socket_tcp, test_ioctl_fionwrite_listen)
+{
+	struct net_sockaddr_in addr;
+	int avail = -1;
+	int fd;
+	int ret;
+
+	prepare_sock_tcp_v4(MY_IPV4_ADDR, SERVER_PORT, &fd, &addr);
+	test_bind(fd, (struct net_sockaddr *)&addr, sizeof(addr));
+	test_listen(fd);
+
+	ret = zsock_ioctl(fd, ZFD_IOCTL_FIONWRITE, &avail);
+	zassert_equal(ret, -1, "FIONWRITE unexpectedly succeeded");
+	zassert_equal(errno, EINVAL, "unexpected errno %d", errno);
+
+	test_close(fd);
+	test_context_cleanup();
+}
+
 /* Connect to peer which is not listening the test port and
  * make sure select() returns proper error for the closed
  * connection.
