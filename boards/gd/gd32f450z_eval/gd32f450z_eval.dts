@@ -189,7 +189,7 @@ zephyr_udc0: &usbfs {
 	clock-source = "lxtal";
 };
 
-&trng {
+&trng0 {
 	status = "okay";
 };
 
