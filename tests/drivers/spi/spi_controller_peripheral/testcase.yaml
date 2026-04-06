@@ -75,9 +75,48 @@ tests:
     integration_platforms:
       - nrf52840dk/nrf52840
 
+  drivers.spi.spi_16bit:
+    extra_configs:
+      - CONFIG_TESTED_SPI_MODE=1
+      - CONFIG_TESTED_SPI_WORD_SIZE=16
+    platform_allow:
+      - gd32f450z_eval/gd32f450
+    integration_platforms:
+      - gd32f450z_eval/gd32f450
+
+  drivers.spi.spi_ti_mode:
+    extra_configs:
+      - CONFIG_TESTED_SPI_MODE=1
+      - CONFIG_TESTED_SPI_TI_MODE=y
+    extra_args: EXTRA_DTC_OVERLAY_FILE="boards/gd32f450z_eval_ti.overlay"
+    platform_allow:
+      - gd32f450z_eval/gd32f450
+    integration_platforms:
+      - gd32f450z_eval/gd32f450
+
+  drivers.spi.spi_gd32_irq:
+    extra_configs:
+      - CONFIG_TESTED_SPI_MODE=1
+    platform_allow:
+      - gd32f450z_eval/gd32f450
+    integration_platforms:
+      - gd32f450z_eval/gd32f450
+
+  drivers.spi.spi_gd32_dma:
+    extra_configs:
+      - CONFIG_TESTED_SPI_MODE=1
+      - CONFIG_SPI_ASYNC=n
+      - CONFIG_SPI_GD32_DMA=y
+    extra_args: EXTRA_DTC_OVERLAY_FILE="boards/gd32f450z_eval_dma.overlay"
+    platform_allow:
+      - gd32f450z_eval/gd32f450
+    integration_platforms:
+      - gd32f450z_eval/gd32f450
+
   drivers.spi.spi_fast:
     extra_args: DTC_OVERLAY_FILE="boards/nrf54h20dk_nrf54h20_cpuapp_fast.overlay"
     platform_exclude:
+      - gd32f450z_eval/gd32f450
       - nrf52840dk/nrf52840
       - nrf54h20dk/nrf54h20/cpurad
       - nrf54h20dk/nrf54h20/cpuppr
@@ -92,6 +131,7 @@ tests:
     build_only: true
     extra_args: DTC_OVERLAY_FILE="boards/nrf54h20dk_nrf54h20_cpuapp_fast_spis.overlay"
     platform_exclude:
+      - gd32f450z_eval/gd32f450
       - nrf52840dk/nrf52840
       - nrf54h20dk/nrf54h20/cpurad
       - nrf54h20dk/nrf54h20/cpuppr
@@ -116,6 +156,7 @@ tests:
       - CONFIG_POWER_DOMAIN=n
     extra_args: DTC_OVERLAY_FILE="boards/nrf54l15dk_nrf54l15_cpuapp_cross_domain.overlay"
     platform_exclude:
+      - gd32f450z_eval/gd32f450
       - nrf52840dk/nrf52840
       - nrf54h20dk/nrf54h20/cpuapp
       - nrf54h20dk/nrf54h20/cpurad
