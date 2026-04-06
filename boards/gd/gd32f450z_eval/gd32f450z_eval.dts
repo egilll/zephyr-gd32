@@ -197,8 +197,6 @@ zephyr_udc0: &usbfs {
 	status = "okay";
 	pinctrl-0 = <&mdio_default>;
 	pinctrl-names = "default";
-	gd,phy-clk-out;
-	phy-connection-type = "rmii";
 
 	eth_phy0: ethernet-phy@1 {
 		compatible = "ethernet-phy";
@@ -212,7 +210,7 @@ zephyr_udc0: &usbfs {
 	status = "okay";
 	pinctrl-0 = <&enet_default>;
 	pinctrl-names = "default";
-	gd,phy-clk-out;
+	phy-clock-type = "internal";
 	phy-handle = <&eth_phy0>;
 };
 
