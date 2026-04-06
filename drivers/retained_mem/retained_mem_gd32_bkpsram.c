@@ -56,6 +56,7 @@ static inline void gd32_bkpsram_lock_release(const struct device *dev)
 static int gd32_bkpsram_init(const struct device *dev)
 {
 	const struct gd32_bkpsram_config *cfg = dev->config;
+	int ret;
 
 #ifdef CONFIG_RETAINED_MEM_MUTEXES
 	struct gd32_bkpsram_data *data = dev->data;
@@ -63,7 +64,10 @@ static int gd32_bkpsram_init(const struct device *dev)
 	k_mutex_init(&data->lock);
 #endif
 
-	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	if (ret < 0) {
+		return ret;
+	}
 
 #if defined(CONFIG_REGULATOR)
 	if (cfg->vin_supply != NULL) {
@@ -71,7 +75,7 @@ static int gd32_bkpsram_init(const struct device *dev)
 			return -ENODEV;
 		}
 
-		int ret = regulator_enable(cfg->vin_supply);
+		ret = regulator_enable(cfg->vin_supply);
 
 		if (ret < 0) {
 			return ret;

@@ -32,8 +32,12 @@ struct gd32_bldo_data {
 static int gd32_bldo_enable(const struct device *dev)
 {
 	const struct gd32_bldo_config *cfg = dev->config;
+	int ret;
 
-	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	if (ret < 0) {
+		return ret;
+	}
 
 	uint32_t start_ms = k_uptime_get_32();
 
@@ -58,8 +62,12 @@ static int gd32_bldo_enable(const struct device *dev)
 static int gd32_bldo_disable(const struct device *dev)
 {
 	const struct gd32_bldo_config *cfg = dev->config;
+	int ret;
 
-	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	if (ret < 0) {
+		return ret;
+	}
 
 	PMU_CTL |= PMU_CTL_BKPWEN;
 	PMU_CS &= ~PMU_CS_BLDOON;
@@ -77,10 +85,14 @@ static int gd32_bldo_init(const struct device *dev)
 {
 	const struct gd32_bldo_config *cfg = dev->config;
 	bool is_enabled;
+	int ret;
 
 	regulator_common_data_init(dev);
 
-	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
+	if (ret < 0) {
+		return ret;
+	}
 
 	is_enabled = (PMU_CS & PMU_CS_BLDORF) != 0U;
 
