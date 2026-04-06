@@ -77,6 +77,7 @@ struct dma_gd32_channel {
 	dma_callback_t callback;
 	void *user_data;
 	uint32_t direction;
+	uint32_t periph_width;
 	bool busy;
 	bool cyclic;
 };
@@ -91,6 +92,38 @@ struct dma_gd32_srcdst_config {
 	uint32_t adj;
 	uint32_t width;
 };
+
+static int dma_gd32_validate_transfer_size_and_alignment(const struct device *dev, uint32_t channel,
+							 const struct dma_config *dma_cfg,
+							 const struct dma_gd32_srcdst_config *src_cfg,
+							 const struct dma_gd32_srcdst_config *dst_cfg,
+							 const struct dma_gd32_srcdst_config *periph_cfg)
+{
+	uint32_t block_size = dma_cfg->head_block->block_size;
+
+	if ((block_size == 0U) || ((block_size % periph_cfg->width) != 0U)) {
+		LOG_ERR("%s ch%" PRIu32 " invalid block size %" PRIu32
+			" for peripheral width %" PRIu32,
+			dev->name, channel, block_size, periph_cfg->width);
+		return -EINVAL;
+	}
+
+	if ((src_cfg->addr % src_cfg->width) != 0U) {
+		LOG_ERR("%s ch%" PRIu32 " unaligned source 0x%08" PRIx32
+			" for width %" PRIu32,
+			dev->name, channel, src_cfg->addr, src_cfg->width);
+		return -EINVAL;
+	}
+
+	if ((dst_cfg->addr % dst_cfg->width) != 0U) {
+		LOG_ERR("%s ch%" PRIu32 " unaligned dest 0x%08" PRIx32
+			" for width %" PRIu32,
+			dev->name, channel, dst_cfg->addr, dst_cfg->width);
+		return -EINVAL;
+	}
+
+	return 0;
+}
 
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
 static inline uint32_t dma_gd32_fifo_threshold(uint16_t fifo_mode_control)
@@ -391,6 +424,8 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 	uint32_t periph_burst = 0U;
 	bool use_multidata = false;
 #endif
+	uint32_t item_count;
+	int ret;
 
 	if (channel >= cfg->channels) {
 		LOG_ERR("channel must be < %" PRIu32 " (%" PRIu32 ")",
@@ -495,6 +530,14 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 		break;
 	}
 
+	ret = dma_gd32_validate_transfer_size_and_alignment(dev, channel, dma_cfg, &src_cfg,
+								    &dst_cfg, periph_cfg);
+	if (ret != 0) {
+		return ret;
+	}
+
+	item_count = dma_cfg->head_block->block_size / periph_cfg->width;
+
 	gd32_dma_memory_address_config(cfg->reg, channel, memory_cfg->addr);
 	if (memory_cfg->adj == DMA_ADDR_ADJ_INCREMENT) {
 		gd32_dma_memory_increase_enable(cfg->reg, channel);
@@ -509,8 +552,12 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 		gd32_dma_periph_increase_disable(cfg->reg, channel);
 	}
 
-	gd32_dma_transfer_number_config(cfg->reg, channel,
-					dma_cfg->head_block->block_size);
+	LOG_DBG("%s ch%" PRIu32 " slot %" PRIu32 " dir %" PRIu32
+		" width m=%" PRIu32 " p=%" PRIu32 " items=%" PRIu32,
+		dev->name, channel, dma_cfg->dma_slot, dma_cfg->channel_direction,
+		memory_cfg->width, periph_cfg->width, item_count);
+
+	gd32_dma_transfer_number_config(cfg->reg, channel, item_count);
 	gd32_dma_priority_config(cfg->reg, channel,
 				 dma_gd32_priority(dma_cfg->channel_priority));
 	gd32_dma_memory_width_config(cfg->reg, channel,
@@ -571,6 +618,7 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 	data->channels[channel].callback = dma_cfg->dma_callback;
 	data->channels[channel].user_data = dma_cfg->user_data;
 	data->channels[channel].direction = dma_cfg->channel_direction;
+	data->channels[channel].periph_width = periph_cfg->width;
 	data->channels[channel].cyclic = dma_cfg->cyclic;
 
 	return 0;
@@ -594,7 +642,14 @@ static int dma_gd32_reload(const struct device *dev, uint32_t ch, uint32_t src,
 
 	gd32_dma_channel_disable(cfg->reg, ch);
 
-	gd32_dma_transfer_number_config(cfg->reg, ch, size);
+	if ((data->channels[ch].periph_width == 0U) ||
+	    ((size % data->channels[ch].periph_width) != 0U)) {
+		LOG_ERR("%s ch%" PRIu32 " invalid reload size %zu for peripheral width %" PRIu32,
+			dev->name, ch, size, data->channels[ch].periph_width);
+		return -EINVAL;
+	}
+
+	gd32_dma_transfer_number_config(cfg->reg, ch, size / data->channels[ch].periph_width);
 
 	switch (data->channels[ch].direction) {
 	case MEMORY_TO_MEMORY:
@@ -735,10 +790,10 @@ static void dma_gd32_isr(const struct device *dev)
 
 		if (errflag) {
 			status = -EIO;
-		} else if (htfflag) {
-			status = DMA_STATUS_BLOCK;
-		} else {
+		} else if (ftfflag) {
 			status = 0;
+		} else {
+			status = DMA_STATUS_BLOCK;
 		}
 
 		gd32_dma_interrupt_flag_clear(cfg->reg, i,
@@ -748,6 +803,10 @@ static void dma_gd32_isr(const struct device *dev)
 		if (!data->channels[i].cyclic && (ftfflag || errflag)) {
 			data->channels[i].busy = false;
 		}
+
+		LOG_DBG("%s ch%" PRIu32 " isr err=0x%x htf=0x%x ftf=0x%x cnt=%" PRIu32 " status=%d",
+			dev->name, i, errflag, htfflag, ftfflag,
+			gd32_dma_transfer_number_get(cfg->reg, i), status);
 
 		if (data->channels[i].callback) {
 			data->channels[i].callback(dev, data->channels[i].user_data, i,

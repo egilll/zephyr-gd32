@@ -6,7 +6,8 @@ config SPI_GD32
 	default y
 	depends on DT_HAS_GD_GD32_SPI_ENABLED
 	select PINCTRL
-	select SPI_GD32_INTERRUPT
+	select GPIO if $(dt_compat_any_has_prop,$(DT_COMPAT_GD_GD32_SPI),cs-gpios)
+	select SPI_GD32_INTERRUPT if SPI_ASYNC
 	help
 	  Enables Gigadevice GD32 SPI driver.
 
@@ -15,14 +16,14 @@ if SPI_GD32
 config SPI_GD32_INTERRUPT
 	bool "GD32 MCU SPI Interrupt Support"
 	default y if SPI_ASYNC
-	default y if SPI_GD32_DMA
 	help
 	  Enable the interrupt driven mode for SPI instances
 
 config SPI_GD32_DMA
 	bool "GD32 MCU SPI DMA Support"
-	select DMA
 	select SPI_GD32_INTERRUPT
+	select DMA
+	select CACHE_MANAGEMENT if CPU_HAS_DCACHE
 	help
 	  Use the DMA for SPI transfer
 	  that enable dma channels in their device tree node.
