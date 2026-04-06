@@ -18,7 +18,6 @@
 #include <soc.h>
 
 #define GD32_BLDO_READY_TIMEOUT_MS 100U
-#define GD32_BLDO_POLL_US          50U
 
 struct gd32_bldo_config {
 	struct regulator_common_config common;
@@ -51,7 +50,7 @@ static int gd32_bldo_enable(const struct device *dev)
 			return -ETIMEDOUT;
 		}
 
-		k_busy_wait(GD32_BLDO_POLL_US);
+		k_msleep(1);
 	}
 
 	PMU_CTL &= ~PMU_CTL_BKPWEN;
