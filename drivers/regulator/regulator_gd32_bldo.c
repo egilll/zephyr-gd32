@@ -16,6 +16,7 @@
 #include <zephyr/logging/log.h>
 
 #include <soc.h>
+#include <gd32_backup_domain.h>
 
 #define GD32_BLDO_READY_TIMEOUT_MS 100U
 
@@ -40,20 +41,20 @@ static int gd32_bldo_enable(const struct device *dev)
 
 	uint32_t start_ms = k_uptime_get_32();
 
-	PMU_CTL |= PMU_CTL_BKPWEN;
+	gd32_backup_domain_enable_access();
 	PMU_CS |= PMU_CS_BLDOON;
 
 	while ((PMU_CS & PMU_CS_BLDORF) == 0U) {
 		if ((k_uptime_get_32() - start_ms) > GD32_BLDO_READY_TIMEOUT_MS) {
 			PMU_CS &= ~PMU_CS_BLDOON;
-			PMU_CTL &= ~PMU_CTL_BKPWEN;
+			gd32_backup_domain_disable_access();
 			return -ETIMEDOUT;
 		}
 
 		k_msleep(1);
 	}
 
-	PMU_CTL &= ~PMU_CTL_BKPWEN;
+	gd32_backup_domain_disable_access();
 
 	return 0;
 }
@@ -68,9 +69,9 @@ static int gd32_bldo_disable(const struct device *dev)
 		return ret;
 	}
 
-	PMU_CTL |= PMU_CTL_BKPWEN;
+	gd32_backup_domain_enable_access();
 	PMU_CS &= ~PMU_CS_BLDOON;
-	PMU_CTL &= ~PMU_CTL_BKPWEN;
+	gd32_backup_domain_disable_access();
 
 	return 0;
 }
