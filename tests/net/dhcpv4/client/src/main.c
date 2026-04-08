@@ -222,6 +222,7 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define DHCP_OPTION_SUBNET_MASK	1
 #define DHCP_OPTION_ROUTER	3
 #define DHCP_OPTION_DNS_SERVER	6
+#define DHCP_OPTION_NTP_SERVER	42
 #define DHCP_OPTION_LEASE_TIME	51
 #define DHCP_OPTION_OVERLOAD	52
 #define PAD			0
@@ -241,9 +242,12 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define OPTION_INVALID		254
 
 #define DHCP_BOOT_HEADER_SIZE	44
+#define DHCP_SNAME_SIZE		64
+#define DHCP_FILE_SIZE		128
 
 enum dhcp_reply_mode {
 	DHCP_REPLY_STANDARD,
+	DHCP_REPLY_EMPTY_ROUTER,
 	DHCP_REPLY_OVERLOADED,
 };
 
@@ -502,6 +506,72 @@ fail:
 	return NULL;
 }
 
+static struct net_pkt *prepare_dhcp_empty_router_reply(struct net_if *iface,
+						       uint32_t xid,
+						       const unsigned char *template,
+						       uint8_t msg_type)
+{
+	static const uint8_t subnet_mask[] = { 255, 255, 255, 0 };
+	static const uint8_t renewal_time[] = { 0x00, 0x00, 0x54, 0x60 };
+	static const uint8_t rebinding_time[] = { 0x00, 0x00, 0x93, 0xa8 };
+	static const uint8_t lease_time[] = { 0x00, 0x00, 0xa8, 0xc0 };
+	static const uint8_t server_id[] = { 10, 184, 9, 1 };
+	static const uint8_t dns_servers[] = {
+		10, 248, 2, 1,
+		163, 33, 253, 68,
+		10, 184, 9, 1,
+	};
+	struct net_pkt *pkt;
+
+	pkt = net_pkt_alloc_with_buffer(iface, 512, NET_AF_INET,
+					NET_IPPROTO_UDP, K_FOREVER);
+	if (!pkt) {
+		return NULL;
+	}
+
+	net_pkt_set_ipv4_ttl(pkt, 0xFF);
+
+	if (net_ipv4_create(pkt, &server_addr, &client_addr) ||
+	    net_udp_create(pkt, net_htons(SERVER_PORT), net_htons(CLIENT_PORT))) {
+		goto fail;
+	}
+
+	if (net_pkt_write(pkt, template, 4) ||
+	    net_pkt_write_be32(pkt, xid) ||
+	    net_pkt_write(pkt, template + 8, DHCP_BOOT_HEADER_SIZE - 8) ||
+	    net_pkt_write(pkt, template + DHCP_BOOT_HEADER_SIZE,
+			  DHCP_SNAME_SIZE + DHCP_FILE_SIZE) ||
+	    net_pkt_write(pkt, "\x63\x82\x53\x63", 4) ||
+	    !write_dhcp_option(pkt, MSG_TYPE, &msg_type, 1) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_RENEWAL,
+			       renewal_time, sizeof(renewal_time)) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_REBINDING,
+			       rebinding_time, sizeof(rebinding_time)) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_LEASE_TIME,
+			       lease_time, sizeof(lease_time)) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_SERVER_ID,
+			       server_id, sizeof(server_id)) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_SUBNET_MASK,
+			       subnet_mask, sizeof(subnet_mask)) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_ROUTER, NULL, 0) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_DNS_SERVER,
+			       dns_servers, sizeof(dns_servers)) ||
+	    !write_dhcp_option(pkt, DHCP_OPTION_NTP_SERVER, NULL, 0) ||
+	    net_pkt_write_u8(pkt, END)) {
+		goto fail;
+	}
+
+	net_pkt_cursor_init(pkt);
+
+	net_ipv4_finalize(pkt, NET_IPPROTO_UDP);
+
+	return pkt;
+
+fail:
+	net_pkt_unref(pkt);
+	return NULL;
+}
+
 static int parse_dhcp_message(struct net_pkt *pkt, struct dhcp_msg *msg)
 {
 	bool found_type = false;
@@ -616,6 +686,10 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 			rpkt = prepare_dhcp_overloaded_reply(net_pkt_iface(pkt),
 							     msg.xid, offer,
 							     NET_DHCPV4_MSG_TYPE_OFFER);
+		} else if (reply_mode == DHCP_REPLY_EMPTY_ROUTER) {
+			rpkt = prepare_dhcp_empty_router_reply(net_pkt_iface(pkt),
+							       msg.xid, offer,
+							       NET_DHCPV4_MSG_TYPE_OFFER);
 		} else {
 			rpkt = prepare_dhcp_offer(net_pkt_iface(pkt), msg.xid);
 		}
@@ -633,6 +707,10 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 			rpkt = prepare_dhcp_overloaded_reply(net_pkt_iface(pkt),
 							     msg.xid, ack,
 							     NET_DHCPV4_MSG_TYPE_ACK);
+		} else if (reply_mode == DHCP_REPLY_EMPTY_ROUTER) {
+			rpkt = prepare_dhcp_empty_router_reply(net_pkt_iface(pkt),
+							       msg.xid, ack,
+							       NET_DHCPV4_MSG_TYPE_ACK);
 		} else {
 			rpkt = prepare_dhcp_ack(net_pkt_iface(pkt), msg.xid);
 		}
@@ -1024,6 +1102,8 @@ ZTEST(dhcpv4_tests, test_dhcp_overloaded_options)
 	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
 	zassert_not_null(iface, "Interface not available");
 
+	iface->config.dhcpv4.request_server_addr.s_addr = NET_INADDR_ANY;
+	iface->config.dhcpv4.attempts = 0U;
 	reply_mode = DHCP_REPLY_OVERLOADED;
 	discover_prl_present = false;
 	request_prl_present = false;
@@ -1060,6 +1140,67 @@ ZTEST(dhcpv4_tests, test_dhcp_overloaded_options)
 
 	zassert_equal(net_if_ipv4_get_gw(iface).s_addr, expected_gw.s_addr,
 		      "Gateway from overloaded options not applied");
+
+	k_event_set(&events, 0U);
+
+	net_dhcpv4_stop(iface);
+
+	evt = k_event_wait_all(&events,
+			       EVT_DHCP_STOP | EVT_ADDR_DEL |
+			       EVT_DNS_SERVER1_DEL | EVT_DNS_SERVER2_DEL |
+			       EVT_DNS_SERVER3_DEL,
+			       false, WAIT_TIME);
+	zassert_equal(evt,
+		      EVT_DHCP_STOP | EVT_ADDR_DEL |
+		      EVT_DNS_SERVER1_DEL | EVT_DNS_SERVER2_DEL |
+		      EVT_DNS_SERVER3_DEL,
+		      "Missing DHCP stop or deleted address");
+}
+
+ZTEST(dhcpv4_tests, test_dhcp_zero_length_router_option)
+{
+	const struct net_in_addr any = { { { 0, 0, 0, 0 } } };
+	struct net_if *iface;
+	uint32_t expected_events;
+	uint32_t evt;
+
+	setup_option_callbacks();
+
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+
+	net_if_ipv4_set_gw(iface, &any);
+	reply_mode = DHCP_REPLY_EMPTY_ROUTER;
+	discover_prl_present = false;
+	request_prl_present = false;
+	discover_prl_len = 0U;
+	request_prl_len = 0U;
+	k_event_set(&events, 0U);
+
+	net_dhcpv4_start(iface);
+
+	evt = k_event_wait(&events, EVT_DHCP_START, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_START, "Missing DHCP start");
+
+	evt = k_event_wait_all(&events,
+			       EVT_DNS_SERVER1_ADD | EVT_DNS_SERVER2_ADD |
+			       EVT_DNS_SERVER3_ADD,
+			       false, WAIT_TIME);
+	zassert_equal(evt,
+		      EVT_DNS_SERVER1_ADD | EVT_DNS_SERVER2_ADD |
+		      EVT_DNS_SERVER3_ADD,
+		      "Missing DNS server(s) %08x", evt);
+
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Missing DHCP bound");
+
+	expected_events = IS_ENABLED(CONFIG_NET_DHCPV4_INIT_REBOOT) ?
+		EVT_DHCP_ACK : EVT_DHCP_OFFER | EVT_DHCP_ACK;
+	evt = k_event_wait_all(&events, expected_events, false, WAIT_TIME);
+	zassert_equal(evt, expected_events, "Missing offer or ack %08x", evt);
+
+	zassert_equal(net_if_ipv4_get_gw(iface).s_addr, any.s_addr,
+		      "Gateway should stay unset for empty router option");
 
 	k_event_set(&events, 0U);
 
