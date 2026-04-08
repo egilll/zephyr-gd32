@@ -219,7 +219,10 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 
 #define SERVER_PORT		67
 #define CLIENT_PORT		68
+#define PAD			0
+#define END			255
 #define MSG_TYPE		53
+#define PARAM_REQ_LIST		55
 #define DISCOVER		1
 #define REQUEST			3
 #define OPTION_DOMAIN		15
@@ -232,10 +235,19 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 struct dhcp_msg {
 	uint32_t xid;
 	uint8_t type;
+	bool prl_present;
+	uint8_t prl_len;
+	uint8_t prl[16];
 };
 
 static uint32_t offer_xid;
 static uint32_t request_xid;
+static bool discover_prl_present;
+static bool request_prl_present;
+static uint8_t discover_prl_len;
+static uint8_t request_prl_len;
+static uint8_t discover_prl[16];
+static uint8_t request_prl[16];
 
 #define EVT_ADDR_ADD        BIT(0)
 #define EVT_ADDR_DEL        BIT(1)
@@ -382,6 +394,8 @@ fail:
 
 static int parse_dhcp_message(struct net_pkt *pkt, struct dhcp_msg *msg)
 {
+	bool found_type = false;
+
 	/* Skip IPv4 and UDP headers */
 	if (net_pkt_skip(pkt, NET_IPV4UDPH_LEN)) {
 		return 0;
@@ -406,7 +420,15 @@ static int parse_dhcp_message(struct net_pkt *pkt, struct dhcp_msg *msg)
 		uint8_t type;
 
 		if (net_pkt_read_u8(pkt, &type)) {
-			return 0;
+			return found_type ? 1 : 0;
+		}
+
+		if (type == END) {
+			return found_type ? 1 : 0;
+		}
+
+		if (type == PAD) {
+			continue;
 		}
 
 		if (type == MSG_TYPE) {
@@ -422,7 +444,29 @@ static int parse_dhcp_message(struct net_pkt *pkt, struct dhcp_msg *msg)
 				request_xid = msg->xid;
 			}
 
-			return 1;
+			found_type = true;
+			continue;
+		}
+
+		if (type == PARAM_REQ_LIST) {
+			if (net_pkt_read_u8(pkt, &length)) {
+				return 0;
+			}
+
+			msg->prl_present = true;
+			msg->prl_len = MIN(length, sizeof(msg->prl));
+
+			if (msg->prl_len > 0U &&
+			    net_pkt_read(pkt, msg->prl, msg->prl_len)) {
+				return 0;
+			}
+
+			if (length > msg->prl_len &&
+			    net_pkt_skip(pkt, length - msg->prl_len)) {
+				return 0;
+			}
+
+			continue;
 		}
 
 		if (net_pkt_read_u8(pkt, &length)) {
@@ -453,6 +497,10 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 	parse_dhcp_message(pkt, &msg);
 
 	if (msg.type == DISCOVER) {
+		discover_prl_present = msg.prl_present;
+		discover_prl_len = msg.prl_len;
+		memcpy(discover_prl, msg.prl, sizeof(discover_prl));
+
 		/* Reply with DHCPv4 offer message */
 		rpkt = prepare_dhcp_offer(net_pkt_iface(pkt), msg.xid);
 		if (!rpkt) {
@@ -460,6 +508,10 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 		}
 		k_event_post(&events, EVT_DHCP_OFFER);
 	} else if (msg.type == REQUEST) {
+		request_prl_present = msg.prl_present;
+		request_prl_len = msg.prl_len;
+		memcpy(request_prl, msg.prl, sizeof(request_prl));
+
 		/* Reply with DHCPv4 ACK message */
 		rpkt = prepare_dhcp_ack(net_pkt_iface(pkt), msg.xid);
 		if (!rpkt) {
@@ -741,6 +793,10 @@ ZTEST(dhcpv4_tests, test_dhcp)
 
 	for (int loop = 0; loop < 2; ++loop) {
 		LOG_DBG("Running DHCPv4 loop %d", loop);
+		discover_prl_present = false;
+		request_prl_present = false;
+		discover_prl_len = 0U;
+		request_prl_len = 0U;
 		net_dhcpv4_start(iface);
 
 		evt = k_event_wait(&events, EVT_DHCP_START, false, WAIT_TIME);
@@ -784,11 +840,21 @@ ZTEST(dhcpv4_tests, test_dhcp)
 				      "Offer/Request xid mismatch, "
 				      "Offer 0x%08x, Request 0x%08x",
 				      offer_xid, request_xid);
+
+			zassert_true(discover_prl_present, "Missing PRL in discover");
+			zassert_true(request_prl_present, "Missing PRL in request");
+			zassert_equal(discover_prl_len, request_prl_len,
+				      "Discover/request PRL length mismatch");
+			zassert_mem_equal(discover_prl, request_prl, discover_prl_len,
+					  "Discover/request PRL mismatch");
 		} else {
 			/* An init-reboot was done */
 			evt = k_event_wait(&events, EVT_DHCP_OFFER | EVT_DHCP_ACK, false,
 					   WAIT_TIME);
 			zassert_equal(evt, EVT_DHCP_ACK, "Ack only expected %08x", evt);
+			zassert_false(discover_prl_present,
+				      "Unexpected discover during init-reboot");
+			zassert_true(request_prl_present, "Missing PRL in request");
 		}
 
 		/* Clear all events */
