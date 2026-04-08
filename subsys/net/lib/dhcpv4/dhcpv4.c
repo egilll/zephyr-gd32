@@ -1262,6 +1262,11 @@ static bool dhcpv4_parse_options_field(struct net_pkt *pkt,
 			 * of preference.  Hence we choose the first
 			 * and skip the rest.
 			 */
+			if (length == 0U) {
+				NET_WARN("options_ntp_server, empty");
+				break;
+			}
+
 			if (length % 4 != 0U) {
 				NET_ERR("options_log_server, bad length");
 				return false;

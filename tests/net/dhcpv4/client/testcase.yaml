@@ -10,6 +10,10 @@ tests:
   net.dhcpv4_client.preempt:
     extra_configs:
       - CONFIG_NET_TC_THREAD_PREEMPTIVE=y
+  net.dhcpv4_client.sntp:
+    extra_configs:
+      - CONFIG_NET_SOCKETS=y
+      - CONFIG_SNTP=y
   net.dhcpv4_client.optioncbs:
     extra_configs:
       - CONFIG_NET_DHCPV4_OPTION_CALLBACKS=y
