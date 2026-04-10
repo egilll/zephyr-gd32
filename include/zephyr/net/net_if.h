@@ -540,6 +540,11 @@ struct net_if_dhcpv4 {
 	/** Number of attempts made for REQUEST and RENEWAL messages */
 	uint8_t attempts;
 
+	/** Uptime at which the current acquisition or renewal began (ms).
+	 *  Used to populate the 'secs' field per RFC 2131 section 4.4.1.
+	 */
+	int64_t acquisition_start;
+
 	/** The address of the server the request is sent to */
 	struct net_in_addr request_server_addr;
 

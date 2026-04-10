@@ -330,6 +330,17 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	msg->flags = IS_ENABLED(CONFIG_NET_DHCPV4_ACCEPT_UNICAST) ?
 		     net_htons(DHCPV4_MSG_UNICAST) : net_htons(DHCPV4_MSG_BROADCAST);
 
+	{
+		int64_t elapsed_ms = k_uptime_get() -
+				     iface->config.dhcpv4.acquisition_start;
+		uint32_t elapsed_secs = (uint32_t)(elapsed_ms / 1000);
+
+		if (elapsed_secs > UINT16_MAX) {
+			elapsed_secs = UINT16_MAX;
+		}
+		msg->secs = net_htons((uint16_t)elapsed_secs);
+	}
+
 	if (ciaddr) {
 		/* The ciaddr field was zero'd out above, if we are
 		 * asked to send a ciaddr then fill it in now
@@ -723,6 +734,7 @@ static void dhcpv4_enter_selecting(struct net_if *iface)
 	iface->config.dhcpv4.server_id.s_addr = NET_INADDR_ANY;
 	iface->config.dhcpv4.requested_ip.s_addr = NET_INADDR_ANY;
 
+	iface->config.dhcpv4.acquisition_start = k_uptime_get();
 	iface->config.dhcpv4.state = NET_DHCPV4_SELECTING;
 	NET_DBG("enter state=%s",
 		net_dhcpv4_state_name(iface->config.dhcpv4.state));
@@ -786,6 +798,7 @@ static void dhcpv4_enter_renewing(struct net_if *iface)
 {
 	iface->config.dhcpv4.state = NET_DHCPV4_RENEWING;
 	iface->config.dhcpv4.attempts = 0U;
+	iface->config.dhcpv4.acquisition_start = k_uptime_get();
 	NET_DBG("enter state=%s",
 		net_dhcpv4_state_name(iface->config.dhcpv4.state));
 }
@@ -1949,6 +1962,7 @@ static void dhcpv4_start_internal(struct net_if *iface, bool first_start)
 		 * startup and increment it on each new request.
 		 */
 		iface->config.dhcpv4.xid = entropy;
+		iface->config.dhcpv4.acquisition_start = k_uptime_get();
 
 		/* Use default */
 		if (first_start) {
