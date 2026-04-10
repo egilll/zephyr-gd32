@@ -202,6 +202,24 @@ static bool dhcpv4_add_vendor_class_id(struct net_pkt *pkt,
 }
 #endif
 
+/* Add DHCPv4 Client Identifier (Option 61): hardware type + MAC address.
+ * RFC 2132 section 9.14.
+ */
+static bool dhcpv4_add_client_id(struct net_pkt *pkt, struct net_if *iface)
+{
+	const struct net_linkaddr *lladdr = net_if_get_link_addr(iface);
+	uint8_t client_id_len = 1 + lladdr->len; /* htype + hwaddr */
+
+	if (net_pkt_write_u8(pkt, DHCPV4_OPTIONS_CLIENT_ID) ||
+	    net_pkt_write_u8(pkt, client_id_len) ||
+	    net_pkt_write_u8(pkt, HARDWARE_ETHERNET_TYPE) ||
+	    net_pkt_write(pkt, lladdr->addr, lladdr->len)) {
+		return false;
+	}
+
+	return true;
+}
+
 /* Add DHCPv4 Options end, rest of the message can be padded with zeros */
 static inline bool dhcpv4_add_end(struct net_pkt *pkt)
 {
@@ -241,7 +259,7 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 {
 	NET_PKT_DATA_ACCESS_DEFINE(dhcp_access, struct dhcp_msg);
 	const struct net_in_addr *addr;
-	size_t size = DHCPV4_MESSAGE_SIZE;
+	size_t size = DHCPV4_MESSAGE_SIZE + DHCPV4_OLV_MSG_CLIENT_ID;
 	struct net_pkt *pkt;
 	struct dhcp_msg *msg;
 #if defined(CONFIG_NET_HOSTNAME_ENABLE)
@@ -330,7 +348,8 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	if (!dhcpv4_add_sname(pkt) ||
 	    !dhcpv4_add_file(pkt) ||
 	    !dhcpv4_add_cookie(pkt) ||
-	    !dhcpv4_add_msg_type(pkt, type)) {
+	    !dhcpv4_add_msg_type(pkt, type) ||
+	    !dhcpv4_add_client_id(pkt, iface)) {
 		goto fail;
 	}
 
