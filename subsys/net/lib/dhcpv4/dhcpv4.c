@@ -202,6 +202,24 @@ static bool dhcpv4_add_vendor_class_id(struct net_pkt *pkt,
 }
 #endif
 
+/* Add DHCPv4 Maximum DHCP Message Size (Option 57).
+ * RFC 2132 section 9.10.
+ */
+static bool dhcpv4_add_max_message_size(struct net_pkt *pkt,
+					struct net_if *iface)
+{
+	uint16_t mtu = net_if_get_mtu(iface);
+
+	if (mtu < NET_IPV4UDPH_LEN) {
+		mtu = NET_IPV4UDPH_LEN;
+	}
+
+	uint16_t max_size = net_htons(mtu - NET_IPV4UDPH_LEN);
+
+	return dhcpv4_add_option_length_value(pkt, DHCPV4_OPTIONS_MAX_MSG_SIZE,
+					      2, &max_size);
+}
+
 /* Add DHCPv4 Client Identifier (Option 61): hardware type + MAC address.
  * RFC 2132 section 9.14.
  */
@@ -259,7 +277,8 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 {
 	NET_PKT_DATA_ACCESS_DEFINE(dhcp_access, struct dhcp_msg);
 	const struct net_in_addr *addr;
-	size_t size = DHCPV4_MESSAGE_SIZE + DHCPV4_OLV_MSG_CLIENT_ID;
+	size_t size = DHCPV4_MESSAGE_SIZE + DHCPV4_OLV_MSG_CLIENT_ID +
+		      DHCPV4_OLV_MSG_MAX_SIZE;
 	struct net_pkt *pkt;
 	struct dhcp_msg *msg;
 #if defined(CONFIG_NET_HOSTNAME_ENABLE)
@@ -360,7 +379,8 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	    !dhcpv4_add_file(pkt) ||
 	    !dhcpv4_add_cookie(pkt) ||
 	    !dhcpv4_add_msg_type(pkt, type) ||
-	    !dhcpv4_add_client_id(pkt, iface)) {
+	    !dhcpv4_add_client_id(pkt, iface) ||
+	    !dhcpv4_add_max_message_size(pkt, iface)) {
 		goto fail;
 	}
 
