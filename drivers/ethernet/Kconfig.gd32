@@ -19,18 +19,20 @@ if ETH_GD32
 config ETH_GD32_RX_DESC_COUNT
 	int "RX DMA descriptor count"
 	range 8 128
-	default 32
+	default 12
 	help
-	  Number of RX descriptors in the ENET DMA chain. The driver reserves one
-	  RX `net_buf` per descriptor from the global RX buffer pool.
+	  Number of RX descriptors in the ENET DMA ring. Each descriptor owns two
+	  private DMA buffers sized from CONFIG_NET_BUF_DATA_SIZE when fixed-size
+	  network buffers are enabled.
 
 config ETH_GD32_TX_DESC_COUNT
 	int "TX DMA descriptor count"
 	range 4 64
-	default 16
+	default 12
 	help
-	  Number of TX descriptors in the ENET DMA ring. TX is zero-copy and may
-	  consume multiple descriptors per frame depending on fragmentation.
+	  Number of TX descriptors in the ENET DMA ring. TX uses zero-copy when
+	  packet fragments are DMA-safe and can map up to two buffers per
+	  descriptor before falling back to private DMA bounce buffers.
 
 config ETH_GD32_ACCEPT_ALL_MULTICAST
 	bool "Accept all multicast frames"
@@ -52,12 +54,13 @@ config ETH_GD32_TX_OSF
 
 config ETH_GD32_RX_STORE_FORWARD
 	bool "Rx store-and-forward"
-	default n
+	default y
 	help
 	  When enabled, RxDMA transfers a frame from the RxFIFO to memory only
 	  after the full frame is received into the FIFO. Disabling enables
 	  cut-through mode, which can reduce latency but may forward frames with
-	  errors (see the reference manual for details).
+	  errors and is less tolerant of burst pressure (see the reference manual
+	  for details).
 
 choice
 	prompt "Rx cut-through threshold"
@@ -82,11 +85,12 @@ endchoice
 
 config ETH_GD32_TX_STORE_FORWARD
 	bool "Tx store-and-forward"
-	default n
+	default y
 	help
 	  When enabled, transmission on the wire starts after the entire frame is
 	  transferred into the TxFIFO. Disabling enables cut-through mode, which
-	  starts transmitting once the TxFIFO reaches a threshold.
+	  starts transmitting once the TxFIFO reaches a threshold and is more
+	  exposed to transmit underflow.
 
 choice
 	prompt "Tx cut-through threshold"
