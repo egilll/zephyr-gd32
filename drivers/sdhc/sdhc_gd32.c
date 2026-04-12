@@ -1121,7 +1121,7 @@ static int gd32_sdhc_start_dma(const struct device *dev, bool write, void *dma_b
 		blk.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 	}
 
-	blk.block_size = (uint32_t)(dma_len / sizeof(uint32_t));
+	blk.block_size = (uint32_t)dma_len;
 	/* Match the GD32 firmware library SDIO sample: `DMA_FIFO_4_WORD`. */
 	blk.fifo_mode_control = 3U;
 
