@@ -872,7 +872,7 @@ static const struct ethernet_api api_funcs = {
 #define _nxp_enet_dma_desc_section
 #define _nxp_enet_dma_buffer_section
 #define _nxp_enet_driver_buffer_section
-#define driver_cache_maintain	true
+#define driver_cache_maintain	false
 #endif
 
 /* Use ENET_FRAME_MAX_VLANFRAMELEN for VLAN frame size
