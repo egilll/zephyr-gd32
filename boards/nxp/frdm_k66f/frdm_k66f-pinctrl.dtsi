@@ -1,0 +1,69 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+#include <nxp/kinetis/MK66FN2M0VMD18-pinctrl.h>
+
+&pinctrl {
+	uart0_default: uart0_default {
+		group0 {
+			pinmux = <UART0_RX_PTB16>,
+				 <UART0_TX_PTB17>;
+			drive-strength = "low";
+			slew-rate = "fast";
+		};
+	};
+
+	mdio_default: mdio_default {
+		group0 {
+			pinmux = <RMII0_MDIO_PTB0>;
+			drive-strength = "low";
+			drive-open-drain;
+			bias-pull-up;
+			slew-rate = "fast";
+		};
+
+		group1 {
+			pinmux = <RMII0_MDC_PTB1>;
+			drive-strength = "low";
+			slew-rate = "fast";
+		};
+	};
+
+	enet_default: enet_default {
+		group0 {
+			pinmux = <RMII0_RXER_PTA5>,
+				 <RMII0_RXD1_PTA12>,
+				 <RMII0_RXD0_PTA13>,
+				 <RMII0_CRS_DV_PTA14>,
+				 <RMII0_TXEN_PTA15>,
+				 <RMII0_TXD0_PTA16>,
+				 <RMII0_TXD1_PTA17>;
+			drive-strength = "low";
+			slew-rate = "fast";
+		};
+
+		group1 {
+			pinmux = <ENET_1588_CLKIN_PTE26>;
+			drive-strength = "low";
+			slew-rate = "fast";
+		};
+	};
+
+	sdhc0_default: sdhc0_default {
+		group0 {
+			pinmux = <SDHC0_D1_PTE0>,
+				 <SDHC0_D0_PTE1>,
+				 <SDHC0_CMD_PTE3>,
+				 <SDHC0_D3_PTE4>,
+				 <SDHC0_D2_PTE5>;
+			drive-strength = "low";
+			bias-pull-up;
+			slew-rate = "fast";
+		};
+
+		group1 {
+			pinmux = <SDHC0_DCLK_PTE2>;
+			drive-strength = "low";
+			slew-rate = "fast";
+		};
+	};
+};

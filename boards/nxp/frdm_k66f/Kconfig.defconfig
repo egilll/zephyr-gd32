@@ -1,0 +1,21 @@
+# FRDM-K66F board
+
+# Copyright (c) 2016, Freescale Semiconductor, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_FRDM_K66F
+
+config OSC_XTAL0_FREQ
+	default 12000000
+
+config TEST_EXTRA_STACK_SIZE
+	default 128
+
+if NETWORKING
+
+config NET_L2_ETHERNET
+	default y if !MODEM
+
+endif # NETWORKING
+
+endif # BOARD_FRDM_K66F
