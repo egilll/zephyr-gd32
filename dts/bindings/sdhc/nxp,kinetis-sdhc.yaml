@@ -27,6 +27,11 @@ properties:
     description: |
       Maximum bus width supported by the board wiring.
 
+  cd-gpios:
+    type: phandle-array
+    required: false
+    description: Optional external card-detect GPIO
+
   pinctrl-0:
     required: true
 

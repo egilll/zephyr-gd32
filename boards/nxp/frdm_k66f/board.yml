@@ -1,0 +1,6 @@
+board:
+  name: frdm_k66f
+  full_name: FRDM-K66F
+  vendor: nxp
+  socs:
+    - name: mk66f18

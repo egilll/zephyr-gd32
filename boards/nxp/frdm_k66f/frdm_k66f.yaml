@@ -1,0 +1,13 @@
+identifier: frdm_k66f
+name: NXP FRDM-K66F
+type: mcu
+arch: arm
+ram: 256
+flash: 2048
+toolchain:
+  - zephyr
+  - gnuarmemb
+supported:
+  - dma
+  - netif:eth
+vendor: nxp
