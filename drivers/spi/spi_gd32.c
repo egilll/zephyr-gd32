@@ -90,6 +90,7 @@ struct spi_gd32_config {
 };
 
 struct spi_gd32_data {
+	const struct device *dev;
 	struct spi_context ctx;
 	uint8_t dfs;
 	size_t frames_left;
@@ -102,6 +103,11 @@ struct spi_gd32_data {
 	struct spi_gd32_dma_data dma[NUM_OF_DIRECTION];
 #endif
 	bool reset_needed;
+#ifdef CONFIG_SPI_RTIO
+	struct spi_rtio *rtio_ctx;
+	struct k_work rtio_work;
+	bool rtio_active;
+#endif
 };
 
 #ifdef CONFIG_SPI_GD32_DMA
@@ -120,10 +126,21 @@ static int spi_gd32_start_interrupt_transfer(const struct device *dev);
 static void spi_gd32_isr(const struct device *dev);
 #endif
 static int spi_gd32_polling_transfer(const struct device *dev);
+static int spi_gd32_cleanup_transfer(const struct device *dev, int status);
+static int spi_gd32_configure(const struct device *dev, const struct spi_config *config);
+static enum spi_gd32_xfer_mode spi_gd32_select_xfer_mode(const struct device *dev,
+							 const struct spi_buf_set *tx_bufs,
+							 const struct spi_buf_set *rx_bufs);
+static int spi_gd32_start_transfer(const struct device *dev);
 static bool spi_gd32_can_write_frame(const struct spi_gd32_data *data);
 static bool spi_gd32_is_slave(const struct spi_gd32_data *data);
 static bool spi_gd32_is_rx_only(const struct spi_gd32_data *data);
 static bool spi_gd32_shift_slave(const struct device *dev, uint32_t *stat);
+#ifdef CONFIG_SPI_RTIO
+static void spi_gd32_iodev_complete(const struct device *dev, int status);
+static void spi_gd32_iodev_start(const struct device *dev);
+static void spi_gd32_rtio_work_handler(struct k_work *work);
+#endif
 
 static inline uint32_t spi_gd32_stat(const struct spi_gd32_config *cfg)
 {
@@ -793,6 +810,227 @@ static int spi_gd32_cleanup_transfer(const struct device *dev, int status)
 	return 0;
 }
 
+#ifdef CONFIG_SPI_RTIO
+static int spi_gd32_cleanup_transfer_step(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	int status = 0;
+
+	spi_gd32_stop_transfer_engine(dev);
+
+	if (!spi_gd32_is_slave(data)) {
+		status = spi_gd32_wait_until_idle(dev);
+		if (status != 0) {
+			spi_gd32_latch_fatal(data, status);
+			return status;
+		}
+	}
+
+	spi_gd32_flush_stale_status(cfg);
+	return 0;
+}
+
+static int spi_gd32_iodev_setup_buffers(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_rtio *rtio_ctx = data->rtio_ctx;
+	struct rtio_sqe *sqe = &rtio_ctx->txn_curr->sqe;
+	struct spi_buf tx_buf = { 0 };
+	struct spi_buf rx_buf = { 0 };
+	struct spi_buf_set tx_bufs = {
+		.buffers = &tx_buf,
+		.count = 1U,
+	};
+	struct spi_buf_set rx_bufs = {
+		.buffers = &rx_buf,
+		.count = 1U,
+	};
+	const struct spi_buf_set *tx_set = NULL;
+	const struct spi_buf_set *rx_set = NULL;
+	uint8_t dfs;
+	int ret;
+
+	switch (sqe->op) {
+	case RTIO_OP_RX:
+		rx_buf.buf = sqe->rx.buf;
+		rx_buf.len = sqe->rx.buf_len;
+		rx_set = &rx_bufs;
+		break;
+	case RTIO_OP_TX:
+		tx_buf.buf = (void *)sqe->tx.buf;
+		tx_buf.len = sqe->tx.buf_len;
+		tx_set = &tx_bufs;
+		break;
+	case RTIO_OP_TINY_TX:
+		tx_buf.buf = (void *)sqe->tiny_tx.buf;
+		tx_buf.len = sqe->tiny_tx.buf_len;
+		tx_set = &tx_bufs;
+		break;
+	case RTIO_OP_TXRX:
+		tx_buf.buf = (void *)sqe->txrx.tx_buf;
+		tx_buf.len = sqe->txrx.buf_len;
+		rx_buf.buf = sqe->txrx.rx_buf;
+		rx_buf.len = sqe->txrx.buf_len;
+		tx_set = &tx_bufs;
+		rx_set = &rx_bufs;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	dfs = SPI_WORD_SIZE_GET(data->ctx.config->operation) > 8U ? 2U : 1U;
+
+	ret = spi_gd32_validate_buffers(tx_set, dfs);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = spi_gd32_validate_buffers(rx_set, dfs);
+	if (ret != 0) {
+		return ret;
+	}
+
+	data->xfer_mode = spi_gd32_select_xfer_mode(dev, tx_set, rx_set);
+	spi_context_buffers_setup(&data->ctx, tx_set, rx_set, dfs);
+	spi_gd32_prepare_transfer(dev);
+
+	return 0;
+}
+
+static int spi_gd32_iodev_prepare_start(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_rtio *rtio_ctx = data->rtio_ctx;
+	struct rtio_iodev_sqe *txn_curr = rtio_ctx->txn_curr;
+	struct spi_dt_spec *spi_dt_spec;
+	int ret;
+
+	if (txn_curr == NULL) {
+		return -EINVAL;
+	}
+
+	spi_dt_spec = txn_curr->sqe.iodev->data;
+
+	if (!data->rtio_active) {
+		spi_context_lock(&data->ctx, false, NULL, NULL, &spi_dt_spec->config);
+		data->rtio_active = true;
+
+		ret = spi_gd32_configure(dev, &spi_dt_spec->config);
+		if (ret != 0) {
+			return ret;
+		}
+	} else if (txn_curr->sqe.iodev != rtio_ctx->txn_head->sqe.iodev) {
+		return -EINVAL;
+	}
+
+	ret = spi_gd32_iodev_setup_buffers(dev);
+	if (ret != 0) {
+		return ret;
+	}
+
+	if (data->frames_left == 0U) {
+		return 0;
+	}
+
+	return 0;
+}
+
+static void spi_gd32_iodev_start(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_rtio *rtio_ctx = data->rtio_ctx;
+	bool new_transaction = !data->rtio_active;
+	int ret;
+
+	ret = spi_gd32_iodev_prepare_start(dev);
+	if (ret != 0) {
+		goto out_error;
+	}
+
+	if (data->frames_left == 0U) {
+		spi_gd32_iodev_complete(dev, 0);
+		return;
+	}
+
+	ret = spi_gd32_start_transfer(dev);
+	if (ret != 0) {
+		goto out_error;
+	}
+
+	if (data->xfer_mode == SPI_GD32_XFER_POLLING) {
+		ret = spi_gd32_polling_transfer(dev);
+		data->transfer_active = false;
+		spi_gd32_iodev_complete(dev, ret);
+	}
+
+	return;
+
+out_error:
+	if (data->rtio_active) {
+		ret = spi_gd32_cleanup_transfer(dev, ret);
+		data->rtio_active = false;
+		if (ret < 0) {
+			data->ctx.config = NULL;
+		}
+		spi_context_release(&data->ctx, ret);
+	} else if (new_transaction) {
+		if (ret < 0) {
+			data->ctx.config = NULL;
+		}
+		spi_context_release(&data->ctx, ret);
+	}
+
+	if (spi_rtio_complete(rtio_ctx, ret)) {
+		(void)k_work_submit(&data->rtio_work);
+	}
+}
+
+static void spi_gd32_iodev_complete(const struct device *dev, int status)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_rtio *rtio_ctx = data->rtio_ctx;
+
+	if ((status == 0) && ((rtio_ctx->txn_curr->sqe.flags & RTIO_SQE_TRANSACTION) != 0U)) {
+		status = spi_gd32_cleanup_transfer_step(dev);
+		if (status == 0) {
+			rtio_ctx->txn_curr = rtio_txn_next(rtio_ctx->txn_curr);
+			spi_gd32_iodev_start(dev);
+			return;
+		}
+	}
+
+	status = spi_gd32_cleanup_transfer(dev, status);
+	data->rtio_active = false;
+	if (status < 0) {
+		data->ctx.config = NULL;
+	}
+	spi_context_release(&data->ctx, status);
+
+	if (spi_rtio_complete(rtio_ctx, status)) {
+		(void)k_work_submit(&data->rtio_work);
+	}
+}
+
+static void spi_gd32_iodev_submit(const struct device *dev, struct rtio_iodev_sqe *iodev_sqe)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	if (spi_rtio_submit(data->rtio_ctx, iodev_sqe)) {
+		(void)k_work_submit(&data->rtio_work);
+	}
+}
+
+static void spi_gd32_rtio_work_handler(struct k_work *work)
+{
+	struct spi_gd32_data *data = CONTAINER_OF(work, struct spi_gd32_data, rtio_work);
+
+	if (!data->rtio_active && (data->rtio_ctx->txn_curr != NULL)) {
+		spi_gd32_iodev_start(data->dev);
+	}
+}
+#endif
+
 #ifdef CONFIG_SPI_ASYNC
 static void spi_gd32_complete_async(const struct device *dev, int status)
 {
@@ -814,6 +1052,13 @@ static void spi_gd32_signal_completion(const struct device *dev, int status)
 	if (!spi_gd32_mark_transfer_inactive(data)) {
 		return;
 	}
+
+#ifdef CONFIG_SPI_RTIO
+	if (data->rtio_active) {
+		spi_gd32_iodev_complete(dev, status);
+		return;
+	}
+#endif
 
 #ifdef CONFIG_SPI_ASYNC
 	if (data->ctx.asynchronous) {
@@ -1559,7 +1804,7 @@ static DEVICE_API(spi, spi_gd32_driver_api) = {
 	.transceive_async = spi_gd32_transceive_async,
 #endif
 #ifdef CONFIG_SPI_RTIO
-	.iodev_submit = spi_rtio_iodev_default_submit,
+	.iodev_submit = spi_gd32_iodev_submit,
 #endif
 	.release = spi_gd32_release,
 };
@@ -1578,6 +1823,8 @@ static int spi_gd32_init(const struct device *dev)
 		LOG_ERR("Failed to enable SPI clock");
 		return ret;
 	}
+
+	data->dev = dev;
 
 	ret = reset_line_toggle_dt(&cfg->reset);
 	if (ret != 0) {
@@ -1618,6 +1865,11 @@ static int spi_gd32_init(const struct device *dev)
 	if (ret != 0) {
 		return ret;
 	}
+
+#ifdef CONFIG_SPI_RTIO
+	k_work_init(&data->rtio_work, spi_gd32_rtio_work_handler);
+	spi_rtio_init(data->rtio_ctx, dev);
+#endif
 
 #ifdef CONFIG_SPI_GD32_INTERRUPT
 	cfg->irq_configure(dev);
@@ -1665,10 +1917,16 @@ static int spi_gd32_init(const struct device *dev)
 #define GD32_SPI_INIT(idx)                                                                         \
 	PINCTRL_DT_INST_DEFINE(idx);                                                               \
 	IF_ENABLED(CONFIG_SPI_GD32_INTERRUPT, (GD32_IRQ_CONFIGURE(idx)));                           \
+	IF_ENABLED(CONFIG_SPI_RTIO,								       \
+		   (SPI_RTIO_DEFINE(spi_gd32_rtio_##idx,				       \
+				    CONFIG_SPI_GD32_RTIO_SQ_SIZE,			       \
+				    CONFIG_SPI_GD32_RTIO_CQ_SIZE);))		       \
 	static struct spi_gd32_data spi_gd32_data_##idx = {                                        \
 		SPI_CONTEXT_INIT_LOCK(spi_gd32_data_##idx, ctx),                                   \
 		SPI_CONTEXT_INIT_SYNC(spi_gd32_data_##idx, ctx),                                   \
-		SPI_CONTEXT_CS_GPIOS_INITIALIZE(DT_DRV_INST(idx), ctx)};                           \
+		SPI_CONTEXT_CS_GPIOS_INITIALIZE(DT_DRV_INST(idx), ctx)			       \
+		IF_ENABLED(CONFIG_SPI_RTIO, (.rtio_ctx = &spi_gd32_rtio_##idx,))		       \
+	};                                                                                       \
 	static const struct spi_gd32_config spi_gd32_config_##idx = {                              \
 		.reg = DT_INST_REG_ADDR(idx),                                                      \
 		.clkid = DT_INST_CLOCKS_CELL(idx, id),                                             \
