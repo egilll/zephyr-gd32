@@ -15,7 +15,7 @@ if SPI_GD32
 
 config SPI_GD32_INTERRUPT
 	bool "GD32 MCU SPI Interrupt Support"
-	default y if SPI_ASYNC
+	default y if SPI_ASYNC || SPI_RTIO
 	help
 	  Enable the interrupt driven mode for SPI instances
 
@@ -27,5 +27,23 @@ config SPI_GD32_DMA
 	help
 	  Use the DMA for SPI transfer
 	  that enable dma channels in their device tree node.
+
+if SPI_RTIO
+
+config SPI_GD32_RTIO_SQ_SIZE
+	int "Number of available submission queue entries"
+	default 8
+	help
+	  Number of RTIO submission queue entries reserved by each GD32 SPI
+	  controller instance when native RTIO support is enabled.
+
+config SPI_GD32_RTIO_CQ_SIZE
+	int "Number of available completion queue entries"
+	default 8
+	help
+	  Number of RTIO completion queue entries reserved by each GD32 SPI
+	  controller instance when native RTIO support is enabled.
+
+endif # SPI_RTIO
 
 endif # SPI_GD32
