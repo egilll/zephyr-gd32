@@ -15,6 +15,7 @@
 		led0 = &red_led;
 		led1 = &green_led;
 		led2 = &blue_led;
+		sdhc0 = &sdhc0;
 		sw0 = &user_button_2;
 		sw1 = &user_button_3;
 		mcuboot-button0 = &user_button_2;
@@ -161,7 +162,8 @@
 	status = "okay";
 	bus-width = <4>;
 	max-bus-freq = <DT_FREQ_M(6)>;
-	cd-gpios = <&gpiod 10 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	power-delay-ms = <1000>;
+	cd-gpios = <&gpiod 10 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 	pinctrl-0 = <&sdhc0_default>;
 	pinctrl-names = "default";
 
