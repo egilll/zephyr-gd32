@@ -12,15 +12,11 @@ config SDHC_KINETIS
 
 if SDHC_KINETIS
 
-# ADMA2 needs word-aligned buffers.
 config SDHC_BUFFER_ALIGNMENT
+	default DCACHE_LINE_SIZE if DCACHE
 	default 4
-
-config SDHC_KINETIS_ADMA_TABLE_SIZE
-	int "ADMA descriptor table size (bytes)"
-	default 512
 	help
-	  Size in bytes of the static ADMA descriptor table used by the Kinetis
-	  SDHC driver.
+	  SDHC buffers should be cache-line aligned when they are placed in a
+	  cacheable region.
 
 endif # SDHC_KINETIS

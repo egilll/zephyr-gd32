@@ -29,6 +29,19 @@
 
 #include <fsl_clock.h>
 
+#define FRDM_K66F_PLLFLLSEL_IRC48MCLK 3U
+#define FRDM_K66F_SDHC_SRC_OSCERCLK   2U
+#define FRDM_K66F_ENET_TIME_SRC_CORE  0U
+#define FRDM_K66F_RMII_SRC_CLKIN      1U
+#define FRDM_K66F_LPUART_SRC_OSCERCLK 2U
+#define FRDM_K66F_TPM_SRC_PLLFLLSEL   1U
+#define FRDM_K66F_CLKOUT_SRC_FLEXBUS  0U
+#define FRDM_K66F_TRACE_SRC_MCGOUTCLK 0U
+#define FRDM_K66F_TRACE_DIV_2         1U
+#define FRDM_K66F_TRACE_FRAC_1        0U
+#define FRDM_K66F_RTC_CLKOUT_1HZ      0U
+#define FRDM_K66F_USB_CLK_HZ          48000000U
+
 static const osc_config_t oscConfig = {
 	.freq = 12000000U,
 	.capLoad = 0U,
@@ -56,11 +69,11 @@ void clock_init(void)
 	CLOCK_InitOsc0(&oscConfig);
 	CLOCK_SetXtal0Freq(oscConfig.freq);
 
+	/* Match the old SDK board clocks: keep MCGIRCLK enabled before PEE setup. */
+	CLOCK_SetInternalRefClkConfig(kMCG_IrclkEnable, kMCG_IrcSlow, 1U);
+
 	/* Boot MCG through FEI → FBE → PBE → PEE. */
 	CLOCK_BootToPeeMode(kMCG_OscselOsc, kMCG_PllClkSelPll0, &pll0Config);
-
-	/* Keep slow IRC enabled for MCGIRCLK (used by some peripherals). */
-	CLOCK_SetInternalRefClkConfig(kMCG_IrclkEnable, kMCG_IrcSlow, 1U);
 
 	/* Set final bus dividers:
 	 *   Core  = /1  (180 MHz)
@@ -73,20 +86,20 @@ void clock_init(void)
 		       SIM_CLKDIV1_OUTDIV3(2U) |
 		       SIM_CLKDIV1_OUTDIV4(6U);
 
-	/* Route SDHC clock to OSCERCLK (12 MHz).
-	 * The overlay limits max-bus-freq to 6 MHz to match this source.
-	 * Using the 180 MHz core clock causes immediate bus faults on the
-	 * first SD write — root cause is still under investigation.
+	/* Match the old SDK SIM clock-source configuration rather than relying on
+	 * reset defaults or piecemeal SOPT2 updates.
 	 */
-	SIM->SOPT2 = (SIM->SOPT2 & ~SIM_SOPT2_SDHCSRC_MASK) |
-		     SIM_SOPT2_SDHCSRC(2U);
+	CLOCK_SetPllFllSelClock(FRDM_K66F_PLLFLLSEL_IRC48MCLK, 0U, 0U);
+	CLOCK_SetRtcClkOutClock(FRDM_K66F_RTC_CLKOUT_1HZ);
+	CLOCK_EnableUsbfs0Clock(kCLOCK_UsbSrcIrc48M, FRDM_K66F_USB_CLK_HZ);
+	CLOCK_SetEnetTime0Clock(FRDM_K66F_ENET_TIME_SRC_CORE);
+	CLOCK_SetRmii0Clock(FRDM_K66F_RMII_SRC_CLKIN);
+	CLOCK_SetSdhc0Clock(FRDM_K66F_SDHC_SRC_OSCERCLK);
+	CLOCK_SetLpuartClock(FRDM_K66F_LPUART_SRC_OSCERCLK);
+	CLOCK_SetTpmClock(FRDM_K66F_TPM_SRC_PLLFLLSEL);
+	CLOCK_SetClkOutClock(FRDM_K66F_CLKOUT_SRC_FLEXBUS);
+	CLOCK_SetTraceClock(FRDM_K66F_TRACE_SRC_MCGOUTCLK, FRDM_K66F_TRACE_DIV_2,
+			    FRDM_K66F_TRACE_FRAC_1);
 
-	/* ENET: 1588 timestamp clock from OSCERCLK, RMII ref clock from
-	 * external 50 MHz oscillator (U13) via ENET_1588_CLKIN (PTE26).
-	 * Note: these are also set by the default soc.c when
-	 * CONFIG_ETH_NXP_ENET / CONFIG_ETH_NXP_ENET_RMII_EXT_CLK are enabled,
-	 * but since we override clock_init we must replicate them here.
-	 */
-	CLOCK_SetEnetTime0Clock(2U);  /* TIMESRC = OSCERCLK */
-	CLOCK_SetRmii0Clock(1U);     /* RMIISRC = ENET_1588_CLKIN */
+	SystemCoreClock = CLOCK_GetFreq(kCLOCK_CoreSysClk);
 }

@@ -32,6 +32,13 @@ properties:
     required: false
     description: Optional external card-detect GPIO
 
+  pwr-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO controlling power to the external SD card slot. When
+      present, the driver uses it to honor SDHC power mode transitions.
+
   pinctrl-0:
     required: true
 
