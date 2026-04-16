@@ -15,6 +15,7 @@
 		led0 = &red_led;
 		led1 = &green_led;
 		led2 = &blue_led;
+		rtc = &rtc;
 		sdhc0 = &sdhc0;
 		sw0 = &user_button_2;
 		sw1 = &user_button_3;
