@@ -12,9 +12,12 @@
 	compatible = "nxp,mk66f18", "nxp,k66f", "nxp,k6x";
 
 	aliases {
+		accel0 = &fxos8700;
+		gyro0 = &fxas21002;
 		led0 = &red_led;
 		led1 = &green_led;
 		led2 = &blue_led;
+		magn0 = &fxos8700;
 		rtc = &rtc;
 		sdhc0 = &sdhc0;
 		sw0 = &user_button_2;
@@ -157,6 +160,31 @@
 
 &edma0 {
 	status = "okay";
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	fxos8700: fxos8700@1d {
+		compatible = "nxp,fxos8700";
+		reg = <0x1d>;
+		int1-gpios = <&gpioc 17 GPIO_ACTIVE_LOW>;
+		int2-gpios = <&gpioc 13 GPIO_ACTIVE_LOW>;
+	};
+
+	fxas21002: fxas21002@21 {
+		compatible = "nxp,fxas21002";
+		reg = <0x21>;
+		int1-gpios = <&gpioa 29 GPIO_ACTIVE_LOW>;
+		int2-gpios = <&gpioa 28 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&i2c1 {
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-names = "default";
 };
 
 &sdhc0 {
