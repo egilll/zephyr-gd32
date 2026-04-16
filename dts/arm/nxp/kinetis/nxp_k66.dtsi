@@ -14,6 +14,17 @@
 
 / {
 	soc {
+		i2c3: i2c@400e7000 {
+			compatible = "nxp,kinetis-i2c";
+			clock-frequency = <I2C_BITRATE_STANDARD>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0x400e7000 0x1000>;
+			interrupts = <91 0>;
+			clocks = <&sim KINETIS_SIM_CLOCK(KINETIS_SIM_BUS_CLK, 0x1028, 7)>;
+			status = "disabled";
+		};
+
 		lpuart0: lpuart@400c4000 {
 			compatible = "nxp,lpuart";
 			reg = <0x400c4000 0x14>;
@@ -36,6 +47,26 @@
 			clk-source = <1>;
 			number-of-mb = <16>;
 			status = "disabled";
+		};
+
+		tpm1: pwm@400c9000 {
+			compatible = "nxp,kinetis-tpm";
+			reg = <0x400c9000 0x88>;
+			interrupts = <88 0>;
+			clocks = <&sim KINETIS_SIM_CLOCK(KINETIS_SIM_BUS_CLK, 0x103c, 25)>;
+			prescaler = <16>;
+			status = "disabled";
+			#pwm-cells = <3>;
+		};
+
+		tpm2: pwm@400ca000 {
+			compatible = "nxp,kinetis-tpm";
+			reg = <0x400ca000 0x88>;
+			interrupts = <89 0>;
+			clocks = <&sim KINETIS_SIM_CLOCK(KINETIS_SIM_BUS_CLK, 0x103c, 26)>;
+			prescaler = <16>;
+			status = "disabled";
+			#pwm-cells = <3>;
 		};
 	};
 };

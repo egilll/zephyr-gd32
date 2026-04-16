@@ -3,6 +3,26 @@
 #include <nxp/kinetis/MK66FN2M0VMD18-pinctrl.h>
 
 &pinctrl {
+	i2c0_default: i2c0_default {
+		group0 {
+			pinmux = <I2C0_SCL_PTD8>,
+				 <I2C0_SDA_PTD9>;
+			drive-strength = "low";
+			drive-open-drain;
+			slew-rate = "fast";
+		};
+	};
+
+	i2c1_default: i2c1_default {
+		group0 {
+			pinmux = <I2C1_SCL_PTC10>,
+				 <I2C1_SDA_PTC11>;
+			drive-strength = "low";
+			drive-open-drain;
+			slew-rate = "fast";
+		};
+	};
+
 	uart0_default: uart0_default {
 		group0 {
 			pinmux = <UART0_RX_PTB16>,
@@ -62,6 +82,12 @@
 
 		group1 {
 			pinmux = <SDHC0_DCLK_PTE2>;
+			drive-strength = "low";
+			slew-rate = "fast";
+		};
+
+		group2 {
+			pinmux = <SDHC0_CLKIN_PTD11>;
 			drive-strength = "low";
 			slew-rate = "fast";
 		};

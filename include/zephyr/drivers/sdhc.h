@@ -237,7 +237,6 @@ struct sdhc_host_props {
 	bool bus_4_bit_support; /**< 4 bit bus support */
 	bool hs200_support; /**< HS200 support */
 	bool hs400_support; /**< HS400 support */
-	bool no_card_power_control; /*!< Host cannot physically remove card power */
 	bool is_spi; /*!< Is the host using SPI mode */
 };
 

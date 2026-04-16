@@ -64,6 +64,7 @@ struct kinetis_sdhc_hw_snapshot {
 struct kinetis_sdhc_req {
 	struct sdhc_command *z_cmd;
 	struct sdhc_data *z_data;
+	sdhc_transfer_t hal_xfer;
 	sdhc_command_t hal_cmd;
 	sdhc_data_t hal_data;
 	uint8_t *buf;
@@ -107,12 +108,16 @@ struct kinetis_sdhc_data {
 	const struct device *dev;
 	bool cd_present;
 	struct kinetis_sdhc_req *active_req;
+	sdhc_handle_t hal_handle;
 	uint32_t adma_table[KINETIS_SDHC_ADMA_TABLE_WORDS] __aligned(KINETIS_SDHC_ADMA_ALIGNMENT);
 };
 
 static int kinetis_sdhc_sync_card_interrupts(const struct device *dev);
 static void kinetis_sdhc_arm_host_cd_interrupts(const struct device *dev, bool present);
-static void kinetis_sdhc_power_on_reset(const struct device *dev);
+static int kinetis_sdhc_reset_controller_only(const struct device *dev);
+static int kinetis_sdhc_restore_host_state(const struct device *dev);
+static int kinetis_sdhc_status_to_errno(status_t status,
+					const struct kinetis_sdhc_hw_snapshot *snapshot);
 
 static uint32_t kinetis_sdhc_initial_dma_mode(const struct kinetis_sdhc_config *cfg)
 {
@@ -192,6 +197,18 @@ static bool kinetis_sdhc_cmd_is_read(const struct sdhc_command *cmd)
 		return true;
 	case SDIO_RW_EXTENDED:
 		return (cmd->arg & BIT(31)) == 0U;
+	default:
+		return false;
+	}
+}
+
+static bool kinetis_sdhc_cmd_allowed_while_dat_busy(const struct sdhc_command *cmd)
+{
+	switch (cmd->opcode) {
+	case SD_GO_IDLE_STATE:
+	case SD_STOP_TRANSMISSION:
+	case SD_SEND_STATUS:
+		return true;
 	default:
 		return false;
 	}
@@ -318,6 +335,30 @@ static int kinetis_sdhc_set_power(const struct device *dev, enum sdhc_power powe
 	return 0;
 }
 
+static int kinetis_sdhc_wait_present_state(const struct device *dev, uint32_t mask, bool set,
+					   uint32_t timeout_ms)
+{
+	const struct kinetis_sdhc_config *cfg = dev->config;
+	int64_t deadline = (timeout_ms == SDHC_TIMEOUT_FOREVER)
+				   ? INT64_MAX
+				   : (k_uptime_get() + (int64_t)timeout_ms);
+
+	while (true) {
+		uint32_t prsstat = SDHC_GetPresentStatusFlags(cfg->base);
+		bool matched = ((prsstat & mask) == mask);
+
+		if (matched == set) {
+			return 0;
+		}
+
+		if ((timeout_ms != SDHC_TIMEOUT_FOREVER) && (k_uptime_get() >= deadline)) {
+			return -ETIMEDOUT;
+		}
+
+		k_sleep(K_USEC(KINETIS_SDHC_RECOVERY_POLL_US));
+	}
+}
+
 static uint32_t kinetis_sdhc_src_clock_hz(void)
 {
 	uint32_t sel = (SIM->SOPT2 & SIM_SOPT2_SDHCSRC_MASK) >> SIM_SOPT2_SDHCSRC_SHIFT;
@@ -350,18 +391,8 @@ static uint32_t kinetis_sdhc_max_blk_len(size_t max_block_len)
 	}
 }
 
-static int kinetis_sdhc_apply_io(const struct device *dev, const struct sdhc_io *ios)
+static int kinetis_sdhc_validate_io(const struct sdhc_io *ios)
 {
-	const struct kinetis_sdhc_config *cfg = dev->config;
-	struct kinetis_sdhc_data *data = dev->data;
-	uint32_t src_clk_hz;
-	uint8_t bus_width;
-	bool power_was_off = (data->host_io.power_mode != SDHC_POWER_ON);
-	int ret;
-
-	LOG_DBG("set_io clk=%u width=%u power=%u timing=%u volt=%u", ios->clock, ios->bus_width,
-		ios->power_mode, ios->timing, ios->signal_voltage);
-
 	if ((ios->timing != 0) && (ios->timing != SDHC_TIMING_LEGACY) &&
 	    (ios->timing != SDHC_TIMING_HS)) {
 		return -ENOTSUP;
@@ -375,17 +406,22 @@ static int kinetis_sdhc_apply_io(const struct device *dev, const struct sdhc_io 
 		return -ENOTSUP;
 	}
 
-	src_clk_hz = kinetis_sdhc_src_clock_hz();
-	if (src_clk_hz == 0U) {
+	if ((ios->power_mode != 0U) && (ios->power_mode != SDHC_POWER_OFF) &&
+	    (ios->power_mode != SDHC_POWER_ON)) {
 		return -ENOTSUP;
 	}
 
-	if (ios->power_mode == SDHC_POWER_OFF) {
-		ret = kinetis_sdhc_set_power(dev, SDHC_POWER_OFF);
-		if (ret != 0) {
-			return ret;
-		}
-	} else if ((ios->power_mode != 0U) && (ios->power_mode != SDHC_POWER_ON)) {
+	return 0;
+}
+
+static int kinetis_sdhc_apply_runtime_io(const struct device *dev, const struct sdhc_io *ios)
+{
+	const struct kinetis_sdhc_config *cfg = dev->config;
+	uint32_t src_clk_hz;
+	uint8_t bus_width;
+
+	src_clk_hz = kinetis_sdhc_src_clock_hz();
+	if (src_clk_hz == 0U) {
 		return -ENOTSUP;
 	}
 
@@ -422,20 +458,65 @@ static int kinetis_sdhc_apply_io(const struct device *dev, const struct sdhc_io 
 		return -ENOTSUP;
 	}
 
-	if (ios->power_mode == SDHC_POWER_ON) {
+	return 0;
+}
+
+static int kinetis_sdhc_apply_io(const struct device *dev, const struct sdhc_io *ios)
+{
+	const struct kinetis_sdhc_config *cfg = dev->config;
+	struct kinetis_sdhc_data *data = dev->data;
+	bool powering_on = (ios->power_mode == SDHC_POWER_ON) &&
+			   (data->host_io.power_mode != SDHC_POWER_ON);
+	bool powering_off = (ios->power_mode == SDHC_POWER_OFF) &&
+			    (data->host_io.power_mode != SDHC_POWER_OFF);
+	int ret;
+
+	LOG_DBG("set_io clk=%u width=%u power=%u timing=%u volt=%u", ios->clock, ios->bus_width,
+		ios->power_mode, ios->timing, ios->signal_voltage);
+
+	ret = kinetis_sdhc_validate_io(ios);
+	if (ret != 0) {
+		return ret;
+	}
+
+	if (powering_off) {
+		data->active_req = NULL;
+		data->hal_handle.command = NULL;
+		data->hal_handle.data = NULL;
+		data->hal_handle.transferredWords = 0U;
+		kinetis_sdhc_disable_transfer_irqs(cfg->base);
+		SDHC_ClearInterruptStatusFlags(cfg->base, kSDHC_AllInterruptFlags);
+		ret = kinetis_sdhc_set_power(dev, SDHC_POWER_OFF);
+		if (ret != 0) {
+			return ret;
+		}
+
+		data->host_io = *ios;
+		data->host_io.clock = 0U;
+
+		return kinetis_sdhc_sync_card_interrupts(dev);
+	}
+
+	if (powering_on) {
 		ret = kinetis_sdhc_set_power(dev, SDHC_POWER_ON);
 		if (ret != 0) {
 			return ret;
 		}
 
-		if (power_was_off) {
-			kinetis_sdhc_power_on_reset(dev);
+		ret = kinetis_sdhc_reset_controller_only(dev);
+		if (ret != 0) {
+			return ret;
 		}
+	}
+
+	ret = kinetis_sdhc_apply_runtime_io(dev, ios);
+	if (ret != 0) {
+		return ret;
 	}
 
 	data->host_io = *ios;
 
-	return 0;
+	return kinetis_sdhc_sync_card_interrupts(dev);
 }
 
 static void kinetis_sdhc_disable_host_cd_interrupts(const struct device *dev)
@@ -514,29 +595,84 @@ static void kinetis_sdhc_init_controller(const struct device *dev)
 	SDHC_ClearInterruptStatusFlags(cfg->base, kSDHC_AllInterruptFlags);
 }
 
-static void kinetis_sdhc_power_on_reset(const struct device *dev)
+static void kinetis_sdhc_transfer_complete(SDHC_Type *base, sdhc_handle_t *handle, status_t status,
+					   void *userData)
 {
+	const struct device *dev = userData;
+	const struct kinetis_sdhc_config *cfg = dev->config;
+	struct kinetis_sdhc_data *data = dev->data;
+	struct kinetis_sdhc_req *req = data->active_req;
+	uint32_t event_bits = 0U;
+	int ret = 0;
+
+	ARG_UNUSED(base);
+	ARG_UNUSED(handle);
+
+	if (req == NULL) {
+		return;
+	}
+
+	switch ((uint32_t)status) {
+	case (uint32_t)kStatus_Success:
+	case (uint32_t)kStatus_SDHC_TransferDataComplete:
+		event_bits = (req->z_data == NULL) ? KINETIS_SDHC_REQ_CMD_DONE
+						   : KINETIS_SDHC_REQ_DATA_DONE;
+		break;
+	case (uint32_t)kStatus_SDHC_TransferCommandComplete:
+		event_bits = KINETIS_SDHC_REQ_CMD_DONE;
+		break;
+	default:
+		kinetis_sdhc_req_record_snapshot(req, cfg->base);
+		ret = kinetis_sdhc_status_to_errno(status, kinetis_sdhc_primary_snapshot(req));
+		event_bits = KINETIS_SDHC_REQ_FAILED;
+		break;
+	}
+
+	req->result = ret;
+	req->events |= event_bits;
+
+	if (((req->events & KINETIS_SDHC_REQ_FAILED) != 0U) ||
+	    ((req->z_data == NULL) && ((req->events & KINETIS_SDHC_REQ_CMD_DONE) != 0U)) ||
+	    ((req->z_data != NULL) && ((req->events & KINETIS_SDHC_REQ_DATA_DONE) != 0U))) {
+		k_sem_give(&data->transfer_sem);
+	}
+}
+
+static int kinetis_sdhc_reset_controller_only(const struct device *dev)
+{
+	const struct kinetis_sdhc_config *cfg = dev->config;
 	struct kinetis_sdhc_data *data = dev->data;
 
 	data->active_req = NULL;
+	kinetis_sdhc_disable_transfer_irqs(cfg->base);
 	kinetis_sdhc_init_controller(dev);
-	(void)kinetis_sdhc_sync_card_interrupts(dev);
+
+	return kinetis_sdhc_sync_card_interrupts(dev);
 }
 
-static int kinetis_sdhc_reset_host(const struct device *dev)
+static int kinetis_sdhc_restore_host_state(const struct device *dev)
 {
 	struct kinetis_sdhc_data *data = dev->data;
 	int ret;
 
-	data->active_req = NULL;
-	kinetis_sdhc_init_controller(dev);
-
-	ret = kinetis_sdhc_apply_io(dev, &data->host_io);
+	ret = kinetis_sdhc_reset_controller_only(dev);
 	if (ret != 0) {
 		return ret;
 	}
 
+	if (data->host_io.power_mode == SDHC_POWER_ON) {
+		ret = kinetis_sdhc_apply_runtime_io(dev, &data->host_io);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
 	return kinetis_sdhc_sync_card_interrupts(dev);
+}
+
+static int kinetis_sdhc_reset_host(const struct device *dev)
+{
+	return kinetis_sdhc_restore_host_state(dev);
 }
 
 static uint32_t kinetis_sdhc_request_timeout_ms(const struct sdhc_command *cmd,
@@ -645,157 +781,6 @@ static int kinetis_sdhc_prepare_adma_table(const struct device *dev, struct kine
 		sys_cache_data_flush_range(data->adma_table, sizeof(data->adma_table)));
 }
 
-static status_t kinetis_sdhc_receive_response(SDHC_Type *base, sdhc_command_t *command)
-{
-	uint32_t response0 = base->CMDRSP[0];
-	uint32_t response1 = base->CMDRSP[1];
-	uint32_t response2 = base->CMDRSP[2];
-
-	if (command->responseType != kCARD_ResponseTypeNone) {
-		command->response[0U] = response0;
-
-		if (command->responseType == kCARD_ResponseTypeR2) {
-			command->response[0U] <<= 8U;
-			command->response[1U] =
-				(response1 << 8U) | ((response0 & 0xFF000000U) >> 24U);
-			command->response[2U] =
-				(response2 << 8U) | ((response1 & 0xFF000000U) >> 24U);
-			command->response[3U] =
-				(base->CMDRSP[3] << 8U) | ((response2 & 0xFF000000U) >> 24U);
-		}
-	}
-
-	if ((command->responseErrorFlags != 0U) &&
-	    ((command->responseType == kCARD_ResponseTypeR1) ||
-	     (command->responseType == kCARD_ResponseTypeR1b) ||
-	     (command->responseType == kCARD_ResponseTypeR6) ||
-	     (command->responseType == kCARD_ResponseTypeR5))) {
-		if ((command->responseErrorFlags & command->response[0U]) != 0U) {
-			return kStatus_SDHC_SendCommandFailed;
-		}
-	}
-
-	return kStatus_Success;
-}
-
-static uint32_t kinetis_sdhc_total_words(size_t bytes)
-{
-	return DIV_ROUND_UP(bytes, sizeof(uint32_t));
-}
-
-static uint32_t kinetis_sdhc_data_words_available(SDHC_Type *base, size_t bytes,
-						  uint32_t transferred_words, bool read)
-{
-	uint32_t watermark = read ? ((base->WML & SDHC_WML_RDWML_MASK) >> SDHC_WML_RDWML_SHIFT)
-				  : ((base->WML & SDHC_WML_WRWML_MASK) >> SDHC_WML_WRWML_SHIFT);
-	uint32_t total_words = kinetis_sdhc_total_words(bytes);
-
-	if (watermark >= total_words) {
-		return total_words - transferred_words;
-	}
-
-	if ((total_words - transferred_words) >= watermark) {
-		return watermark;
-	}
-
-	return total_words - transferred_words;
-}
-
-static void kinetis_sdhc_pio_transfer_data(SDHC_Type *base, struct kinetis_sdhc_req *req)
-{
-	uint32_t words;
-	uint32_t i;
-
-	words = kinetis_sdhc_data_words_available(base, req->len, req->transferred_words,
-						  !req->is_write);
-
-	for (i = 0U; i < words; i++) {
-		size_t offset = (size_t)req->transferred_words * sizeof(uint32_t);
-		size_t remaining = req->len - MIN(req->len, offset);
-		size_t chunk = MIN(remaining, sizeof(uint32_t));
-
-		if (req->is_write) {
-			uint32_t word = 0U;
-
-			if (chunk > 0U) {
-				memcpy(&word, req->buf + offset, chunk);
-			}
-			SDHC_WriteData(base, word);
-		} else {
-			uint32_t word = SDHC_ReadData(base);
-
-			if (chunk > 0U) {
-				memcpy(req->buf + offset, &word, chunk);
-			}
-		}
-
-		req->transferred_words++;
-	}
-}
-
-static void kinetis_sdhc_set_transfer_config(SDHC_Type *base, const struct kinetis_sdhc_req *req)
-{
-	uint32_t flags = 0U;
-	sdhc_transfer_config_t transfer_cfg = {0};
-
-	switch (req->hal_cmd.responseType) {
-	case kCARD_ResponseTypeR1:
-	case kCARD_ResponseTypeR5:
-	case kCARD_ResponseTypeR6:
-	case kCARD_ResponseTypeR7:
-		flags |= (uint32_t)kSDHC_ResponseLength48Flag | (uint32_t)kSDHC_EnableCrcCheckFlag |
-			 (uint32_t)kSDHC_EnableIndexCheckFlag;
-		break;
-	case kCARD_ResponseTypeR1b:
-	case kCARD_ResponseTypeR5b:
-		flags |= (uint32_t)kSDHC_ResponseLength48BusyFlag |
-			 (uint32_t)kSDHC_EnableCrcCheckFlag | (uint32_t)kSDHC_EnableIndexCheckFlag;
-		break;
-	case kCARD_ResponseTypeR2:
-		flags |= (uint32_t)kSDHC_ResponseLength136Flag | (uint32_t)kSDHC_EnableCrcCheckFlag;
-		break;
-	case kCARD_ResponseTypeR3:
-	case kCARD_ResponseTypeR4:
-		flags |= (uint32_t)kSDHC_ResponseLength48Flag;
-		break;
-	default:
-		break;
-	}
-
-	if (req->hal_cmd.type == kCARD_CommandTypeAbort) {
-		flags |= (uint32_t)kSDHC_CommandTypeAbortFlag;
-	}
-
-	if (req->z_data != NULL) {
-		flags |= (uint32_t)kSDHC_DataPresentFlag;
-
-		if (req->use_dma) {
-			flags |= (uint32_t)kSDHC_EnableDmaFlag;
-		}
-
-		if (!req->is_write) {
-			flags |= (uint32_t)kSDHC_DataReadFlag;
-		}
-
-		if (req->hal_data.blockCount > 1U) {
-			flags |= (uint32_t)kSDHC_MultipleBlockFlag |
-				 (uint32_t)kSDHC_EnableBlockCountFlag;
-			if (req->hal_data.enableAutoCommand12) {
-				flags |= (uint32_t)kSDHC_EnableAutoCommand12Flag;
-			}
-		}
-
-		transfer_cfg.dataBlockSize = req->hal_data.blockSize;
-		transfer_cfg.dataBlockCount = req->hal_data.blockCount;
-	}
-
-	transfer_cfg.commandArgument = req->hal_cmd.argument;
-	transfer_cfg.commandIndex = req->hal_cmd.index;
-	transfer_cfg.flags = flags;
-
-	SDHC_SetTransferConfig(base, &transfer_cfg);
-}
-
 static bool kinetis_sdhc_req_terminal(const struct kinetis_sdhc_req *req)
 {
 	if ((req->events & KINETIS_SDHC_REQ_FAILED) != 0U) {
@@ -807,26 +792,6 @@ static bool kinetis_sdhc_req_terminal(const struct kinetis_sdhc_req *req)
 	}
 
 	return (req->events & KINETIS_SDHC_REQ_DATA_DONE) != 0U;
-}
-
-static void kinetis_sdhc_req_finish(const struct device *dev, struct kinetis_sdhc_req *req, int ret,
-				    uint32_t event_bits)
-{
-	const struct kinetis_sdhc_config *cfg = dev->config;
-
-	if (kinetis_sdhc_req_terminal(req)) {
-		return;
-	}
-
-	if (ret != 0) {
-		kinetis_sdhc_req_record_snapshot(req, cfg->base);
-		event_bits |= KINETIS_SDHC_REQ_FAILED;
-	}
-
-	req->result = ret;
-	req->events |= event_bits;
-	kinetis_sdhc_disable_transfer_irqs(cfg->base);
-	k_sem_give(&((struct kinetis_sdhc_data *)dev->data)->transfer_sem);
 }
 
 static int kinetis_sdhc_prepare_request(struct kinetis_sdhc_req *req, struct sdhc_command *cmd,
@@ -889,15 +854,16 @@ static int kinetis_sdhc_start_request(const struct device *dev, struct kinetis_s
 	struct kinetis_sdhc_data *data = dev->data;
 	sdhc_dma_mode_t dma_mode = req->use_dma ? kSDHC_DmaModeAdma2 : kSDHC_DmaModeNo;
 	uint32_t prsstat = SDHC_GetPresentStatusFlags(cfg->base);
-	uint32_t irq_mask = (uint32_t)kSDHC_CommandFlag;
 	int ret;
+	status_t status;
 
 	if ((prsstat & (uint32_t)kSDHC_CommandInhibitFlag) != 0U) {
 		kinetis_sdhc_take_snapshot(cfg->base, &req->last_snapshot);
 		return -EBUSY;
 	}
 
-	if ((req->z_data != NULL) && ((prsstat & (uint32_t)kSDHC_DataInhibitFlag) != 0U)) {
+	if (((prsstat & (uint32_t)kSDHC_DataInhibitFlag) != 0U) &&
+	    !kinetis_sdhc_cmd_allowed_while_dat_busy(req->z_cmd)) {
 		kinetis_sdhc_take_snapshot(cfg->base, &req->last_snapshot);
 		return -EBUSY;
 	}
@@ -914,21 +880,28 @@ static int kinetis_sdhc_start_request(const struct device *dev, struct kinetis_s
 		}
 	}
 
-	if (req->z_data != NULL) {
-		irq_mask |= req->use_dma ? (uint32_t)kSDHC_DataDMAFlag : (uint32_t)kSDHC_DataFlag;
-	}
-
 	req->events = 0U;
 	req->result = 0;
-	req->transferred_words = 0U;
 
 	k_sem_reset(&data->transfer_sem);
 	data->active_req = req;
 
 	kinetis_sdhc_set_dma_mode(cfg->base, dma_mode);
-	SDHC_ClearInterruptStatusFlags(cfg->base, KINETIS_SDHC_TRANSFER_IRQ_FLAGS);
-	SDHC_EnableInterruptSignal(cfg->base, irq_mask);
-	kinetis_sdhc_set_transfer_config(cfg->base, req);
+	SDHC_ClearInterruptStatusFlags(cfg->base, kSDHC_AllInterruptFlags);
+	data->hal_handle.command = NULL;
+	data->hal_handle.data = NULL;
+	data->hal_handle.transferredWords = 0U;
+
+	req->hal_xfer.command = &req->hal_cmd;
+	req->hal_xfer.data = (req->z_data != NULL) ? &req->hal_data : NULL;
+
+	status = SDHC_TransferNonBlocking(cfg->base, &data->hal_handle, data->adma_table,
+					  ARRAY_SIZE(data->adma_table), &req->hal_xfer);
+	if (status != kStatus_Success) {
+		data->active_req = NULL;
+		kinetis_sdhc_take_snapshot(cfg->base, &req->last_snapshot);
+		return kinetis_sdhc_status_to_errno(status, &req->last_snapshot);
+	}
 
 	return 0;
 }
@@ -1002,19 +975,43 @@ static int kinetis_sdhc_issue_stop(const struct device *dev, uint32_t timeout_ms
 	return kinetis_sdhc_execute_request(dev, &req);
 }
 
+static int kinetis_sdhc_issue_go_idle_cmd(const struct device *dev)
+{
+	struct sdhc_command z_cmd = {
+		.opcode = SD_GO_IDLE_STATE,
+		.arg = 0U,
+		.response_type = SD_RSP_TYPE_NONE,
+		.timeout_ms = KINETIS_SDHC_DEFAULT_TIMEOUT_MS,
+	};
+	struct kinetis_sdhc_req req;
+	int ret;
+
+	ret = kinetis_sdhc_prepare_request(&req, &z_cmd, NULL, false);
+	if (ret != 0) {
+		return ret;
+	}
+
+	return kinetis_sdhc_execute_request(dev, &req);
+}
+
 static int kinetis_sdhc_wait_card_ready(const struct device *dev, uint32_t timeout_ms)
 {
+	return kinetis_sdhc_wait_present_state(dev, (uint32_t)kSDHC_Data0LineLevelFlag, true,
+					       timeout_ms);
+}
+
+static int kinetis_sdhc_reset_lines(const struct device *dev, bool reset_cmd, bool reset_data)
+{
 	const struct kinetis_sdhc_config *cfg = dev->config;
-	int64_t deadline = (timeout_ms == SDHC_TIMEOUT_FOREVER)
-				   ? INT64_MAX
-				   : (k_uptime_get() + (int64_t)timeout_ms);
 
-	while ((SDHC_GetPresentStatusFlags(cfg->base) & (uint32_t)kSDHC_Data0LineLevelFlag) == 0U) {
-		if ((timeout_ms != SDHC_TIMEOUT_FOREVER) && (k_uptime_get() >= deadline)) {
-			return -ETIMEDOUT;
-		}
+	if (reset_cmd &&
+	    !SDHC_Reset(cfg->base, (uint32_t)kSDHC_ResetCommand, KINETIS_SDHC_RESET_TIMEOUT)) {
+		return kinetis_sdhc_restore_host_state(dev);
+	}
 
-		k_sleep(K_USEC(KINETIS_SDHC_RECOVERY_POLL_US));
+	if (reset_data &&
+	    !SDHC_Reset(cfg->base, (uint32_t)kSDHC_ResetData, KINETIS_SDHC_RESET_TIMEOUT)) {
+		return kinetis_sdhc_restore_host_state(dev);
 	}
 
 	return 0;
@@ -1028,29 +1025,42 @@ static int kinetis_sdhc_recover_request(const struct device *dev,
 	const struct kinetis_sdhc_hw_snapshot *snapshot = kinetis_sdhc_primary_snapshot(req);
 	uint32_t live_prsstat;
 	uint32_t live_irqstat;
+	bool cmd_allowed_while_dat_busy = kinetis_sdhc_cmd_allowed_while_dat_busy(req->z_cmd);
 	bool need_cmd_reset;
 	bool need_data_reset;
 	bool need_stop;
-	int ret = 0;
+	int timeout_ms = (int)kinetis_sdhc_request_timeout_ms(req->z_cmd, req->z_data);
+	int ret;
 
 	kinetis_sdhc_disable_transfer_irqs(cfg->base);
 	data->active_req = NULL;
+	data->hal_handle.command = NULL;
+	data->hal_handle.data = NULL;
+	data->hal_handle.transferredWords = 0U;
+	SDHC_ClearInterruptStatusFlags(cfg->base, KINETIS_SDHC_TRANSFER_IRQ_FLAGS);
 
-	need_stop = (req->z_data != NULL) &&
-		    (req->is_multiblock ||
-		     ((snapshot->irqstat &
-		       ((uint32_t)kSDHC_DataErrorFlag | (uint32_t)kSDHC_DmaErrorFlag |
-			(uint32_t)kSDHC_AutoCommand12ErrorFlag)) != 0U) ||
-		     ((snapshot->prsstat & ((uint32_t)kSDHC_DataInhibitFlag |
-					    (uint32_t)kSDHC_DataLineActiveFlag)) != 0U));
+	live_prsstat = SDHC_GetPresentStatusFlags(cfg->base);
+	live_irqstat = SDHC_GetInterruptStatusFlags(cfg->base);
+
+	need_cmd_reset = ((live_irqstat & (uint32_t)kSDHC_CommandErrorFlag) != 0U) ||
+			 ((live_prsstat & (uint32_t)kSDHC_CommandInhibitFlag) != 0U);
+
+	need_stop =
+		(req->is_multiblock ||
+		 ((snapshot->irqstat &
+		   ((uint32_t)kSDHC_DataErrorFlag | (uint32_t)kSDHC_DmaErrorFlag |
+		    (uint32_t)kSDHC_AutoCommand12ErrorFlag)) != 0U) ||
+		 ((snapshot->prsstat &
+		   ((uint32_t)kSDHC_DataInhibitFlag | (uint32_t)kSDHC_DataLineActiveFlag)) != 0U) ||
+		 ((live_prsstat &
+		   ((uint32_t)kSDHC_DataInhibitFlag | (uint32_t)kSDHC_DataLineActiveFlag)) != 0U)) &&
+		((req->z_data != NULL) || !cmd_allowed_while_dat_busy);
 
 	if (need_stop) {
-		ret = kinetis_sdhc_issue_stop(
-			dev, kinetis_sdhc_request_timeout_ms(req->z_cmd, req->z_data));
-	}
-
-	if ((ret == 0) && (req->z_data != NULL) && req->is_write) {
-		ret = kinetis_sdhc_wait_card_ready(dev, KINETIS_SDHC_CARD_READY_TIMEOUT_MS);
+		ret = kinetis_sdhc_issue_stop(dev, timeout_ms);
+		if ((ret != 0) && (ret != -ETIMEDOUT) && (ret != -EIO) && (ret != -EBUSY)) {
+			return kinetis_sdhc_restore_host_state(dev);
+		}
 	}
 
 	live_prsstat = SDHC_GetPresentStatusFlags(cfg->base);
@@ -1059,24 +1069,30 @@ static int kinetis_sdhc_recover_request(const struct device *dev,
 	need_cmd_reset = ((live_irqstat & (uint32_t)kSDHC_CommandErrorFlag) != 0U) ||
 			 ((live_prsstat & (uint32_t)kSDHC_CommandInhibitFlag) != 0U);
 	need_data_reset =
-		((live_irqstat & ((uint32_t)kSDHC_DataErrorFlag | (uint32_t)kSDHC_DmaErrorFlag)) !=
-		 0U) ||
-		((live_prsstat &
-		  ((uint32_t)kSDHC_DataInhibitFlag | (uint32_t)kSDHC_DataLineActiveFlag)) != 0U);
+		(((live_irqstat &
+		   ((uint32_t)kSDHC_DataErrorFlag | (uint32_t)kSDHC_DmaErrorFlag)) != 0U) ||
+		 ((snapshot->irqstat &
+		   ((uint32_t)kSDHC_DataErrorFlag | (uint32_t)kSDHC_DmaErrorFlag |
+		    (uint32_t)kSDHC_AutoCommand12ErrorFlag)) != 0U) ||
+		 ((live_prsstat &
+		   ((uint32_t)kSDHC_DataInhibitFlag | (uint32_t)kSDHC_DataLineActiveFlag)) != 0U)) &&
+		((req->z_data != NULL) || !cmd_allowed_while_dat_busy);
 
-	if (need_cmd_reset &&
-	    !SDHC_Reset(cfg->base, (uint32_t)kSDHC_ResetCommand, KINETIS_SDHC_RESET_TIMEOUT)) {
-		return kinetis_sdhc_reset_host(dev);
+	ret = kinetis_sdhc_reset_lines(dev, need_cmd_reset, need_data_reset);
+	if (ret != 0) {
+		return ret;
 	}
 
-	if (need_data_reset &&
-	    !SDHC_Reset(cfg->base, (uint32_t)kSDHC_ResetData, KINETIS_SDHC_RESET_TIMEOUT)) {
-		return kinetis_sdhc_reset_host(dev);
+	if (need_stop || need_data_reset) {
+		ret = kinetis_sdhc_wait_card_ready(dev, KINETIS_SDHC_CARD_READY_TIMEOUT_MS);
+		if ((ret != 0) && (ret != -ETIMEDOUT)) {
+			return ret;
+		}
 	}
 
-	SDHC_ClearInterruptStatusFlags(cfg->base, KINETIS_SDHC_TRANSFER_IRQ_FLAGS);
+	SDHC_ClearInterruptStatusFlags(cfg->base, kSDHC_AllInterruptFlags);
 
-	return ret;
+	return 0;
 }
 
 static bool kinetis_sdhc_should_retry(int ret)
@@ -1215,15 +1231,20 @@ static int kinetis_sdhc_go_idle(const struct device *dev)
 {
 	const struct kinetis_sdhc_config *cfg = dev->config;
 	struct kinetis_sdhc_data *data = dev->data;
+	uint32_t prsstat;
 	uint32_t src_clk_hz;
 	uint32_t init_clock_hz;
 	bool restore_clock_off = false;
 	bool ok;
+	int ret;
 
-	if ((SDHC_GetPresentStatusFlags(cfg->base) &
-	     ((uint32_t)kSDHC_CommandInhibitFlag | (uint32_t)kSDHC_DataInhibitFlag |
-	      (uint32_t)kSDHC_DataLineActiveFlag)) != 0U) {
-		return -EBUSY;
+	if (data->host_io.power_mode != SDHC_POWER_ON) {
+		return -EIO;
+	}
+
+	ret = kinetis_sdhc_restore_host_state(dev);
+	if (ret != 0) {
+		return ret;
 	}
 
 	if ((cfg->base->SYSCTL & SDHC_SYSCTL_SDCLKEN_MASK) == 0U) {
@@ -1246,12 +1267,69 @@ static int kinetis_sdhc_go_idle(const struct device *dev)
 		restore_clock_off = (data->host_io.clock == 0U);
 	}
 
+	ret = kinetis_sdhc_wait_present_state(dev, (uint32_t)kSDHC_CommandInhibitFlag, false,
+					      KINETIS_SDHC_DEFAULT_TIMEOUT_MS);
+	if (ret != 0) {
+		if (restore_clock_off) {
+			SDHC_EnableSdClock(cfg->base, false);
+		}
+
+		return ret;
+	}
+
+	prsstat = SDHC_GetPresentStatusFlags(cfg->base);
+	if ((prsstat & ((uint32_t)kSDHC_DataInhibitFlag | (uint32_t)kSDHC_DataLineActiveFlag)) !=
+	    0U) {
+		ret = kinetis_sdhc_issue_stop(dev, KINETIS_SDHC_DEFAULT_TIMEOUT_MS);
+		if ((ret != 0) && (ret != -ETIMEDOUT) && (ret != -EIO) && (ret != -EBUSY)) {
+			if (restore_clock_off) {
+				SDHC_EnableSdClock(cfg->base, false);
+			}
+
+			return kinetis_sdhc_restore_host_state(dev);
+		}
+
+		prsstat = SDHC_GetPresentStatusFlags(cfg->base);
+		if ((prsstat &
+		     ((uint32_t)kSDHC_DataInhibitFlag | (uint32_t)kSDHC_DataLineActiveFlag)) !=
+		    0U) {
+			ret = kinetis_sdhc_reset_lines(dev, false, true);
+			if (ret != 0) {
+				if (restore_clock_off) {
+					SDHC_EnableSdClock(cfg->base, false);
+				}
+
+				return ret;
+			}
+		}
+	}
+
+	ret = kinetis_sdhc_wait_present_state(
+		dev, (uint32_t)kSDHC_CommandInhibitFlag | (uint32_t)kSDHC_DataInhibitFlag, false,
+		KINETIS_SDHC_DEFAULT_TIMEOUT_MS);
+	if (ret != 0) {
+		if (restore_clock_off) {
+			SDHC_EnableSdClock(cfg->base, false);
+		}
+
+		return ret;
+	}
+
 	ok = SDHC_SetCardActive(cfg->base, KINETIS_SDHC_DEFAULT_TIMEOUT_MS);
+	if (!ok) {
+		if (restore_clock_off) {
+			SDHC_EnableSdClock(cfg->base, false);
+		}
+
+		return -EIO;
+	}
+
+	ret = kinetis_sdhc_issue_go_idle_cmd(dev);
 	if (restore_clock_off) {
 		SDHC_EnableSdClock(cfg->base, false);
 	}
 
-	return ok ? 0 : -EIO;
+	return ret;
 }
 
 static void kinetis_cd_gpio_cb(const struct device *port, struct gpio_callback *cb,
@@ -1369,10 +1447,8 @@ static int kinetis_sdhc_request(const struct device *dev, struct sdhc_command *c
 
 	if (cmd->opcode == SD_GO_IDLE_STATE) {
 		ret = kinetis_sdhc_go_idle(dev);
-		if (ret != 0) {
-			k_mutex_unlock(&dev_data->lock);
-			return ret;
-		}
+		k_mutex_unlock(&dev_data->lock);
+		return ret;
 	}
 
 	if (data != NULL) {
@@ -1477,36 +1553,6 @@ static int kinetis_sdhc_disable_interrupt(const struct device *dev, int sources)
 	return ret;
 }
 
-static void kinetis_sdhc_handle_card_events(const struct device *dev, uint32_t flags)
-{
-	struct kinetis_sdhc_data *data = dev->data;
-	const struct kinetis_sdhc_config *cfg = dev->config;
-
-	if ((flags & (uint32_t)kSDHC_CardInsertionFlag) != 0U) {
-		if (cfg->cd_gpio.port == NULL) {
-			data->cd_present = true;
-			kinetis_sdhc_arm_host_cd_interrupts(dev, true);
-
-			if (((data->enabled_sources & SDHC_INT_INSERTED) != 0) &&
-			    (data->card_cb != NULL)) {
-				data->card_cb(dev, SDHC_INT_INSERTED, data->card_cb_user_data);
-			}
-		}
-	}
-
-	if ((flags & (uint32_t)kSDHC_CardRemovalFlag) != 0U) {
-		if (cfg->cd_gpio.port == NULL) {
-			data->cd_present = false;
-			kinetis_sdhc_arm_host_cd_interrupts(dev, false);
-
-			if (((data->enabled_sources & SDHC_INT_REMOVED) != 0) &&
-			    (data->card_cb != NULL)) {
-				data->card_cb(dev, SDHC_INT_REMOVED, data->card_cb_user_data);
-			}
-		}
-	}
-}
-
 static void kinetis_sdhc_handle_sdio_interrupt(const struct device *dev)
 {
 	const struct kinetis_sdhc_config *cfg = dev->config;
@@ -1520,92 +1566,53 @@ static void kinetis_sdhc_handle_sdio_interrupt(const struct device *dev)
 	SDHC_DisableInterruptSignal(cfg->base, (uint32_t)kSDHC_CardInterruptFlag);
 }
 
-static void kinetis_sdhc_handle_command_irq(const struct device *dev, uint32_t flags,
-					    struct kinetis_sdhc_req *req)
+static void kinetis_sdhc_hal_card_inserted(SDHC_Type *base, void *userData)
 {
-	const struct kinetis_sdhc_config *cfg = dev->config;
-	status_t status;
+	const struct device *dev = userData;
+	struct kinetis_sdhc_data *data = dev->data;
 
-	if (((flags & (uint32_t)kSDHC_CommandFlag) == 0U) || kinetis_sdhc_req_terminal(req)) {
-		return;
-	}
+	ARG_UNUSED(base);
 
-	if ((flags & (uint32_t)kSDHC_CommandErrorFlag) != 0U) {
-		kinetis_sdhc_req_record_snapshot(req, cfg->base);
-		kinetis_sdhc_req_finish(
-			dev, req, kinetis_sdhc_xfer_error(kinetis_sdhc_primary_snapshot(req)), 0U);
-		return;
-	}
+	data->cd_present = true;
+	kinetis_sdhc_arm_host_cd_interrupts(dev, true);
 
-	status = kinetis_sdhc_receive_response(cfg->base, &req->hal_cmd);
-	SDHC_DisableInterruptSignal(cfg->base, (uint32_t)kSDHC_CommandFlag);
-
-	if (status != kStatus_Success) {
-		kinetis_sdhc_req_record_snapshot(req, cfg->base);
-		kinetis_sdhc_req_finish(
-			dev, req,
-			kinetis_sdhc_status_to_errno(status, kinetis_sdhc_primary_snapshot(req)),
-			0U);
-		return;
-	}
-
-	if (req->z_data == NULL) {
-		kinetis_sdhc_req_finish(dev, req, 0, KINETIS_SDHC_REQ_CMD_DONE);
+	if (((data->enabled_sources & SDHC_INT_INSERTED) != 0) && (data->card_cb != NULL)) {
+		data->card_cb(dev, SDHC_INT_INSERTED, data->card_cb_user_data);
 	}
 }
 
-static void kinetis_sdhc_handle_data_irq(const struct device *dev, uint32_t flags,
-					 struct kinetis_sdhc_req *req)
+static void kinetis_sdhc_hal_card_removed(SDHC_Type *base, void *userData)
 {
-	const struct kinetis_sdhc_config *cfg = dev->config;
+	const struct device *dev = userData;
+	struct kinetis_sdhc_data *data = dev->data;
 
-	if (((flags & ((uint32_t)kSDHC_DataFlag | (uint32_t)kSDHC_DataDMAFlag)) == 0U) ||
-	    kinetis_sdhc_req_terminal(req)) {
-		return;
-	}
+	ARG_UNUSED(base);
 
-	if ((flags & ((uint32_t)kSDHC_DataErrorFlag | (uint32_t)kSDHC_DmaErrorFlag)) != 0U) {
-		kinetis_sdhc_req_record_snapshot(req, cfg->base);
-		kinetis_sdhc_req_finish(
-			dev, req, kinetis_sdhc_xfer_error(kinetis_sdhc_primary_snapshot(req)), 0U);
-		return;
-	}
+	data->cd_present = false;
+	kinetis_sdhc_arm_host_cd_interrupts(dev, false);
 
-	if (!req->use_dma && ((flags & ((uint32_t)kSDHC_BufferWriteReadyFlag |
-					(uint32_t)kSDHC_BufferReadReadyFlag)) != 0U)) {
-		kinetis_sdhc_pio_transfer_data(cfg->base, req);
+	if (((data->enabled_sources & SDHC_INT_REMOVED) != 0) && (data->card_cb != NULL)) {
+		data->card_cb(dev, SDHC_INT_REMOVED, data->card_cb_user_data);
 	}
+}
 
-	if ((flags & (uint32_t)kSDHC_DataCompleteFlag) != 0U) {
-		kinetis_sdhc_req_finish(dev, req, 0, KINETIS_SDHC_REQ_DATA_DONE);
-	}
+static void kinetis_sdhc_hal_sdio_interrupt(SDHC_Type *base, void *userData)
+{
+	ARG_UNUSED(base);
+
+	kinetis_sdhc_handle_sdio_interrupt(userData);
 }
 
 static void kinetis_sdhc_isr(const struct device *dev)
 {
 	const struct kinetis_sdhc_config *cfg = dev->config;
 	struct kinetis_sdhc_data *data = dev->data;
-	struct kinetis_sdhc_req *req = data->active_req;
-	uint32_t flags = SDHC_GetEnabledInterruptStatusFlags(cfg->base);
 
-	if (flags == 0U) {
+	if (SDHC_GetEnabledInterruptStatusFlags(cfg->base) == 0U) {
 		return;
 	}
 
-	if ((flags & (uint32_t)kSDHC_CardDetectFlag) != 0U) {
-		kinetis_sdhc_handle_card_events(dev, flags);
-	}
-
-	if ((flags & (uint32_t)kSDHC_CardInterruptFlag) != 0U) {
-		kinetis_sdhc_handle_sdio_interrupt(dev);
-	}
-
-	if (req != NULL) {
-		kinetis_sdhc_handle_command_irq(dev, flags, req);
-		kinetis_sdhc_handle_data_irq(dev, flags, req);
-	}
-
-	SDHC_ClearInterruptStatusFlags(cfg->base, flags);
+	SDHC_TransferHandleIRQ(cfg->base, &data->hal_handle);
 }
 
 static int kinetis_sdhc_init(const struct device *dev)
@@ -1645,7 +1652,6 @@ static int kinetis_sdhc_init(const struct device *dev)
 	data->props.bus_4_bit_support = (cfg->bus_width >= 4U);
 	data->props.host_caps.vol_330_support = true;
 	data->props.host_caps.bus_8_bit_support = (cfg->bus_width >= 8U);
-	data->props.no_card_power_control = (cfg->pwr_gpio.port == NULL);
 
 	SDHC_GetCapability(cfg->base, &cap);
 	data->props.host_caps.high_spd_support =
@@ -1705,6 +1711,17 @@ static int kinetis_sdhc_init(const struct device *dev)
 
 	NVIC_ClearPendingIRQ(cfg->irq_num);
 	cfg->irq_config_func(dev);
+
+		{
+			const sdhc_transfer_callback_t hal_callbacks = {
+				.CardInserted = kinetis_sdhc_hal_card_inserted,
+				.CardRemoved = kinetis_sdhc_hal_card_removed,
+				.SdioInterrupt = kinetis_sdhc_hal_sdio_interrupt,
+				.TransferComplete = kinetis_sdhc_transfer_complete,
+			};
+
+		SDHC_TransferCreateHandle(cfg->base, &data->hal_handle, &hal_callbacks, (void *)dev);
+	}
 
 	return 0;
 }
