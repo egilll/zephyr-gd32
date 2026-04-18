@@ -1,0 +1,12 @@
+/*
+ * Copyright (c) 2026 Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&uac1_headphones {
+	windows-full-speed-compat;
+};
+
+&as_iso_out {
+	sync-type = "adaptive";
+};

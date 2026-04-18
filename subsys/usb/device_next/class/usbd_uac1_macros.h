@@ -220,6 +220,9 @@
 #define UAC1_SYNC_TYPE_ADAPTIVE 1
 #define UAC1_SYNC_TYPE_SYNCHRONOUS 2
 
+#define UAC1_WINDOWS_FULL_SPEED_COMPAT(node)					\
+	DT_PROP(node, windows_full_speed_compat)
+
 #define AS_HAS_ISOCHRONOUS_DATA_ENDPOINT(node)					\
 	UTIL_NOT(DT_PROP(node, external_interface))
 
@@ -271,8 +274,8 @@
 #define AS_DATA_EP_SYNC_TYPE_BITS(node)					\
 	COND_CODE_1(IS_EQ(UAC1_SYNC_TYPE(node), UAC1_SYNC_TYPE_ASYNCHRONOUS),	\
 		(0x1 << 2),							\
-		COND_CODE_1(IS_EQ(UAC1_SYNC_TYPE(node), UAC1_SYNC_TYPE_ADAPTIVE),\
-			(0x2 << 2), (0x3 << 2))					\
+		(COND_CODE_1(IS_EQ(UAC1_SYNC_TYPE(node), UAC1_SYNC_TYPE_ADAPTIVE),\
+			(0x2 << 2), (0x3 << 2)))				\
 	)
 
 #define AS_DATA_EP_ATTR(node)							\
@@ -536,6 +539,18 @@
 		     "subslot-size must be 1..4");				\
 	BUILD_ASSERT(DT_PROP(node, bit_resolution) <= (DT_PROP(node, subslot_size) * 8), \
 		     "bit-resolution exceeds subslot-size");			\
+	BUILD_ASSERT(UTIL_NOT(UTIL_AND(					\
+			UAC1_WINDOWS_FULL_SPEED_COMPAT(DT_PARENT(node)),	\
+			UTIL_AND(UAC1_ALLOWED_AT_FULL_SPEED(DT_PARENT(node)),	\
+				 IS_EQ(DT_PROP(node, subslot_size), 3)))),	\
+		     "Windows-compatible FS UAC1 does not support packed 24-bit audio");\
+	BUILD_ASSERT(UTIL_NOT(UTIL_AND(					\
+			UAC1_WINDOWS_FULL_SPEED_COMPAT(DT_PARENT(node)),	\
+			UTIL_AND(UAC1_ALLOWED_AT_FULL_SPEED(DT_PARENT(node)),	\
+				 UTIL_AND(AS_IS_USB_ISO_OUT(node),		\
+					  IS_EQ(UAC1_SYNC_TYPE(node),		\
+						UAC1_SYNC_TYPE_ASYNCHRONOUS))))),\
+		     "Windows-compatible FS UAC1 requires adaptive or synchronous USB ISO OUT");\
 	BUILD_ASSERT(UTIL_OR(DT_NODE_HAS_COMPAT(DT_PROP(node, linked_terminal),	\
 						zephyr_uac1_input_terminal),	\
 			     DT_NODE_HAS_COMPAT(DT_PROP(node, linked_terminal),	\
