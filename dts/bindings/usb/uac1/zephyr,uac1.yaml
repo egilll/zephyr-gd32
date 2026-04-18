@@ -22,6 +22,16 @@ properties:
     description: |
       True if this instance is allowed to operate at High-Speed.
 
+  windows-full-speed-compat:
+    type: boolean
+    description: |
+      Constrain Full-Speed descriptors to a conservative subset that matches
+      Windows ``usbaudio.sys`` expectations for USB Audio Class 1.
+
+      When enabled, Full-Speed playback streams must use adaptive or
+      synchronous synchronization, and packed 24-bit Full-Speed formats are
+      rejected at build time. High-Speed descriptors are unchanged.
+
   interrupt-endpoint:
     type: boolean
     description: |
