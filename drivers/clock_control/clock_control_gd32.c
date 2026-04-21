@@ -6,6 +6,7 @@
 
 #define DT_DRV_COMPAT gd_gd32_cctl
 
+#include <errno.h>
 #include <stdint.h>
 
 #include <zephyr/arch/cpu.h>
@@ -13,8 +14,13 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/gd32.h>
+#include <zephyr/kernel.h>
 
 #include <gd32_regs.h>
+
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+#include <gd32_rcu.h>
+#endif
 
 /** RCU offset (from id cell) */
 #define GD32_CLOCK_ID_OFFSET(id) (((id) >> 6U) & 0xFFU)
@@ -39,6 +45,99 @@ static const uint8_t apb2_exp[8] = {
 struct clock_control_gd32_config {
 	uint32_t base;
 };
+
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+static int gd32_wait_flag(rcu_flag_enum flag, FlagStatus target, uint32_t timeout_ms)
+{
+	int64_t deadline = k_uptime_get() + timeout_ms;
+
+	while (rcu_flag_get(flag) != target) {
+		if (k_uptime_get() >= deadline) {
+			return -ETIMEDOUT;
+		}
+
+		k_sleep(K_MSEC(1));
+	}
+
+	return 0;
+}
+
+static int gd32f4xx_plli2s_input_rate_get(uint32_t *rate_hz)
+{
+	uint32_t pllm = RCU_PLL & RCU_PLL_PLLPSC;
+
+	if (pllm == 0U) {
+		return -EINVAL;
+	}
+
+	if ((RCU_PLL & RCU_PLL_PLLSEL) == RCU_PLLSRC_HXTAL) {
+		rcu_osci_on(RCU_HXTAL);
+
+		int ret = gd32_wait_flag(RCU_FLAG_HXTALSTB, SET, 100);
+
+		if (ret < 0) {
+			return ret;
+		}
+
+		*rate_hz = HXTAL_VALUE / pllm;
+	} else {
+		*rate_hz = IRC16M_VALUE / pllm;
+	}
+
+	return 0;
+}
+
+static int gd32f4xx_i2s_clock_configure(void *data)
+{
+	struct gd32_i2s_clock_config *cfg = data;
+
+	if (cfg == NULL) {
+		return -EINVAL;
+	}
+
+	if (cfg->source == GD32_I2S_CLOCK_SRC_EXTERNAL) {
+		if (cfg->external_rate_hz == 0U) {
+			return -EINVAL;
+		}
+
+		rcu_i2s_clock_config(RCU_I2SSRC_I2S_CKIN);
+		cfg->actual_rate_hz = cfg->external_rate_hz;
+
+		return 0;
+	}
+
+	if ((cfg->plli2s_n < 50U) || (cfg->plli2s_n > 500U) ||
+	    (cfg->plli2s_r < 2U) || (cfg->plli2s_r > 7U)) {
+		return -EINVAL;
+	}
+
+	uint32_t input_rate_hz;
+	int ret = gd32f4xx_plli2s_input_rate_get(&input_rate_hz);
+
+	if (ret < 0) {
+		return ret;
+	}
+
+	rcu_osci_off(RCU_PLLI2S_CK);
+	(void)gd32_wait_flag(RCU_FLAG_PLLI2SSTB, RESET, 10);
+
+	if (rcu_plli2s_config(cfg->plli2s_n, cfg->plli2s_r) != SUCCESS) {
+		return -EINVAL;
+	}
+
+	rcu_i2s_clock_config(RCU_I2SSRC_PLLI2S);
+	rcu_osci_on(RCU_PLLI2S_CK);
+
+	ret = gd32_wait_flag(RCU_FLAG_PLLI2SSTB, SET, 100);
+	if (ret < 0) {
+		return ret;
+	}
+
+	cfg->actual_rate_hz = ((uint64_t)input_rate_hz * cfg->plli2s_n) / cfg->plli2s_r;
+
+	return 0;
+}
+#endif
 
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_timer)
 /* timer identifiers */
@@ -198,11 +297,35 @@ clock_control_gd32_get_status(const struct device *dev,
 	return CLOCK_CONTROL_STATUS_OFF;
 }
 
+static int clock_control_gd32_configure(const struct device *dev,
+					clock_control_subsys_t sys,
+					void *data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(sys);
+
+	if (data == NULL) {
+		return 0;
+	}
+
+	struct gd32_i2s_clock_config *cfg = data;
+
+	switch (cfg->type) {
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+	case GD32_CLOCK_CONFIG_TYPE_I2S:
+		return gd32f4xx_i2s_clock_configure(data);
+#endif
+	default:
+		return -ENOTSUP;
+	}
+}
+
 static DEVICE_API(clock_control, clock_control_gd32_api) = {
 	.on = clock_control_gd32_on,
 	.off = clock_control_gd32_off,
 	.get_rate = clock_control_gd32_get_rate,
 	.get_status = clock_control_gd32_get_status,
+	.configure = clock_control_gd32_configure,
 };
 
 static const struct clock_control_gd32_config config = {

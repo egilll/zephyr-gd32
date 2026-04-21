@@ -19,6 +19,12 @@
 
 LOG_MODULE_REGISTER(uac1_sample, LOG_LEVEL_INF);
 
+#if defined(CONFIG_BOARD_GD32F450Z_EVAL)
+#define SAMPLE_I2S_AUDIO_FORMAT (I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED | I2S_FMT_BIT_CLK_INV)
+#else
+#define SAMPLE_I2S_AUDIO_FORMAT I2S_FMT_DATA_FORMAT_I2S
+#endif
+
 #define STREAMING_IN_TERMINAL_ID UAC1_ENTITY_ID(DT_NODELABEL(in_terminal))
 
 #define FS_SAMPLES_PER_SOF  48
@@ -50,6 +56,13 @@ struct usb_i2s_ctx {
 	int32_t fb_adjust;
 };
 
+static void uac1_reset_i2s_ctx(struct usb_i2s_ctx *ctx)
+{
+	ctx->i2s_started = false;
+	ctx->i2s_blocks_written = 0;
+	ctx->fb_adjust = 0;
+}
+
 static void uac1_terminal_update_cb(const struct device *dev, uint8_t terminal,
 				    bool enabled, bool microframes,
 				    void *user_data)
@@ -62,11 +75,14 @@ static void uac1_terminal_update_cb(const struct device *dev, uint8_t terminal,
 	ctx->microframes = microframes;
 	ctx->terminal_enabled = enabled;
 
-	if (ctx->i2s_started && !enabled) {
-		i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
-		ctx->i2s_started = false;
-		ctx->i2s_blocks_written = 0;
-		ctx->fb_adjust = 0;
+	if (!enabled && (ctx->i2s_started || ctx->i2s_blocks_written != 0U)) {
+		int ret = i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+
+		if (ret < 0) {
+			LOG_WRN("I2S drop failed on terminal disable: %d", ret);
+		}
+
+		uac1_reset_i2s_ctx(ctx);
 	}
 }
 
@@ -113,22 +129,34 @@ static void uac1_data_recv_cb(const struct device *dev, uint8_t terminal,
 		return;
 	}
 
-		if (!size) {
-			size = ctx->microframes ? (HS_SAMPLES_PER_XFER * BYTES_PER_SLOT) :
-						  (FS_SAMPLES_PER_SOF * BYTES_PER_SLOT);
-			memset(buf, 0, size);
-		}
+	if (!size) {
+		size = ctx->microframes ? (HS_SAMPLES_PER_XFER * BYTES_PER_SLOT) :
+					  (FS_SAMPLES_PER_SOF * BYTES_PER_SLOT);
+		memset(buf, 0, size);
+	}
 
 	ret = i2s_write(ctx->i2s_dev, buf, size);
 	if (ret < 0) {
-		ctx->i2s_started = false;
-		ctx->i2s_blocks_written = 0;
-		ctx->fb_adjust = 0;
+		LOG_ERR("i2s_write failed: %d", ret);
+		uac1_reset_i2s_ctx(ctx);
 
-		i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE);
-		ret = i2s_write(ctx->i2s_dev, buf, size);
-		if (ret < 0) {
+		if (ret == -EIO) {
+			ret = i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE);
+			if (ret < 0) {
+				LOG_ERR("I2S prepare failed: %d", ret);
+				k_mem_slab_free(&i2s_tx_slab, buf);
+				return;
+			}
+
+			ret = i2s_write(ctx->i2s_dev, buf, size);
+			if (ret < 0) {
+				LOG_ERR("i2s_write retry failed: %d", ret);
+				k_mem_slab_free(&i2s_tx_slab, buf);
+				return;
+			}
+		} else {
 			k_mem_slab_free(&i2s_tx_slab, buf);
+			return;
 		}
 	}
 
@@ -170,8 +198,13 @@ static void uac1_sof(const struct device *dev, void *user_data)
 	}
 
 	if (!ctx->i2s_started && ctx->i2s_blocks_written >= 2) {
-		i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
-		ctx->i2s_started = true;
+		int ret = i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+
+		if (ret == 0) {
+			ctx->i2s_started = true;
+		} else {
+			LOG_ERR("I2S start failed: %d", ret);
+		}
 	}
 
 	if (ctx->i2s_started && !ctx->microframes) {
@@ -211,8 +244,8 @@ int main(void)
 
 	config.word_size = SAMPLE_BIT_WIDTH;
 	config.channels = NUMBER_OF_CHANNELS;
-	config.format = I2S_FMT_DATA_FORMAT_I2S;
-	config.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER;
+	config.format = SAMPLE_I2S_AUDIO_FORMAT;
+	config.options = I2S_OPT_BIT_CLK_CONTROLLER | I2S_OPT_FRAME_CLK_CONTROLLER;
 	config.frame_clk_freq = SAMPLE_FREQUENCY;
 	config.mem_slab = &i2s_tx_slab;
 	config.block_size = MAX_BLOCK_SIZE;

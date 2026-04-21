@@ -20,6 +20,7 @@
 
 	i2s1_default: i2s1_default {
 		group1 {
+			/* Board manual routes the CS4344 headphone DAC word select on PB9. */
 			pinmux = <I2S1_MCK_PC6>, <I2S1_CK_PC7>, <I2S1_NSS_PB9>, <I2S1_SD_PC1>;
 		};
 	};

@@ -454,7 +454,13 @@ static inline int udc_set_address(const struct device *dev, const uint8_t addr)
 	const struct udc_api *api = (const struct udc_api *)dev->api;
 	int ret;
 
-	if (!udc_is_enabled(dev)) {
+	/*
+	 * A bus reset may arrive while a controller driver is still inside its
+	 * enable callback. In that window, the generic UDC layer has not yet
+	 * marked the controller enabled, but usbd_core still needs to restore
+	 * the default USB address 0.
+	 */
+	if (!udc_is_enabled(dev) && !(addr == 0U && udc_is_initialized(dev))) {
 		return -EPERM;
 	}
 

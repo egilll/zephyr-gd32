@@ -724,12 +724,19 @@ DT_INST_FOREACH_STATUS_OKAY(QUIRK_ESP32_USB_OTG_DEFINE)
 #include <zephyr/drivers/clock_control/gd32.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/dt-bindings/clock/gd32f4xx-clocks.h>
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+#include <gd32f4xx.h>
+#include <gd32f4xx_rcu.h>
+#endif
 
 /* USBFS/USBHS Global Core Configuration register (GCCFG), offset 0x0038. */
 #define USB_DWC2_GCCFG_GD32_PWRON	BIT(16)
 #define USB_DWC2_GCCFG_GD32_VBUSACEN	BIT(18)
 #define USB_DWC2_GCCFG_GD32_VBUSBCEN	BIT(19)
 #define USB_DWC2_GCCFG_GD32_VBUSIG	BIT(21)
+/* GD32 uses GUSBCFG[13:10] as USB turnaround time, vendor USBFS code sets 5. */
+#define USB_DWC2_GUSBCFG_GD32_UTT_MASK	GENMASK(13, 10)
+#define USB_DWC2_GUSBCFG_GD32_UTT_FS	(5U << 10)
 
 /* RCU_ADDCTL bits used to provide a stable 48 MHz clock for the embedded PHY. */
 #define GD32_RCU_ADDCTL_IRC48MEN	BIT(16)
@@ -759,13 +766,88 @@ static inline int gd32_usb_wait_irc48m_stable(void)
 	return 0;
 }
 
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+static inline int gd32f4xx_wait_flag(rcu_flag_enum flag, FlagStatus target, uint32_t timeout_ms)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(timeout_ms));
+
+	while (rcu_flag_get(flag) != target) {
+		if (sys_timepoint_expired(timeout)) {
+			return -ETIMEDOUT;
+		}
+
+		k_usleep(50);
+	}
+
+	return 0;
+}
+
+static inline int gd32f4xx_usbfs_configure_ck48m_from_pllsai(void)
+{
+	uint32_t pllm = RCU_PLL & RCU_PLL_PLLPSC;
+	uint32_t input_rate_hz;
+	uint32_t pllsai_n;
+	int ret;
+
+	if (pllm == 0U) {
+		return -EINVAL;
+	}
+
+	if ((RCU_PLL & RCU_PLL_PLLSEL) == RCU_PLLSRC_HXTAL) {
+		rcu_osci_on(RCU_HXTAL);
+		ret = gd32f4xx_wait_flag(RCU_FLAG_HXTALSTB, SET, 100);
+		if (ret < 0) {
+			return ret;
+		}
+
+		input_rate_hz = HXTAL_VALUE / pllm;
+	} else {
+		ret = gd32f4xx_wait_flag(RCU_FLAG_IRC16MSTB, SET, 100);
+		if (ret < 0) {
+			return ret;
+		}
+
+		input_rate_hz = IRC16M_VALUE / pllm;
+	}
+
+	if ((input_rate_hz == 0U) || ((288000000U % input_rate_hz) != 0U)) {
+		return -EINVAL;
+	}
+
+	pllsai_n = 288000000U / input_rate_hz;
+	if ((pllsai_n < RCU_PLLSAIN_MUL_MIN) || (pllsai_n > RCU_PLLSAIN_MUL_MAX)) {
+		return -EINVAL;
+	}
+
+	rcu_osci_off(RCU_PLLSAI_CK);
+	(void)gd32f4xx_wait_flag(RCU_FLAG_PLLSAISTB, RESET, 10);
+
+	if (rcu_pllsai_config(pllsai_n, 6U, 2U) != SUCCESS) {
+		return -EINVAL;
+	}
+
+	rcu_osci_on(RCU_PLLSAI_CK);
+	ret = gd32f4xx_wait_flag(RCU_FLAG_PLLSAISTB, SET, 100);
+	if (ret < 0) {
+		return ret;
+	}
+
+	rcu_pll48m_clock_config(RCU_PLL48MSRC_PLLSAIP);
+	rcu_ck48m_clock_config(RCU_CK48MSRC_PLL48M);
+
+	return 0;
+}
+#endif
+
 static inline int gd32_usb_enable_embedded_phy(const struct device *dev, bool vbus_sensing)
 {
 	const struct udc_dwc2_config *const config = dev->config;
 	mem_addr_t gccfg_reg = (mem_addr_t)&config->base->ggpio;
+	mem_addr_t gusbcfg_reg = (mem_addr_t)&config->base->gusbcfg;
 	uint32_t gccfg_bits = USB_DWC2_GCCFG_GD32_PWRON |
 			      USB_DWC2_GCCFG_GD32_VBUSACEN |
 			      USB_DWC2_GCCFG_GD32_VBUSBCEN;
+	uint32_t gusbcfg;
 
 	/*
 	 * Reference: GD32_28_USBFS.md and GD32_29_USBHS.md document USBx_GCCFG
@@ -777,6 +859,16 @@ static inline int gd32_usb_enable_embedded_phy(const struct device *dev, bool vb
 	}
 
 	sys_set_bits(gccfg_reg, gccfg_bits);
+
+	/*
+	 * The GD32 vendor USBFS device driver programs the embedded-FS PHY
+	 * turnaround time to 5. Leaving it at reset value 0 causes reset and
+	 * speed detection to work, but control traffic never becomes valid.
+	 */
+	gusbcfg = sys_read32(gusbcfg_reg);
+	gusbcfg &= ~USB_DWC2_GUSBCFG_GD32_UTT_MASK;
+	gusbcfg |= USB_DWC2_GUSBCFG_GD32_UTT_FS;
+	sys_write32(gusbcfg, gusbcfg_reg);
 
 	/* Vendor reference uses ~20ms delay after transceiver power-on. */
 	k_msleep(20);
@@ -861,6 +953,14 @@ static inline int gd32_dwc2_irq_clear(const struct device *dev)
 				return ret;					\
 			}							\
 		}								\
+										\
+		/* GD32F4 USBFS examples drive CK48M from PLL48M/PLLSAIP. */	\
+		IF_ENABLED(CONFIG_SOC_SERIES_GD32F4XX, (			\
+			ret = gd32f4xx_usbfs_configure_ck48m_from_pllsai();	\
+			if (ret) {						\
+				return ret;					\
+			}							\
+		))								\
 										\
 		/* Ensure PHY clock is not gated. */				\
 		sys_write32(0, (mem_addr_t)&config->base->pcgcctl);		\
