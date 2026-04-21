@@ -71,13 +71,15 @@ LOG_MODULE_REGISTER(eth_gd32, CONFIG_ETHERNET_LOG_LEVEL);
 
 #define GD32_ETH_RX_DESC_COUNT CONFIG_ETH_GD32_RX_DESC_COUNT
 #define GD32_ETH_TX_DESC_COUNT CONFIG_ETH_GD32_TX_DESC_COUNT
-#define GD32_ETH_DMA_BUFS_PER_DESC 2U
+#define GD32_ETH_RX_DMA_BUFS_PER_DESC 1U
+#define GD32_ETH_TX_DMA_BUFS_PER_DESC 2U
 #if defined(CONFIG_NET_BUF_FIXED_DATA_SIZE)
 #define GD32_ETH_DMA_BUF_SIZE ROUND_UP(ROUND_DOWN(CONFIG_NET_BUF_DATA_SIZE, 4), GD32_ETH_DMA_ALIGN)
 #else
 #define GD32_ETH_DMA_BUF_SIZE ROUND_UP(128U, GD32_ETH_DMA_ALIGN)
 #endif
-#define GD32_ETH_DMA_DESC_BUF_LEN (GD32_ETH_DMA_BUFS_PER_DESC * GD32_ETH_DMA_BUF_SIZE)
+#define GD32_ETH_RX_DESC_BUF_LEN (GD32_ETH_RX_DMA_BUFS_PER_DESC * GD32_ETH_DMA_BUF_SIZE)
+#define GD32_ETH_TX_DESC_BUF_LEN (GD32_ETH_TX_DMA_BUFS_PER_DESC * GD32_ETH_DMA_BUF_SIZE)
 #define GD32_ETH_DMA_DESC_SIZE ROUND_UP(sizeof(enet_descriptors_struct), GD32_ETH_DMA_ALIGN)
 
 #define GD32_ENET_MAC_CFG_OFFSET      0x0000U
@@ -98,6 +100,8 @@ LOG_MODULE_REGISTER(eth_gd32, CONFIG_ETHERNET_LOG_LEVEL);
 #define GD32_ENET_DMA_STAT_OFFSET     0x1014U
 #define GD32_ENET_DMA_CTL_OFFSET      0x1018U
 #define GD32_ENET_DMA_INTEN_OFFSET    0x101CU
+#define GD32_ENET_DMA_CRDADDR_OFFSET  0x104CU
+#define GD32_ENET_DMA_CRBADDR_OFFSET  0x1054U
 
 BUILD_ASSERT(GD32_ETH_DMA_BUF_SIZE >= 4U, "DMA buffer size must be at least 4");
 BUILD_ASSERT((GD32_ETH_DMA_BUF_SIZE % 4U) == 0U, "DMA buffer size must be 32-bit aligned");
@@ -106,9 +110,9 @@ BUILD_ASSERT((GD32_ETH_DMA_BUF_SIZE % GD32_ETH_DMA_ALIGN) == 0U,
 BUILD_ASSERT(GD32_ETH_DMA_BUF_SIZE <= 0x1FFFU, "DMA buffer size must fit RB1S field");
 BUILD_ASSERT(GD32_ETH_TX_DESC_COUNT >= 4, "Need at least 4 TX descriptors");
 BUILD_ASSERT(GD32_ETH_RX_DESC_COUNT >= 8, "Need at least 8 RX descriptors");
-BUILD_ASSERT((GD32_ETH_RX_DESC_COUNT * GD32_ETH_DMA_DESC_BUF_LEN) >= GD32_ETH_FRAME_SIZE_MAX,
+BUILD_ASSERT((GD32_ETH_RX_DESC_COUNT * GD32_ETH_RX_DESC_BUF_LEN) >= GD32_ETH_FRAME_SIZE_MAX,
 	     "RX ring too small for a full frame");
-BUILD_ASSERT((GD32_ETH_TX_DESC_COUNT * GD32_ETH_DMA_DESC_BUF_LEN) >= GD32_ETH_FRAME_SIZE_MAX,
+BUILD_ASSERT((GD32_ETH_TX_DESC_COUNT * GD32_ETH_TX_DESC_BUF_LEN) >= GD32_ETH_FRAME_SIZE_MAX,
 	     "TX ring too small for a full frame");
 
 #ifdef SELECT_DESCRIPTORS_ENHANCED_MODE
@@ -136,8 +140,8 @@ struct eth_gd32_config {
 	const struct device *phy_dev;
 	const struct nvmem_cell mac_nvmem;
 	struct eth_gd32_dma_rings *dma;
-	uint8_t (*rx_dma_buf)[GD32_ETH_DMA_BUFS_PER_DESC][GD32_ETH_DMA_BUF_SIZE];
-	uint8_t (*tx_dma_buf)[GD32_ETH_DMA_BUFS_PER_DESC][GD32_ETH_DMA_BUF_SIZE];
+	uint8_t (*rx_dma_buf)[GD32_ETH_RX_DMA_BUFS_PER_DESC][GD32_ETH_DMA_BUF_SIZE];
+	uint8_t (*tx_dma_buf)[GD32_ETH_TX_DMA_BUFS_PER_DESC][GD32_ETH_DMA_BUF_SIZE];
 	uint8_t local_mac[NET_ETH_ADDR_LEN];
 	uint8_t mac_prefix[3];
 	bool random_mac;
@@ -217,12 +221,11 @@ static inline struct eth_gd32_dma_rings *eth_gd32_dma(const struct device *dev)
 	return cfg->dma;
 }
 
-static inline uint8_t *eth_gd32_rx_dma_buf(const struct device *dev, uint16_t desc_idx,
-					   uint8_t buf_idx)
+static inline uint8_t *eth_gd32_rx_dma_buf(const struct device *dev, uint16_t desc_idx)
 {
 	const struct eth_gd32_config *cfg = dev->config;
 
-	return cfg->rx_dma_buf[desc_idx][buf_idx];
+	return cfg->rx_dma_buf[desc_idx][0];
 }
 
 static inline uint8_t *eth_gd32_tx_dma_buf(const struct device *dev, uint16_t desc_idx,
@@ -340,17 +343,32 @@ static inline bool eth_gd32_tx_desc_dma_owned(const enet_descriptors_struct *des
 	return (desc->status & ENET_TDES0_DAV) != 0U;
 }
 
-static void eth_gd32_trace_state(const struct device *dev, const char *tag, uint32_t stat)
+static void eth_gd32_trace_state(const struct device *dev, const char *tag, uint32_t stat,
+				 bool warn)
 {
 	const struct eth_gd32_config *cfg = dev->config;
 	struct eth_gd32_data *data = dev->data;
 	struct eth_gd32_dma_rings *dma = eth_gd32_dma(dev);
+	uint32_t crdaddr = eth_gd32_reg_read(cfg, GD32_ENET_DMA_CRDADDR_OFFSET);
+	uint32_t crbaddr = eth_gd32_reg_read(cfg, GD32_ENET_DMA_CRBADDR_OFFSET);
 	uint16_t rx_dma_owned = 0U;
 	uint16_t tx_dma_owned = 0U;
 	uint16_t tx_pkt_refs = 0U;
+	int16_t rx_curr_idx = -1;
+	uint32_t rx_curr_status = 0U;
+	uint32_t rx_curr_ctl = 0U;
 
 	for (uint16_t i = 0U; i < GD32_ETH_RX_DESC_COUNT; i++) {
-		if (eth_gd32_rx_desc_dma_owned(eth_gd32_rx_desc(dma, i))) {
+		enet_descriptors_struct *desc = eth_gd32_rx_desc(dma, i);
+
+		if ((uint32_t)(uintptr_t)desc == crdaddr) {
+			rx_curr_idx = (int16_t)i;
+			eth_gd32_desc_refresh(desc);
+			rx_curr_status = desc->status;
+			rx_curr_ctl = desc->control_buffer_size;
+		}
+
+		if (eth_gd32_rx_desc_dma_owned(desc)) {
 			rx_dma_owned++;
 		}
 	}
@@ -365,15 +383,31 @@ static void eth_gd32_trace_state(const struct device *dev, const char *tag, uint
 		}
 	}
 
-	LOG_WRN("%s: IRQ_STAT=0x%08x DMA_STAT=0x%08x DMA_CTL=0x%08x MAC_CFG=0x%08x "
-		"rx_tail=%u tx_use=%u tx_clean=%u tx_in_use=%u tx_sem=%u "
-		"rx_owned=%u/%u tx_owned=%u/%u tx_pkt_refs=%u",
-		tag, stat, eth_gd32_reg_read(cfg, GD32_ENET_DMA_STAT_OFFSET),
-		eth_gd32_reg_read(cfg, GD32_ENET_DMA_CTL_OFFSET),
-		eth_gd32_reg_read(cfg, GD32_ENET_MAC_CFG_OFFSET), data->rx_tail,
-		data->tx_next_to_use, data->tx_next_to_clean, data->tx_descs_in_use,
-		data->tx_desc_sem.count, rx_dma_owned, GD32_ETH_RX_DESC_COUNT, tx_dma_owned,
-		GD32_ETH_TX_DESC_COUNT, tx_pkt_refs);
+	if (warn) {
+		LOG_WRN("%s: IRQ_STAT=0x%08x DMA_STAT=0x%08x DMA_CTL=0x%08x MAC_CFG=0x%08x "
+			"rx_tail=%u rx_curr=%d crd=0x%08x crb=0x%08x rdes0=0x%08x rdes1=0x%08x "
+			"tx_use=%u tx_clean=%u tx_in_use=%u tx_sem=%u "
+			"rx_owned=%u/%u tx_owned=%u/%u tx_pkt_refs=%u",
+			tag, stat, eth_gd32_reg_read(cfg, GD32_ENET_DMA_STAT_OFFSET),
+			eth_gd32_reg_read(cfg, GD32_ENET_DMA_CTL_OFFSET),
+			eth_gd32_reg_read(cfg, GD32_ENET_MAC_CFG_OFFSET), data->rx_tail, rx_curr_idx,
+			crdaddr, crbaddr, rx_curr_status, rx_curr_ctl, data->tx_next_to_use,
+			data->tx_next_to_clean, data->tx_descs_in_use,
+			data->tx_desc_sem.count, rx_dma_owned, GD32_ETH_RX_DESC_COUNT, tx_dma_owned,
+			GD32_ETH_TX_DESC_COUNT, tx_pkt_refs);
+	} else {
+		LOG_DBG("%s: IRQ_STAT=0x%08x DMA_STAT=0x%08x DMA_CTL=0x%08x MAC_CFG=0x%08x "
+			"rx_tail=%u rx_curr=%d crd=0x%08x crb=0x%08x rdes0=0x%08x rdes1=0x%08x "
+			"tx_use=%u tx_clean=%u tx_in_use=%u tx_sem=%u "
+			"rx_owned=%u/%u tx_owned=%u/%u tx_pkt_refs=%u",
+			tag, stat, eth_gd32_reg_read(cfg, GD32_ENET_DMA_STAT_OFFSET),
+			eth_gd32_reg_read(cfg, GD32_ENET_DMA_CTL_OFFSET),
+			eth_gd32_reg_read(cfg, GD32_ENET_MAC_CFG_OFFSET), data->rx_tail, rx_curr_idx,
+			crdaddr, crbaddr, rx_curr_status, rx_curr_ctl, data->tx_next_to_use,
+			data->tx_next_to_clean, data->tx_descs_in_use,
+			data->tx_desc_sem.count, rx_dma_owned, GD32_ETH_RX_DESC_COUNT, tx_dma_owned,
+			GD32_ETH_TX_DESC_COUNT, tx_pkt_refs);
+	}
 }
 
 static inline void eth_gd32_rx_buf_prepare_for_dma(void *buf, size_t len)
@@ -412,10 +446,7 @@ static inline void eth_gd32_rx_desc_give_to_dma(const struct device *dev,
 
 static void eth_gd32_rx_desc_rearm(const struct device *dev, enet_descriptors_struct *desc, uint16_t idx)
 {
-	for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_DMA_BUFS_PER_DESC; buf_idx++) {
-		eth_gd32_rx_buf_prepare_for_dma(eth_gd32_rx_dma_buf(dev, idx, buf_idx),
-						GD32_ETH_DMA_BUF_SIZE);
-	}
+	eth_gd32_rx_buf_prepare_for_dma(eth_gd32_rx_dma_buf(dev, idx), GD32_ETH_DMA_BUF_SIZE);
 
 	eth_gd32_rx_desc_give_to_dma(dev, desc, idx);
 }
@@ -423,31 +454,32 @@ static void eth_gd32_rx_desc_rearm(const struct device *dev, enet_descriptors_st
 static bool eth_gd32_rx_desc_copy(struct net_pkt *pkt, const struct device *dev, uint16_t idx,
 				  uint32_t *copied, uint32_t frame_len)
 {
-	for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_DMA_BUFS_PER_DESC; buf_idx++) {
-		uint32_t frag_len = MIN(frame_len - *copied, (uint32_t)GD32_ETH_DMA_BUF_SIZE);
-		void *rx_buf;
+	uint32_t frag_len = MIN(frame_len - *copied, (uint32_t)GD32_ETH_DMA_BUF_SIZE);
+	void *rx_buf;
 
-		if (frag_len == 0U) {
-			break;
-		}
-
-		rx_buf = eth_gd32_rx_dma_buf(dev, idx, buf_idx);
-		gd32_cache_invalidate(rx_buf, frag_len);
-		if (net_pkt_write(pkt, rx_buf, frag_len) != 0) {
-			return false;
-		}
-
-		*copied += frag_len;
+	if (frag_len == 0U) {
+		return true;
 	}
 
+	rx_buf = eth_gd32_rx_dma_buf(dev, idx);
+	gd32_cache_invalidate(rx_buf, frag_len);
+	if (net_pkt_write(pkt, rx_buf, frag_len) != 0) {
+		return false;
+	}
+
+	*copied += frag_len;
 	return true;
 }
 
 static inline void eth_gd32_rx_desc_give_to_dma(const struct device *dev,
 						enet_descriptors_struct *desc, uint16_t idx)
 {
-	desc->buffer1_addr = (uint32_t)(uintptr_t)eth_gd32_rx_dma_buf(dev, idx, 0U);
-	desc->buffer2_next_desc_addr = (uint32_t)(uintptr_t)eth_gd32_rx_dma_buf(dev, idx, 1U);
+	const struct eth_gd32_config *cfg = dev->config;
+	struct eth_gd32_dma_rings *dma = cfg->dma;
+
+	desc->buffer1_addr = (uint32_t)(uintptr_t)eth_gd32_rx_dma_buf(dev, idx);
+	desc->buffer2_next_desc_addr =
+		(uint32_t)(uintptr_t)eth_gd32_rx_desc(dma, modulo_inc(idx, GD32_ETH_RX_DESC_COUNT));
 	barrier_dmem_fence_full();
 	desc->status = ENET_RDES0_DAV;
 	eth_gd32_desc_publish(desc);
@@ -746,7 +778,8 @@ static int eth_gd32_tx_desc_reserve(const struct device *dev, uint16_t desc_coun
 
 		eth_gd32_tx_desc_unreserve(data, reserved);
 		eth_gd32_trace_state(dev, "TX descriptor reserve timeout",
-				     eth_gd32_reg_read(dev->config, GD32_ENET_DMA_STAT_OFFSET));
+				     eth_gd32_reg_read(dev->config, GD32_ENET_DMA_STAT_OFFSET),
+				     true);
 		return -ENOBUFS;
 	}
 
@@ -761,7 +794,8 @@ static void eth_gd32_dma_irqs_enable(const struct eth_gd32_config *cfg)
 	 * register bits instead.
 	 */
 	const uint32_t mask = ENET_DMA_INTEN_NIE | ENET_DMA_INTEN_AIE | ENET_DMA_INTEN_RIE |
-			      ENET_DMA_INTEN_RBUIE | ENET_DMA_INTEN_RPSIE | ENET_DMA_INTEN_ROIE |
+			      ENET_DMA_INTEN_RBUIE | ENET_DMA_INTEN_RPSIE |
+			      ENET_DMA_INTEN_ROIE |
 			      ENET_DMA_INTEN_TIE | ENET_DMA_INTEN_TPSIE | ENET_DMA_INTEN_TUIE |
 			      ENET_DMA_INTEN_FBEIE;
 
@@ -814,16 +848,13 @@ static void eth_gd32_rings_configure(const struct device *dev)
 		enet_descriptors_struct *desc = eth_gd32_rx_desc(dma, i);
 
 		desc->control_buffer_size = FIELD_PREP(ENET_RDES1_RB1S, GD32_ETH_DMA_BUF_SIZE) |
-					    FIELD_PREP(ENET_RDES1_RB2S, GD32_ETH_DMA_BUF_SIZE);
+					    ENET_RDES1_RCHM;
 		desc->control_buffer_size &= ~ENET_RDES1_DINTC;
 		if (eth_gd32_desc_is_last(i, GD32_ETH_RX_DESC_COUNT)) {
 			desc->control_buffer_size |= ENET_RDES1_RERM;
 		}
 
-		for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_DMA_BUFS_PER_DESC; buf_idx++) {
-			eth_gd32_rx_buf_prepare_for_dma(eth_gd32_rx_dma_buf(dev, i, buf_idx),
-							GD32_ETH_DMA_BUF_SIZE);
-		}
+		eth_gd32_rx_buf_prepare_for_dma(eth_gd32_rx_dma_buf(dev, i), GD32_ETH_DMA_BUF_SIZE);
 		eth_gd32_rx_desc_give_to_dma(dev, desc, i);
 	}
 
@@ -1085,6 +1116,29 @@ static void eth_gd32_rx(const struct device *dev, bool resume_pending)
 	}
 }
 
+static bool eth_gd32_rx_stuck(const struct device *dev)
+{
+	const struct eth_gd32_config *cfg = dev->config;
+	struct eth_gd32_dma_rings *dma = eth_gd32_dma(dev);
+	uint32_t stat = eth_gd32_reg_read(cfg, GD32_ENET_DMA_STAT_OFFSET);
+	uint32_t crdaddr;
+
+	if (!eth_gd32_rx_dma_suspended(stat)) {
+		return false;
+	}
+
+	crdaddr = eth_gd32_reg_read(cfg, GD32_ENET_DMA_CRDADDR_OFFSET);
+	for (uint16_t i = 0U; i < GD32_ETH_RX_DESC_COUNT; i++) {
+		enet_descriptors_struct *desc = eth_gd32_rx_desc(dma, i);
+
+		if ((uint32_t)(uintptr_t)desc == crdaddr) {
+			return eth_gd32_rx_desc_dma_owned(desc);
+		}
+	}
+
+	return true;
+}
+
 static void eth_gd32_rx_work_handler(struct k_work *work)
 {
 	struct eth_gd32_data *data = CONTAINER_OF(work, struct eth_gd32_data, rx_work);
@@ -1093,6 +1147,17 @@ static void eth_gd32_rx_work_handler(struct k_work *work)
 		bool resume_pending = atomic_cas(&data->rx_resume_pending, 1, 0);
 
 		eth_gd32_rx(data->dev, resume_pending);
+
+		if (atomic_get(&data->link_up) != 0 && eth_gd32_rx_stuck(data->dev)) {
+			eth_gd32_trace_state(
+				data->dev, "RX suspended with descriptors returned",
+				eth_gd32_reg_read(data->dev->config, GD32_ENET_DMA_STAT_OFFSET),
+				true);
+			if (atomic_cas(&data->recovering, 0, 1)) {
+				(void)k_work_submit(&data->recover_work);
+			}
+			break;
+		}
 
 		if (!atomic_cas(&data->rx_work_pending, 1, 0)) {
 			break;
@@ -1122,12 +1187,14 @@ static void eth_gd32_recover_work_handler(struct k_work *work)
 	const struct device *dev = data->dev;
 	const struct eth_gd32_config *cfg = dev->config;
 
-	LOG_ERR("Recovering ENET after fatal bus error");
+	LOG_ERR("Recovering ENET after DMA fault");
 
 	eth_gd32_reg_write(cfg, GD32_ENET_DMA_INTEN_OFFSET, 0U);
 	eth_gd32_disable(cfg);
 
 	k_mutex_lock(&data->tx_mutex, K_FOREVER);
+	atomic_clear(&data->rx_work_pending);
+	atomic_clear(&data->rx_resume_pending);
 	eth_gd32_tx_reset(dev);
 	data->rx_tail = 0U;
 
@@ -1148,6 +1215,7 @@ static void eth_gd32_service(const struct device *dev)
 	struct eth_gd32_data *data = dev->data;
 	uint32_t stat = eth_gd32_reg_read(cfg, GD32_ENET_DMA_STAT_OFFSET);
 	uint32_t clear = 0U;
+	bool rx_done = (stat & ENET_DMA_STAT_RS) != 0U;
 
 	clear |= stat &
 		 (ENET_DMA_STAT_TS | ENET_DMA_STAT_TBU | ENET_DMA_STAT_TJT | ENET_DMA_STAT_TU);
@@ -1163,14 +1231,22 @@ static void eth_gd32_service(const struct device *dev)
 
 	if ((stat & (ENET_DMA_STAT_RS | ENET_DMA_STAT_RBU | ENET_DMA_STAT_RPS)) != 0U) {
 		if ((stat & ENET_DMA_STAT_RBU) != 0U) {
-			LOG_DBG("RX buffer unavailable");
-			eth_gd32_trace_state(dev, "RX buffer unavailable", stat);
+			/*
+			 * RBU is expected when RxDMA finishes a frame and runs
+			 * ahead of the worker before descriptors are returned.
+			 * Treat it as noteworthy only if reception did not also
+			 * complete in this interrupt.
+			 */
+			if (!rx_done) {
+				LOG_DBG("RX buffer unavailable");
+				eth_gd32_trace_state(dev, "RX buffer unavailable", stat, false);
+			}
 			atomic_set(&data->rx_resume_pending, 1);
 		}
 
 		if ((stat & ENET_DMA_STAT_RPS) != 0U) {
 			LOG_WRN("RX process stopped");
-			eth_gd32_trace_state(dev, "RX process stopped", stat);
+			eth_gd32_trace_state(dev, "RX process stopped", stat, true);
 			atomic_set(&data->rx_resume_pending, 1);
 		}
 
@@ -1184,7 +1260,7 @@ static void eth_gd32_service(const struct device *dev)
 
 	if ((stat & ENET_DMA_STAT_TU) != 0U) {
 		LOG_WRN("TX underflow");
-		eth_gd32_trace_state(dev, "TX underflow", stat);
+		eth_gd32_trace_state(dev, "TX underflow", stat, true);
 		if (eth_gd32_tx_has_pending_descs(dev)) {
 			/*
 			 * TU is a real transmit fault: the FIFO ran dry in the
@@ -1197,12 +1273,12 @@ static void eth_gd32_service(const struct device *dev)
 
 	if ((stat & ENET_DMA_STAT_RO) != 0U) {
 		LOG_WRN("RX overflow");
-		eth_gd32_trace_state(dev, "RX overflow", stat);
+		eth_gd32_trace_state(dev, "RX overflow", stat, true);
 	}
 
 	if ((stat & ENET_DMA_STAT_FBE) != 0U) {
 		LOG_ERR("Fatal bus error (DMA_STAT=0x%08x)", stat);
-		eth_gd32_trace_state(dev, "Fatal bus error", stat);
+		eth_gd32_trace_state(dev, "Fatal bus error", stat, true);
 		if (atomic_cas(&data->recovering, 0, 1)) {
 			(void)k_work_submit(&data->recover_work);
 		}
@@ -1229,12 +1305,12 @@ static bool eth_gd32_tx_zerocopy_possible(struct net_pkt *pkt, uint16_t *frag_co
 		}
 
 		count++;
-		if (count > (GD32_ETH_TX_DESC_COUNT * GD32_ETH_DMA_BUFS_PER_DESC)) {
+		if (count > (GD32_ETH_TX_DESC_COUNT * GD32_ETH_TX_DMA_BUFS_PER_DESC)) {
 			return false;
 		}
 	}
 
-	*frag_count = DIV_ROUND_UP(count, GD32_ETH_DMA_BUFS_PER_DESC);
+	*frag_count = DIV_ROUND_UP(count, GD32_ETH_TX_DMA_BUFS_PER_DESC);
 	return count != 0U;
 }
 
@@ -1257,7 +1333,7 @@ static int eth_gd32_tx_bounce_fill(const struct device *dev, struct net_pkt *pkt
 	uint16_t idx = first_idx;
 
 	for (uint16_t n = 0U; n < desc_count; n++) {
-		for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_DMA_BUFS_PER_DESC; buf_idx++) {
+		for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_TX_DMA_BUFS_PER_DESC; buf_idx++) {
 			size_t copied = 0U;
 			uint8_t *dst = eth_gd32_tx_dma_buf(dev, idx, buf_idx);
 
@@ -1318,7 +1394,7 @@ static int eth_gd32_tx(const struct device *dev, struct net_pkt *pkt)
 
 	zero_copy = eth_gd32_tx_zerocopy_possible(pkt, &desc_count);
 	if (!zero_copy) {
-		desc_count = DIV_ROUND_UP(total_len, GD32_ETH_DMA_DESC_BUF_LEN);
+		desc_count = DIV_ROUND_UP(total_len, GD32_ETH_TX_DESC_BUF_LEN);
 		if (desc_count > GD32_ETH_TX_DESC_COUNT) {
 			return -ENOBUFS;
 		}
@@ -1689,6 +1765,7 @@ static void phy_link_state_changed(const struct device *phy_dev, struct phy_link
 		return;
 	}
 
+	k_mutex_lock(&data->tx_mutex, K_FOREVER);
 	eth_gd32_disable(cfg);
 	if (state->is_up) {
 		eth_gd32_set_mac_config(dev, state);
@@ -1702,6 +1779,7 @@ static void phy_link_state_changed(const struct device *phy_dev, struct phy_link
 			net_eth_carrier_off(data->iface);
 		}
 	}
+	k_mutex_unlock(&data->tx_mutex);
 }
 
 static void eth_iface_init(struct net_if *iface)
@@ -1791,17 +1869,14 @@ static int eth_gd32_hw_init(const struct device *dev)
 	}
 
 	for (uint16_t i = 0U; i < GD32_ETH_RX_DESC_COUNT; i++) {
-		for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_DMA_BUFS_PER_DESC; buf_idx++) {
-			if (((uintptr_t)cfg->rx_dma_buf[i][buf_idx] & 0x3U) != 0U ||
-			    !gd32_dma_addr_ok((uintptr_t)cfg->rx_dma_buf[i][buf_idx],
-					      GD32_ETH_DMA_BUF_SIZE)) {
-				return -EFAULT;
-			}
+		if (((uintptr_t)cfg->rx_dma_buf[i][0] & 0x3U) != 0U ||
+		    !gd32_dma_addr_ok((uintptr_t)cfg->rx_dma_buf[i][0], GD32_ETH_DMA_BUF_SIZE)) {
+			return -EFAULT;
 		}
 	}
 
 	for (uint16_t i = 0U; i < GD32_ETH_TX_DESC_COUNT; i++) {
-		for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_DMA_BUFS_PER_DESC; buf_idx++) {
+		for (uint8_t buf_idx = 0U; buf_idx < GD32_ETH_TX_DMA_BUFS_PER_DESC; buf_idx++) {
 			if (((uintptr_t)cfg->tx_dma_buf[i][buf_idx] & 0x3U) != 0U ||
 			    !gd32_dma_addr_ok((uintptr_t)cfg->tx_dma_buf[i][buf_idx],
 					      GD32_ETH_DMA_BUF_SIZE)) {
@@ -1866,11 +1941,11 @@ static int eth_gd32_init(const struct device *dev)
 	static struct eth_gd32_dma_rings eth_gd32_dma_##inst __nocache                             \
 		__aligned(GD32_ETH_DMA_ALIGN);                                                     \
 	static uint8_t eth_gd32_rx_dma_buf_##inst[GD32_ETH_RX_DESC_COUNT]                          \
-							 [GD32_ETH_DMA_BUFS_PER_DESC]                      \
+							 [GD32_ETH_RX_DMA_BUFS_PER_DESC]                   \
 							 [GD32_ETH_DMA_BUF_SIZE] __nocache                 \
 		__aligned(GD32_ETH_DMA_ALIGN);                                                     \
 	static uint8_t eth_gd32_tx_dma_buf_##inst[GD32_ETH_TX_DESC_COUNT]                          \
-							 [GD32_ETH_DMA_BUFS_PER_DESC]                      \
+							 [GD32_ETH_TX_DMA_BUFS_PER_DESC]                   \
 							 [GD32_ETH_DMA_BUF_SIZE] __nocache                 \
 		__aligned(GD32_ETH_DMA_ALIGN);                                                     \
 	ETH_GD32_IRQ_CONFIG(inst)                                                                  \
