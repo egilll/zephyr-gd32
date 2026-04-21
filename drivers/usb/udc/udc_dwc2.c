@@ -813,6 +813,25 @@ static void dwc2_prep_rx(const struct device *dev, struct net_buf *buf,
 	LOG_INF("Prepare RX 0x%02x doeptsiz 0x%x", cfg->addr, doeptsiz);
 }
 
+static inline void dwc2_prep_setup0(const struct device *dev)
+{
+	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
+	struct udc_dwc2_data *const priv = udc_get_private(dev);
+	uint32_t doeptsiz;
+
+	/*
+	 * In Completer mode endpoint 0 SETUP packets are received through the
+	 * RxFIFO, but the core still requires DOEPTSIZ0 to be primed for three
+	 * 8-byte SETUP packets before the first control transfer arrives.
+	 */
+	doeptsiz = usb_dwc2_set_doeptsizn_pktcnt(1) |
+		   usb_dwc2_set_doeptsizn_xfersize(8U * 3U) |
+		   (3U << USB_DWC2_DOEPTSIZ0_SUPCNT_POS);
+
+	priv->rx_siz[0] = doeptsiz;
+	sys_write32(doeptsiz, (mem_addr_t)&base->out_ep[0].doeptsiz);
+}
+
 static void dwc2_handle_xfer_next(const struct device *dev,
 				  struct udc_ep_config *const cfg)
 {
@@ -2355,19 +2374,24 @@ static int udc_dwc2_enable(const struct device *dev)
 		return err;
 	}
 
-	/* Enable global interrupt */
-	sys_set_bits((mem_addr_t)&base->gahbcfg, USB_DWC2_GAHBCFG_GLBINTRMASK);
-	config->irq_enable_func(dev);
-
-	/* Disable soft disconnect */
-	sys_clear_bits((mem_addr_t)&base->dctl, USB_DWC2_DCTL_SFTDISCON);
-	LOG_DBG("Enable device %p", base);
-
 	err = dwc2_quirk_post_enable(dev);
 	if (err) {
 		LOG_ERR("Quirk post enable failed %d", err);
 		return err;
 	}
+
+	/* Enable global interrupt after vendor-specific PHY sequencing. */
+	sys_set_bits((mem_addr_t)&base->gahbcfg, USB_DWC2_GAHBCFG_GLBINTRMASK);
+	config->irq_enable_func(dev);
+
+	/*
+	 * Some integrations need additional PHY/pull-up sequencing before the
+	 * host is allowed to see the device. Complete vendor post-enable quirks
+	 * before enabling interrupts and clearing soft disconnect to avoid
+	 * racing the first bus reset.
+	 */
+	sys_clear_bits((mem_addr_t)&base->dctl, USB_DWC2_DCTL_SFTDISCON);
+	LOG_DBG("Enable device %p", base);
 
 	return 0;
 }
@@ -2620,6 +2644,7 @@ static void dwc2_on_bus_reset(const struct device *dev)
 
 	/* Software has to handle RxFLvl interrupt only in Completer mode */
 	if (dwc2_in_completer_mode(dev)) {
+		dwc2_prep_setup0(dev);
 		sys_set_bits((mem_addr_t)&base->gintmsk,
 			     USB_DWC2_GINTSTS_RXFLVL);
 	}
@@ -2636,6 +2661,13 @@ static void dwc2_handle_enumdone(const struct device *dev)
 	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
 	struct udc_dwc2_data *const priv = udc_get_private(dev);
 	uint32_t dsts;
+
+	if (dwc2_in_completer_mode(dev)) {
+		dwc2_prep_setup0(dev);
+	}
+
+	sys_clear_bits((mem_addr_t)&base->dctl, USB_DWC2_DCTL_CGNPINNAK);
+	sys_set_bits((mem_addr_t)&base->dctl, USB_DWC2_DCTL_CGNPINNAK);
 
 	dsts = sys_read32((mem_addr_t)&base->dsts);
 	priv->enumspd = usb_dwc2_get_dsts_enumspd(dsts);

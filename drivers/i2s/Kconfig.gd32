@@ -16,13 +16,13 @@ if I2S_GD32
 
 config I2S_GD32_RX_BLOCK_COUNT
 	int "RX queue block count"
-	default 2
+	default 4
 	help
 	  Number of RX blocks that can be queued internally.
 
 config I2S_GD32_TX_BLOCK_COUNT
 	int "TX queue block count"
-	default 2
+	default 8
 	help
 	  Number of TX blocks that can be queued internally.
 

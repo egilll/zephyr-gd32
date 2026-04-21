@@ -11,6 +11,16 @@
 
 #define SAMPLE_NO 64
 
+#if defined(CONFIG_BOARD_GD32F450Z_EVAL)
+#define SAMPLE_OUTPUT_FORMAT (I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED | I2S_FMT_BIT_CLK_INV)
+#define SAMPLE_CONTINUOUS_OUTPUT 1
+#define SAMPLE_ATTENUATION 0
+#else
+#define SAMPLE_OUTPUT_FORMAT I2S_FMT_DATA_FORMAT_I2S
+#define SAMPLE_CONTINUOUS_OUTPUT 0
+#define SAMPLE_ATTENUATION 1
+#endif
+
 /* The data represent a sine wave */
 static int16_t data[SAMPLE_NO] = {
 	  3211,   6392,   9511,  12539,  15446,  18204,  20787,  23169,
@@ -42,6 +52,11 @@ static void fill_buf(int16_t *tx_block, int att)
 
 #define NUM_BLOCKS 20
 #define BLOCK_SIZE (2 * sizeof(data))
+#define PRIME_BLOCKS 4
+#define DEMO_DURATION_MS 3000
+#define DEMO_BLOCK_COUNT \
+	((DEMO_DURATION_MS * i2s_cfg.frame_clk_freq + (SAMPLE_NO * 1000U) - 1U) / \
+	 (SAMPLE_NO * 1000U))
 
 #ifdef CONFIG_NOCACHE_MEMORY
 	#define MEM_SLAB_CACHE_ATTR __nocache
@@ -58,10 +73,11 @@ static STRUCT_SECTION_ITERABLE(k_mem_slab, tx_0_mem_slab) =
 
 int main(void)
 {
-	void *tx_block[NUM_BLOCKS];
 	struct i2s_config i2s_cfg;
+	int16_t tx_block[2 * SAMPLE_NO];
 	int ret;
 	uint32_t tx_idx;
+	uint32_t total_blocks;
 	const struct device *dev_i2s = DEVICE_DT_GET(DT_ALIAS(i2s_tx));
 
 	if (!device_is_ready(dev_i2s)) {
@@ -71,7 +87,7 @@ int main(void)
 	/* Configure I2S stream */
 	i2s_cfg.word_size = 16U;
 	i2s_cfg.channels = 2U;
-	i2s_cfg.format = I2S_FMT_DATA_FORMAT_I2S;
+	i2s_cfg.format = SAMPLE_OUTPUT_FORMAT;
 	i2s_cfg.frame_clk_freq = 44100;
 	i2s_cfg.block_size = BLOCK_SIZE;
 	i2s_cfg.timeout = 2000;
@@ -85,24 +101,17 @@ int main(void)
 		return ret;
 	}
 
-	/* Prepare all TX blocks */
-	for (tx_idx = 0; tx_idx < NUM_BLOCKS; tx_idx++) {
-		ret = k_mem_slab_alloc(&tx_0_mem_slab, &tx_block[tx_idx],
-				       K_FOREVER);
+	fill_buf(tx_block, SAMPLE_ATTENUATION);
+	total_blocks = DEMO_BLOCK_COUNT;
+
+	for (tx_idx = 0; tx_idx < MIN(PRIME_BLOCKS, total_blocks); tx_idx++) {
+		ret = i2s_buf_write(dev_i2s, tx_block, BLOCK_SIZE);
 		if (ret < 0) {
-			printf("Failed to allocate TX block\n");
+			printf("Could not prime TX buffer %u\n", tx_idx);
 			return ret;
 		}
-		fill_buf((uint16_t *)tx_block[tx_idx], tx_idx % 3);
 	}
 
-	tx_idx = 0;
-	/* Send first block */
-	ret = i2s_write(dev_i2s, tx_block[tx_idx++], BLOCK_SIZE);
-	if (ret < 0) {
-		printf("Could not write TX buffer %d\n", tx_idx);
-		return ret;
-	}
 	/* Trigger the I2S transmission */
 	ret = i2s_trigger(dev_i2s, I2S_DIR_TX, I2S_TRIGGER_START);
 	if (ret < 0) {
@@ -110,10 +119,23 @@ int main(void)
 		return ret;
 	}
 
-	for (; tx_idx < NUM_BLOCKS; ) {
-		ret = i2s_write(dev_i2s, tx_block[tx_idx++], BLOCK_SIZE);
+	if (SAMPLE_CONTINUOUS_OUTPUT) {
+		printf("Continuous I2S tone running\n");
+
+		for (;;) {
+			ret = i2s_buf_write(dev_i2s, tx_block, BLOCK_SIZE);
+			if (ret < 0) {
+				printf("Could not write TX buffer %u\n", tx_idx);
+				return ret;
+			}
+			tx_idx++;
+		}
+	}
+
+	for (; tx_idx < total_blocks; tx_idx++) {
+		ret = i2s_buf_write(dev_i2s, tx_block, BLOCK_SIZE);
 		if (ret < 0) {
-			printf("Could not write TX buffer %d\n", tx_idx);
+			printf("Could not write TX buffer %u\n", tx_idx);
 			return ret;
 		}
 	}
