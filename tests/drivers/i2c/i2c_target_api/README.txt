@@ -35,14 +35,6 @@ Transfer of commands from one bus controller to the other is
 accomplished by hardware through having the SCL (and SDA) signals
 shorted to join the two buses.
 
-On gd32f450z_eval, the test uses I2C0 and I2C1. Wire:
-1. PB6 (I2C0_SCL) to PB10 (I2C1_SCL),
-2. PB7 (I2C0_SDA) to PB11 (I2C1_SDA).
-
-On gd32f450z_eval, two build variants are provided:
-1. IRQ controller to IRQ target with the base board overlay,
-2. DMA controller to DMA target with an extra DMA overlay.
-
 Presence of this required hardware configuration is identified by the
 `i2c_bus_short` fixture.  If the buses are not connected as required,
 or the controller driver has bugs, the test will fail one or more I2C

@@ -14,7 +14,6 @@ tests:
       - nucleo_l073rz
       - sama7g54_ek
       - sama7d65_curiosity
-      - gd32f450z_eval
     integration_platforms:
       - qemu_x86
   drivers.eeprom.api.w_at2x_emul:

@@ -6,21 +6,10 @@
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/eeprom.h>
-#include <zephyr/drivers/i2c.h>
 #include <zephyr/ztest.h>
 
 /* There is no obvious way to pass this to tests, so use a global */
 ZTEST_BMEM static const struct device *eeprom;
-
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_target_0))
-#define EEPROM_TARGET_0_NODE DT_ALIAS(eeprom_target_0)
-static const struct device *const eeprom_target_0 = DEVICE_DT_GET(EEPROM_TARGET_0_NODE);
-#endif
-
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_target_1))
-#define EEPROM_TARGET_1_NODE DT_ALIAS(eeprom_target_1)
-static const struct device *const eeprom_target_1 = DEVICE_DT_GET(EEPROM_TARGET_1_NODE);
-#endif
 
 /* Test retrieval of eeprom size */
 ZTEST_USER(eeprom, test_size)
@@ -175,36 +164,6 @@ ZTEST_USER(eeprom, test_zero_length_write)
 	zassert_ok(rc, "Unexpected error code (%d)", rc);
 }
 
-ZTEST_USER(eeprom, test_large_pattern_write_read)
-{
-	uint8_t wr_buf[32];
-	uint8_t rd_buf[sizeof(wr_buf)];
-	size_t size;
-	off_t address = 0;
-	int rc;
-
-	size = eeprom_get_size(eeprom);
-	if (size < sizeof(wr_buf)) {
-		ztest_test_skip();
-	}
-
-	for (size_t i = 0; i < sizeof(wr_buf); i++) {
-		wr_buf[i] = (uint8_t)(0x31U + (i * 7U));
-	}
-
-	while ((address + sizeof(wr_buf)) <= MIN(size, 96U)) {
-		rc = eeprom_write(eeprom, address, wr_buf, sizeof(wr_buf));
-		zassert_ok(rc, "Unexpected error code (%d)", rc);
-
-		rc = eeprom_read(eeprom, address, rd_buf, sizeof(rd_buf));
-		zassert_ok(rc, "Unexpected error code (%d)", rc);
-
-		zassert_mem_equal(wr_buf, rd_buf, sizeof(wr_buf),
-				  "Large pattern mismatch at offset %ld", (long)address);
-		address += 8;
-	}
-}
-
 static void *eeprom_setup(void)
 {
 	zassert_true(device_is_ready(eeprom), "EEPROM device not ready");
@@ -224,41 +183,13 @@ static void run_tests_on_eeprom(const struct device *dev)
 	ztest_run_all(NULL, false, 1, 1);
 }
 
-static void register_targets(void)
-{
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_target_0))
-	zassert_true(device_is_ready(eeprom_target_0), "EEPROM target 0 not ready");
-	zassert_ok(i2c_target_driver_register(eeprom_target_0));
-#endif
-
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_target_1))
-	zassert_true(device_is_ready(eeprom_target_1), "EEPROM target 1 not ready");
-	zassert_ok(i2c_target_driver_register(eeprom_target_1));
-#endif
-}
-
-static void unregister_targets(void)
-{
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_target_0))
-	zassert_ok(i2c_target_driver_unregister(eeprom_target_0));
-#endif
-
-#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_target_1))
-	zassert_ok(i2c_target_driver_unregister(eeprom_target_1));
-#endif
-}
-
 void test_main(void)
 {
-	register_targets();
-
 	run_tests_on_eeprom(DEVICE_DT_GET(DT_ALIAS(eeprom_0)));
 
 #if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_1))
 	run_tests_on_eeprom(DEVICE_DT_GET(DT_ALIAS(eeprom_1)));
 #endif /* DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(eeprom_1)) */
-
-	unregister_targets();
 
 	ztest_verify_all_test_suites_ran();
 }

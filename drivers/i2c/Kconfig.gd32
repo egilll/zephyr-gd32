@@ -21,24 +21,4 @@ config I2C_GD32_DMA
 	  Use DMA for GD32 I2C controller mode transfers when DMA channels are
 	  described in devicetree.
 
-config I2C_GD32_DMA_MIN_MSG_LEN
-	int "Minimum message length for DMA offload"
-	default 5
-	range 1 65535
-	depends on I2C_GD32_DMA
-	help
-	  Only use DMA for single-message controller transfers at or above this
-	  many bytes. Smaller transfers stay on the interrupt-driven path to avoid
-	  paying DMA setup/teardown overhead.
-
-config I2C_GD32_TARGET_BUFFER_SIZE
-	int "Buffered target-mode RX capacity"
-	default 64
-	range 1 65535
-	depends on I2C_TARGET
-	depends on I2C_TARGET_BUFFER_MODE
-	help
-	  Number of bytes that can be accumulated for a buffered target-mode write
-	  before the driver NACKs further data.
-
 endif # I2C_GD32
