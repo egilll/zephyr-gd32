@@ -57,15 +57,21 @@ extern void dns_dispatcher_svc_handler(struct net_socket_service_event *pev);
 #if defined(CONFIG_NET_IPV4)
 static struct mdns_responder_context v4_ctx[MAX_IPV4_IFACE_COUNT];
 
+/* Sized to fit both the steady-state responder (one fd per iface) and the
+ * probe path, which reuses the same socket service via a dns_resolve_context
+ * that carries DNS_RESOLVER_MAX_POLL fds. Taking the smaller of the two
+ * causes net_socket_service_register to return -ENOMEM, so probing never
+ * completes and the responder is stuck at EBADF on every announce.
+ */
 NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(v4_svc, dns_dispatcher_svc_handler,
-				      MDNS_MAX_IPV4_IFACE_COUNT);
+				      MAX(MDNS_MAX_IPV4_IFACE_COUNT, DNS_RESOLVER_MAX_POLL));
 #endif
 
 #if defined(CONFIG_NET_IPV6)
 static struct mdns_responder_context v6_ctx[MAX_IPV6_IFACE_COUNT];
 
 NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(v6_svc, dns_dispatcher_svc_handler,
-				      MDNS_MAX_IPV6_IFACE_COUNT);
+				      MAX(MDNS_MAX_IPV6_IFACE_COUNT, DNS_RESOLVER_MAX_POLL));
 #endif
 
 static struct net_mgmt_event_callback mgmt_iface_cb;
@@ -98,6 +104,11 @@ struct mdns_monitor_iface_addr {
 	struct net_addr addr;
 	bool in_use : 1;
 	bool needs_announce : 1;
+	/* The address has been removed from the interface but its goodbye
+	 * announce (TTL=0) hasn't yet been emitted — the entry is kept here
+	 * so the next successful send carries the withdrawal.
+	 */
+	bool pending_goodbye : 1;
 };
 
 static struct mdns_monitor_iface_addr mon_if[
@@ -160,6 +171,7 @@ static void mark_needs_announce(struct net_if *iface, bool needs_announce)
 		mon_if[i].needs_announce = needs_announce;
 	}
 }
+
 #endif /* CONFIG_MDNS_RESPONDER_PROBE */
 
 static void mdns_iface_event_handler(struct net_mgmt_event_callback *cb,
@@ -190,6 +202,13 @@ static void mdns_iface_event_handler(struct net_mgmt_event_callback *cb,
 
 		mark_needs_announce(iface, true);
 	}
+
+	/* We don't try to emit a goodbye on IF_DOWN: sending fails once the
+	 * iface is down anyway, and addresses are removed via ADDR_DEL which
+	 * already marks mon_if entries pending_goodbye. The next time the
+	 * iface comes back up and a new address is announced, those pending
+	 * entries ride along with TTL=0 in the same packet.
+	 */
 #endif /* CONFIG_MDNS_RESPONDER_PROBE */
 }
 
@@ -810,7 +829,13 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 		}
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
-			mon_if[j].in_use = false;
+			/* Keep the entry around marked as pending_goodbye so the
+			 * next successful announce emits a TTL=0 record for it.
+			 * in_use stays true so create_unsolicited_mdns_answer
+			 * still picks it up.
+			 */
+			mon_if[j].pending_goodbye = true;
+			mon_if[j].needs_announce = true;
 			return 0;
 		}
 	}
@@ -1025,17 +1050,41 @@ static void mdns_addr_event_handler(struct net_mgmt_event_callback *cb,
 	int ret;
 
 #if defined(CONFIG_NET_IPV4)
-	if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
+	/* With CONFIG_NET_IPV4_ACD enabled, ADDR_ADD fires while the address is
+	 * still tentative — sending a probe at that moment fails because the
+	 * source address is unspecified. Defer probe scheduling to ACD_SUCCEED
+	 * in that case.
+	 */
+	if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD ||
+	    mgmt_event == NET_EVENT_IPV4_ACD_SUCCEED) {
 		ARRAY_FOR_EACH(v4_ctx, i) {
 			if (v4_ctx[i].iface != iface) {
 				continue;
 			}
 
-			ret = add_address(iface, NET_AF_INET, cb->info, cb->info_length);
-			if (ret < 0 && ret != -EALREADY) {
-				NET_DBG("Cannot %s %s address (%d)", "add", "IPv4", ret);
-				return;
+			if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
+				ret = add_address(iface, NET_AF_INET, cb->info, cb->info_length);
+				if (ret < 0 && ret != -EALREADY) {
+					NET_DBG("Cannot %s %s address (%d)", "add", "IPv4", ret);
+					return;
+				}
+
+				if (IS_ENABLED(CONFIG_NET_IPV4_ACD)) {
+					/* Wait for ACD_SUCCEED before probing. */
+					break;
+				}
 			}
+
+			/* Once the responder has completed its initial probe
+			 * we already own the name; a subsequent address change
+			 * just needs a fresh announce, not another probe.
+			 */
+#if defined(CONFIG_NET_DHCPV4)
+			if (init_listener_done) {
+				start_announce(iface);
+				break;
+			}
+#endif
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v4_ctx[i].probe_timer,
@@ -1705,7 +1754,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 
 		net_buf_add_be16(answer, type);
 		net_buf_add_be16(answer, DNS_CLASS_IN);
-		net_buf_add_be32(answer, ttl);
+		net_buf_add_be32(answer, addr_list[i].pending_goodbye ? 0 : ttl);
 
 		if (type == DNS_RR_TYPE_A) {
 			net_buf_add_be16(answer, sizeof(struct net_in_addr));
@@ -1747,7 +1796,7 @@ static bool check_if_needs_announce(struct net_if *iface)
 	return false;
 }
 
-static int send_announce(const char *name)
+static int send_announce_ttl(const char *name, struct net_if *only_iface, uint32_t ttl)
 {
 	struct net_buf *answer;
 	int ret;
@@ -1758,18 +1807,31 @@ static int send_announce(const char *name)
 	create_ipv4_addr(&dst_addr4);
 
 	ARRAY_FOR_EACH(v4_ctx, i) {
-		if (v4_ctx[i].sock < 0 || v4_ctx[i].iface == NULL ||
-		    !net_if_is_up(v4_ctx[i].iface)) {
+		if (v4_ctx[i].sock < 0 || v4_ctx[i].iface == NULL) {
 			continue;
 		}
 
-		if (!check_if_needs_announce(v4_ctx[i].iface)) {
+		if (only_iface != NULL && v4_ctx[i].iface != only_iface) {
 			continue;
+		}
+
+		/* For goodbye (ttl==0) we must emit even when the iface is
+		 * going down — skip only the needs-announce gate because this
+		 * path is explicitly withdrawing the records.
+		 */
+		if (ttl != 0) {
+			if (!net_if_is_up(v4_ctx[i].iface)) {
+				continue;
+			}
+
+			if (!check_if_needs_announce(v4_ctx[i].iface)) {
+				continue;
+			}
 		}
 
 		answer = create_unsolicited_mdns_answer(v4_ctx[i].iface,
 							name,
-							MDNS_TTL,
+							ttl,
 							mon_if,
 							ARRAY_SIZE(mon_if));
 		if (answer == NULL) {
@@ -1790,8 +1852,21 @@ static int send_announce(const char *name)
 			continue;
 		}
 
-		NET_DBG("Announcing %s responder for %s%s (iface %d)",
-			"mDNS", name, ".local", net_if_get_by_iface(v4_ctx[i].iface));
+		NET_DBG("Announcing %s responder for %s%s (iface %d, ttl=%u)",
+			"mDNS", name, ".local", net_if_get_by_iface(v4_ctx[i].iface), ttl);
+
+		/* Any pending_goodbye entries on this iface just had their
+		 * TTL=0 record sent. Drop them from the monitor list.
+		 */
+		ARRAY_FOR_EACH(mon_if, j) {
+			if (mon_if[j].in_use && mon_if[j].iface == v4_ctx[i].iface &&
+			    mon_if[j].addr.family == NET_AF_INET &&
+			    mon_if[j].pending_goodbye) {
+				mon_if[j].in_use = false;
+				mon_if[j].pending_goodbye = false;
+				mon_if[j].needs_announce = false;
+			}
+		}
 	}
 #endif /* defined(CONFIG_NET_IPV4) */
 
@@ -1801,18 +1876,27 @@ static int send_announce(const char *name)
 	create_ipv6_addr(&dst_addr6);
 
 	ARRAY_FOR_EACH(v6_ctx, i) {
-		if (v6_ctx[i].sock < 0 || v6_ctx[i].iface == NULL ||
-		    !net_if_is_up(v6_ctx[i].iface)) {
+		if (v6_ctx[i].sock < 0 || v6_ctx[i].iface == NULL) {
 			continue;
 		}
 
-		if (!check_if_needs_announce(v6_ctx[i].iface)) {
+		if (only_iface != NULL && v6_ctx[i].iface != only_iface) {
 			continue;
+		}
+
+		if (ttl != 0) {
+			if (!net_if_is_up(v6_ctx[i].iface)) {
+				continue;
+			}
+
+			if (!check_if_needs_announce(v6_ctx[i].iface)) {
+				continue;
+			}
 		}
 
 		answer = create_unsolicited_mdns_answer(v6_ctx[i].iface,
 							name,
-							MDNS_TTL,
+							ttl,
 							mon_if,
 							ARRAY_SIZE(mon_if));
 		if (answer == NULL) {
@@ -1833,12 +1917,27 @@ static int send_announce(const char *name)
 			continue;
 		}
 
-		NET_DBG("Announcing %s responder for %s%s (iface %d)",
-			"mDNS", name, ".local", net_if_get_by_iface(v6_ctx[i].iface));
+		NET_DBG("Announcing %s responder for %s%s (iface %d, ttl=%u)",
+			"mDNS", name, ".local", net_if_get_by_iface(v6_ctx[i].iface), ttl);
+
+		ARRAY_FOR_EACH(mon_if, j) {
+			if (mon_if[j].in_use && mon_if[j].iface == v6_ctx[i].iface &&
+			    mon_if[j].addr.family == NET_AF_INET6 &&
+			    mon_if[j].pending_goodbye) {
+				mon_if[j].in_use = false;
+				mon_if[j].pending_goodbye = false;
+				mon_if[j].needs_announce = false;
+			}
+		}
 	}
 #endif /* defined(CONFIG_NET_IPV6) */
 
 	return 0;
+}
+
+static int send_announce(const char *name)
+{
+	return send_announce_ttl(name, NULL, MDNS_TTL);
 }
 
 static void announce_start(struct k_work *work)
@@ -1876,7 +1975,11 @@ static void do_init_listener(struct k_work *work)
 		return;
 	}
 
-	if (do_announce) {
+	/* do_announce gets set by the DHCP_BOUND path before init_listener has
+	 * ever run; gate on init_listener_done so we actually open the sockets
+	 * the first time through.
+	 */
+	if (do_announce && init_listener_done) {
 		if (announce_count < 1) {
 			announce_start(work);
 		} else {
@@ -1901,7 +2004,7 @@ static void do_init_listener(struct k_work *work)
 
 static int mdns_responder_init(void)
 {
-	uint64_t flags = NET_EVENT_IF_UP;
+	uint64_t flags = NET_EVENT_IF_UP | NET_EVENT_IF_DOWN;
 	external_records = NULL;
 	external_records_count = 0;
 
@@ -1918,7 +2021,8 @@ static int mdns_responder_init(void)
 #if defined(CONFIG_NET_IPV4)
 	net_mgmt_init_event_callback(&mgmt4_addr_cb, mdns_addr_event_handler,
 				     NET_EVENT_IPV4_ADDR_ADD |
-				     NET_EVENT_IPV4_ADDR_DEL);
+				     NET_EVENT_IPV4_ADDR_DEL |
+				     NET_EVENT_IPV4_ACD_SUCCEED);
 	net_mgmt_add_event_callback(&mgmt4_addr_cb);
 #endif
 
