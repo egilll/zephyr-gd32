@@ -7,3 +7,11 @@ config CLOCK_CONTROL_GD32
     depends on DT_HAS_GD_GD32_CCTL_ENABLED
     help
       Enable driver for Gigadevice Reset Clock Unit (RCU).
+
+config CLOCK_GD32_CKOUT
+    bool "GD32 CKOUT (microcontroller clock output)"
+    default y
+    depends on DT_HAS_GD_GD32_CKOUT_ENABLED
+    help
+      Enable configuration of CKOUT0 via devicetree. Useful to feed
+      external peripherals (e.g. RMII PHY 50 MHz) directly from the MCU.

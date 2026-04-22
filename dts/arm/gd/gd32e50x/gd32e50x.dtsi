@@ -180,34 +180,6 @@
 			status = "disabled";
 		};
 
-		enet: ethernet@40028000 {
-			compatible = "gd,gd32-ethernet";
-			reg = <0x40028000 0x8000>;
-			#address-cells = <1>;
-			#size-cells = <1>;
-			interrupts = <61 0>;
-			clocks = <&cctl GD32_CLOCK_ENET>,
-				 <&cctl GD32_CLOCK_ENETTX>,
-				 <&cctl GD32_CLOCK_ENETRX>;
-			clock-names = "mac", "tx", "rx";
-			resets = <&rctl GD32_RESET_ENET>;
-			reset-names = "mac";
-			phy-connection-type = "rmii";
-			status = "disabled";
-
-			mdio: mdio@40028010 {
-				compatible = "gd,gd32-mdio";
-				/* MDIO is part of ENET; map the management station registers. */
-				reg = <0x40028010 0x08>;
-				#address-cells = <1>;
-				#size-cells = <0>;
-				clocks = <&cctl GD32_CLOCK_ENET>,
-					 <&cctl GD32_CLOCK_ENETTX>,
-					 <&cctl GD32_CLOCK_ENETRX>;
-				status = "disabled";
-			};
-		};
-
 		exti: interrupt-controller@40010400 {
 			compatible = "gd,gd32-exti";
 			interrupt-controller;

@@ -7,22 +7,15 @@
 
 &pinctrl {
 	enet_default: enet_default {
-		group1 {
-			pinmux = <ETH_RMII_REF_CLK_PA1>, <ETH_RMII_CRS_DV_PA7>,
-				 <ETH_RMII_RXD0_PC4>, <ETH_RMII_RXD1_PC5>,
-				 <ETH_RMII_TX_EN_PG11>, <ETH_RMII_TXD0_PG13>,
-				 <ETH_RMII_TXD1_PG14>;
-			slew-rate = "max-speed-200mhz";
-		};
-	};
-
-	mdio_default: mdio_default {
-		group1 {
-			pinmux = <ETH_MDIO_PA2>, <ETH_MDC_PC1>;
-			slew-rate = "max-speed-200mhz";
-		};
-	};
-
+        group1 {
+            pinmux = <ETH_RMII_REF_CLK_PA1>, <ETH_MDIO_PA2>,
+                     <ETH_RMII_CRS_DV_PA7>, <ETH_MDC_PC1>,
+                     <ETH_RMII_RXD0_PC4>, <ETH_RMII_RXD1_PC5>,
+                     <ETH_RMII_TX_EN_PG11>, <ETH_RMII_TXD0_PG13>,
+                     <ETH_RMII_TXD1_PG14>;
+            slew-rate = "max-speed-200mhz";
+        };
+    };
 	usart0_default: usart0_default {
 		group1 {
 			pinmux = <USART0_TX_PA9>, <USART0_RX_PA10>;

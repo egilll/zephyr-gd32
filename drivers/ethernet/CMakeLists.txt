@@ -31,10 +31,6 @@ add_subdirectory(nxp_imx_netc)
 add_subdirectory(dwc_xgmac)
 add_subdirectory(intel)
 
-if(CONFIG_ETH_GD32 OR CONFIG_MDIO_GD_GD32)
-  zephyr_library_sources(gd32_enet_platform.c)
-endif()
-
 # zephyr-keep-sorted-start
 zephyr_library_sources_ifdef(CONFIG_ETH_ADIN2111 eth_adin2111.c)
 zephyr_library_sources_ifdef(CONFIG_ETH_CYCLONEV eth_cyclonev.c)

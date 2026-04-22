@@ -8,11 +8,26 @@ compatible: "gd,gd32-mdio"
 include: [mdio-controller.yaml, pinctrl-device.yaml]
 
 properties:
-  clocks:
-    required: true
-
   pinctrl-0:
     required: true
 
   pinctrl-names:
     required: true
+
+  phy-connection-type:
+    type: string
+    default: "rmii"
+    enum:
+      - "mii"
+      - "rmii"
+    description: |
+      Selects the PHY interface mode in SYSCFG (ENET_PHY_SEL).
+      This must match the board wiring.
+
+  gd,phy-clk-out:
+    type: boolean
+    required: false
+    description: |
+      When present, configure CKOUT0 on PA8 to output 50 MHz from PLLP/4
+      to feed the external PHY XI pin. Some designs rely on the MCU as the
+      PHY clock source.

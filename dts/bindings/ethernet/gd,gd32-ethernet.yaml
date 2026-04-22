@@ -22,13 +22,6 @@ properties:
     description: |
       Clock names, typically "mac", "tx", "rx" and optionally "ptp".
 
-  resets:
-    required: false
-    description: |
-      Optional MAC bus reset. Supported GD32 ENET implementations expose a
-      single "mac" reset domain; TX, RX and PTP are separate clocks, not
-      separate reset lines.
-
   phy-connection-type:
     required: true
 
@@ -42,16 +35,14 @@ properties:
   pinctrl-names:
     required: true
 
-  phy-clock-type:
-    type: string
-    default: "external"
-    enum:
-      - "external"
-      - "internal"
+  gd,phy-clk-out:
+    type: boolean
+    required: false
     description: |
-      Selects the PHY reference clock source.
-      "external" means the PHY is clocked from its own crystal or oscillator.
-      "internal" means the MCU drives CKOUT0 on PA8 as the PHY reference clock.
+      When present, configure CKOUT0 on PA8 to output 50 MHz from PLLP/4
+      to feed the external PHY XI pin. Some designs rely on the MCU as the
+      PHY clock source. If not present, the driver assumes the PHY has its own
+      crystal or clocking source and no CKOUT is configured.
 
   zephyr,mac-address-prefix:
     type: uint8-array

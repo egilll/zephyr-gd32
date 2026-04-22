@@ -168,25 +168,3 @@
 &fwdgt {
 	status = "okay";
 };
-
-&mdio {
-	status = "okay";
-	pinctrl-0 = <&mdio_default>;
-	pinctrl-names = "default";
-
-	eth_phy0: ethernet-phy@1 {
-		compatible = "ethernet-phy";
-		reg = <1>;
-		no-reset;
-		default-speeds = "10BASE Half-Duplex", "10BASE Full-Duplex",
-				 "100BASE Half-Duplex", "100BASE Full-Duplex";
-	};
-};
-
-&enet {
-	status = "okay";
-	pinctrl-0 = <&enet_default>;
-	pinctrl-names = "default";
-	gd,phy-clk-out;
-	phy-handle = <&eth_phy0>;
-};

@@ -17,19 +17,4 @@
 			pinmux = <TIMER0_CH0_PA8_OUT_NORMP>;
 		};
 	};
-
-	enet_default: enet_default {
-		group1 {
-			pinmux = <ETH_RMII_REF_CLK_PA1>, <ETH_RMII_CRS_DV_PA7_NORMP>,
-				 <ETH_RMII_RXD0_PC4_NORMP>, <ETH_RMII_RXD1_PC5_NORMP>,
-				 <ETH_RMII_TX_EN_PB11>, <ETH_RMII_TXD0_PB12>,
-				 <ETH_RMII_TXD1_PB13>;
-		};
-	};
-
-	mdio_default: mdio_default {
-		group1 {
-			pinmux = <ETH_RMII_MDIO_PA2>, <ETH_RMII_MDC_PC1>;
-		};
-	};
 };
