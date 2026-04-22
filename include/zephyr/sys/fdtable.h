@@ -296,7 +296,6 @@ enum {
 	/* Codes above 0x5400 and below 0x5500 are reserved for termios, FIO, etc */
 	ZFD_IOCTL_FIONREAD = 0x541B,
 	ZFD_IOCTL_FIONBIO = 0x5421,
-	ZFD_IOCTL_SIOCOUTQ = 0x5411,
 };
 
 /**

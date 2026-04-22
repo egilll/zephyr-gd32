@@ -1418,36 +1418,9 @@ static size_t zsock_recv_stream_immediate(struct net_context *ctx, uint8_t **buf
 
 static int zsock_fionread_ctx(struct net_context *ctx)
 {
-	if (net_context_get_proto(ctx) == NET_IPPROTO_TCP &&
-	    net_context_get_state(ctx) == NET_CONTEXT_LISTENING) {
-		return -EINVAL;
-	}
-
 	size_t ret = zsock_recv_stream_immediate(ctx, NULL, NULL, 0);
 
 	return MIN(ret, INT_MAX);
-}
-
-static int zsock_outq_ctx(struct net_context *ctx, enum tcp_conn_option option)
-{
-	int outq;
-	uint32_t len = sizeof(outq);
-	int ret;
-
-	if (net_context_get_proto(ctx) != NET_IPPROTO_TCP) {
-		return -EOPNOTSUPP;
-	}
-
-	if (net_context_get_state(ctx) == NET_CONTEXT_LISTENING) {
-		return -EINVAL;
-	}
-
-	ret = net_tcp_get_option(ctx, option, &outq, &len);
-	if (ret < 0) {
-		return ret;
-	}
-
-	return outq;
 }
 
 static ssize_t zsock_recv_stream_timed(struct net_context *ctx, struct net_msghdr *msg,
@@ -2001,19 +1974,6 @@ int zsock_getsockopt_ctx(struct net_context *ctx, int level, int optname,
 		case ZSOCK_TCP_NODELAY:
 			ret = net_tcp_get_option(ctx, TCP_OPT_NODELAY, optval, optlen);
 			return ret;
-
-		case ZSOCK_TCP_INFO:
-			if (net_context_get_proto(ctx) != NET_IPPROTO_TCP) {
-				break;
-			}
-
-			ret = net_tcp_get_option(ctx, TCP_OPT_INFO, optval, optlen);
-			if (ret < 0) {
-				errno = -ret;
-				return -1;
-			}
-
-			return 0;
 
 		case ZSOCK_TCP_KEEPIDLE:
 			__fallthrough;
@@ -3146,27 +3106,8 @@ static int sock_ioctl_vmeth(void *obj, unsigned int request, va_list args)
 
 	case ZFD_IOCTL_FIONREAD: {
 		int *avail = va_arg(args, int *);
-		int ret = zsock_fionread_ctx(obj);
 
-		if (ret < 0) {
-			errno = -ret;
-			return -1;
-		}
-
-		*avail = ret;
-		return 0;
-	}
-
-	case ZFD_IOCTL_SIOCOUTQ: {
-		int *avail = va_arg(args, int *);
-		int outq = zsock_outq_ctx(obj, TCP_OPT_OUTQ);
-
-		if (outq < 0) {
-			errno = -outq;
-			return -1;
-		}
-
-		*avail = outq;
+		*avail = zsock_fionread_ctx(obj);
 		return 0;
 	}
 

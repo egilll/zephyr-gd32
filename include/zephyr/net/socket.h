@@ -595,10 +595,9 @@ static inline int zsock_fcntl_wrapper(int sock, int cmd, ...)
  * https://pubs.opengroup.org/onlinepubs/9699919799/functions/ioctl.html
  * for normative description.
  * This function enables querying or manipulating underlying socket parameters.
- * Currently supported @p request values include:
- *   - `ZFD_IOCTL_FIONBIO`, to set non-blocking mode
- *   - `ZFD_IOCTL_FIONREAD`, to query the number of bytes available to read
- *   - `ZFD_IOCTL_SIOCOUTQ`, to query the total queued send bytes
+ * Currently supported @p request values include `ZFD_IOCTL_FIONBIO`, and
+ * `ZFD_IOCTL_FIONREAD`, to set non-blocking mode, and query the number of
+ * bytes available to read, respectively.
  * This function is also exposed as `ioctl()`
  * if @kconfig{CONFIG_POSIX_API} is defined (in which case
  * it may conflict with generic POSIX `ioctl()` function).
@@ -944,76 +943,6 @@ int zsock_getnameinfo(const struct net_sockaddr *addr, net_socklen_t addrlen,
 #define ZSOCK_TCP_KEEPINTVL 3
 /** Number of keepalives before dropping connection */
 #define ZSOCK_TCP_KEEPCNT 4
-/** Retrieve TCP transport information for a TCP socket. */
-#define ZSOCK_TCP_INFO 5
-
-/** `tcpi_state`: established connection. */
-#define ZSOCK_TCP_ESTABLISHED 1
-/** `tcpi_state`: connection request has been sent. */
-#define ZSOCK_TCP_SYN_SENT 2
-/** `tcpi_state`: connection request has been received. */
-#define ZSOCK_TCP_SYN_RECV 3
-/** `tcpi_state`: waiting for a matching connection request after close. */
-#define ZSOCK_TCP_FIN_WAIT1 4
-/** `tcpi_state`: waiting for a connection termination request from the peer. */
-#define ZSOCK_TCP_FIN_WAIT2 5
-/** `tcpi_state`: waiting for enough time to pass to be sure the peer received the close. */
-#define ZSOCK_TCP_TIME_WAIT 6
-/** `tcpi_state`: socket is closed. */
-#define ZSOCK_TCP_CLOSE 7
-/** `tcpi_state`: waiting for a connection termination request from the local user. */
-#define ZSOCK_TCP_CLOSE_WAIT 8
-/** `tcpi_state`: waiting for an acknowledgement of the connection termination request. */
-#define ZSOCK_TCP_LAST_ACK 9
-/** `tcpi_state`: listening for incoming connections. */
-#define ZSOCK_TCP_LISTEN 10
-/** `tcpi_state`: connection closed while waiting for the final ACK. */
-#define ZSOCK_TCP_CLOSING 11
-
-/** Congestion avoidance state is open. */
-#define ZSOCK_TCP_CA_OPEN 0
-/** Congestion avoidance is in disorder detection. */
-#define ZSOCK_TCP_CA_DISORDER 1
-/** Congestion avoidance is in congestion window reduction. */
-#define ZSOCK_TCP_CA_CWR 2
-/** Congestion avoidance is in fast recovery. */
-#define ZSOCK_TCP_CA_RECOVERY 3
-/** Congestion avoidance is in loss recovery. */
-#define ZSOCK_TCP_CA_LOSS 4
-
-/** Snapshot of supported TCP transport state for one socket. */
-struct zsock_tcp_info {
-	/** TCP finite-state-machine state using `ZSOCK_TCP_*` values. */
-	uint8_t tcpi_state;
-	/** Best-effort congestion avoidance state derived from recovery bookkeeping. */
-	uint8_t tcpi_ca_state;
-	/** Current retransmission attempt count for outstanding data. */
-	uint8_t tcpi_retransmits;
-	/** Consecutive duplicate ACKs seen recently. */
-	uint8_t tcpi_dupacks;
-	/** Retransmission timeout, in microseconds. */
-	uint32_t tcpi_rto;
-	/** Current effective send MSS, in bytes. */
-	uint32_t tcpi_snd_mss;
-	/** Current slow-start threshold, in bytes. */
-	uint32_t tcpi_snd_ssthresh;
-	/** Current congestion window, in bytes. */
-	uint32_t tcpi_snd_cwnd;
-	/** Current receive window advertised to the peer, in bytes. */
-	uint32_t tcpi_rcv_space;
-	/** Current effective peer-advertised send window, in bytes. */
-	uint32_t tcpi_snd_wnd;
-	/** Oldest unacknowledged sequence number derived from current send state. */
-	uint32_t tcpi_snd_una;
-	/** Next sequence number already sent to the peer. */
-	uint32_t tcpi_snd_nxt;
-	/** Highest queued sequence number edge currently represented in the send buffer. */
-	uint32_t tcpi_snd_max;
-	/** Next sequence number expected from the peer. */
-	uint32_t tcpi_rcv_nxt;
-	/** Queued send bytes not yet sent to the peer. */
-	uint32_t tcpi_notsent_bytes;
-};
 
 /** @} */
 

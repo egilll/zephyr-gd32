@@ -247,7 +247,6 @@ extern "C" {
 #define TCP_KEEPIDLE   ZSOCK_TCP_KEEPIDLE
 #define TCP_KEEPINTVL  ZSOCK_TCP_KEEPINTVL
 #define TCP_KEEPCNT    ZSOCK_TCP_KEEPCNT
-#define TCP_INFO       ZSOCK_TCP_INFO
 
 #define IP_TOS               ZSOCK_IP_TOS
 #define IP_TTL               ZSOCK_IP_TTL
