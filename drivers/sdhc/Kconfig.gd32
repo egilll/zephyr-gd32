@@ -23,4 +23,18 @@ config SD_BUFFER_SIZE
 	int
 	default 512
 
+config SDHC_GD32_VERBOSE_DATA_ERRORS
+	bool "Verbose LOG_ERR + hw-state dump on data-path failures"
+	default n
+	help
+	  Enable rich LOG_ERR + dump_hw_state diagnostics in
+	  gd32_sdhc_wait_data_done when an SDIO/DMA transfer fails.
+	  The function still returns -ETIMEDOUT / -EIO / -ENODEV to the
+	  caller in either case; this only controls in-driver logging.
+
+	  Off by default because each LOG_ERR site (7-8 args) inflates
+	  cbprintf scratch into the inlined gd32_sdhc_request frame and
+	  pushes the SDHC tail above 700 B on the caller's stack. Turn
+	  on only when diagnosing data-path failures.
+
 endif # SDHC_GD32
