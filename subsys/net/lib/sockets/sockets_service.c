@@ -130,18 +130,25 @@ void net_socket_service_callback(struct net_socket_service_event *pev)
 static int call_work(struct zsock_pollfd *pev, struct net_socket_service_event *event)
 {
 	int ret = 0;
-	int fd = pev->fd;
 
 	/* Mark the global fd non pollable so that we do not
 	 * call the callback second time.
 	 */
 	pev->fd = -1;
 
-	/* Synchronous call */
+	/* Synchronous call. The handler may unregister and/or close the fd;
+	 * net_socket_service_unregister() routes through cleanup_svc_events()
+	 * which sets the owning service's pev fd to -1.
+	 */
 	net_socket_service_callback(event);
 
-	/* Restore the fd so that new data can be re-triggered */
-	pev->fd = fd;
+	/* Re-read the canonical fd from the owning service descriptor rather
+	 * than restoring the cached value. If the handler unregistered the
+	 * service, event->event.fd is now -1 and we must not put the (likely
+	 * closed) fd back into the global poll array — that would cause the
+	 * next zsock_poll() to fail with EBADF.
+	 */
+	pev->fd = event->event.fd;
 
 	return ret;
 }
@@ -236,8 +243,14 @@ restart:
 		ret = zsock_poll(ctx.events, count + 1, -1);
 		if (ret < 0) {
 			ret = -errno;
-			NET_ERR("poll failed (%d)", ret);
-			goto out;
+			NET_ERR("poll failed (%d), restarting", ret);
+			/* A transient failure (e.g. a stale fd briefly left in the
+			 * array during a register/unregister race) must not kill the
+			 * thread — every registered service would be orphaned and
+			 * its socket recv queue would grow unbounded. Resync from
+			 * svc->pev which holds the canonical fd state.
+			 */
+			goto restart;
 		}
 
 		if (ret == 0) {
