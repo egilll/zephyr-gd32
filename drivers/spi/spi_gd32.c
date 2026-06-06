@@ -103,6 +103,11 @@ struct spi_gd32_data {
 	struct spi_gd32_dma_data dma[NUM_OF_DIRECTION];
 #endif
 	bool reset_needed;
+	uint32_t timeout_count;
+	uint32_t error_count;
+	uint32_t reset_count;
+	uint32_t last_fault_detail;
+	int last_fault_status;
 #ifdef CONFIG_SPI_RTIO
 	struct spi_rtio *rtio_ctx;
 	struct k_work rtio_work;
@@ -132,6 +137,8 @@ static enum spi_gd32_xfer_mode spi_gd32_select_xfer_mode(const struct device *de
 							 const struct spi_buf_set *tx_bufs,
 							 const struct spi_buf_set *rx_bufs);
 static int spi_gd32_start_transfer(const struct device *dev);
+static void spi_gd32_stop_transfer_engine(const struct device *dev);
+static void spi_gd32_force_recover(const struct device *dev, bool reset_peripheral);
 static bool spi_gd32_can_write_frame(const struct spi_gd32_data *data);
 static bool spi_gd32_is_slave(const struct spi_gd32_data *data);
 static bool spi_gd32_is_rx_only(const struct spi_gd32_data *data);
@@ -154,11 +161,24 @@ static uint32_t spi_gd32_get_errors(const struct spi_gd32_config *cfg)
 }
 #endif
 
-static void spi_gd32_log_errors(const struct device *dev, uint32_t errors)
+static void spi_gd32_note_fault(const struct device *dev, int status, uint32_t detail,
+				const char *reason)
 {
-	if (errors != 0U) {
-		LOG_ERR("%s error status 0x%08x", dev->name, errors);
+	struct spi_gd32_data *data = dev->data;
+
+	if (status == -ETIMEDOUT) {
+		data->timeout_count++;
+	} else {
+		data->error_count++;
 	}
+
+	data->last_fault_status = status;
+	data->last_fault_detail = detail;
+
+	LOG_WRN_RATELIMIT_RATE(
+		5000, "%s %s: status=%d detail=0x%08x timeouts=%u errors=%u resets=%u",
+		dev->name, reason, status, detail, data->timeout_count, data->error_count,
+		data->reset_count);
 }
 
 static void spi_gd32_clear_errors(const struct spi_gd32_config *cfg, uint32_t stat)
@@ -195,14 +215,20 @@ static uint16_t spi_gd32_discard_frame(const struct spi_gd32_config *cfg)
 
 static void spi_gd32_flush_stale_status(const struct spi_gd32_config *cfg)
 {
-	uint32_t stat = spi_gd32_stat(cfg);
+	uint32_t stat;
 
-	if ((stat & SPI_STAT_RBNE) != 0U) {
-		(void)spi_gd32_discard_frame(cfg);
+	do {
 		stat = spi_gd32_stat(cfg);
-	}
 
-	spi_gd32_clear_errors(cfg, stat);
+		while ((stat & SPI_STAT_RBNE) != 0U) {
+			(void)spi_gd32_discard_frame(cfg);
+			stat = spi_gd32_stat(cfg);
+		}
+
+		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
+			spi_gd32_clear_errors(cfg, stat);
+		}
+	} while ((stat & (SPI_STAT_RBNE | SPI_GD32_ERR_MASK)) != 0U);
 }
 
 static void spi_gd32_disable_interrupts(const struct spi_gd32_config *cfg)
@@ -459,12 +485,13 @@ static int spi_gd32_wait_for_status(const struct device *dev, uint32_t flags, ui
 		}
 	}
 
-	LOG_ERR("%s timed out waiting for SPI flags 0x%08x", dev->name, flags);
+	spi_gd32_note_fault(dev, -ETIMEDOUT, flags, "timed out waiting for SPI flags");
 	return -ETIMEDOUT;
 
 out:
 	if ((stat & SPI_GD32_ERR_MASK) != 0U) {
-		spi_gd32_log_errors(dev, stat & SPI_GD32_ERR_MASK);
+		spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
+				    "saw SPI error status while waiting for flags");
 		spi_gd32_clear_errors(cfg, stat);
 		return -EIO;
 	}
@@ -491,12 +518,13 @@ static int spi_gd32_wait_until_idle(const struct device *dev)
 		}
 	}
 
-	LOG_ERR("%s timed out waiting for SPI idle", dev->name);
+	spi_gd32_note_fault(dev, -ETIMEDOUT, spi_gd32_stat(cfg), "timed out waiting for SPI idle");
 	return -ETIMEDOUT;
 
 out:
 	if ((stat & SPI_GD32_ERR_MASK) != 0U) {
-		spi_gd32_log_errors(dev, stat & SPI_GD32_ERR_MASK);
+		spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
+				    "saw SPI error status while waiting for idle");
 		spi_gd32_clear_errors(cfg, stat);
 		return -EIO;
 	}
@@ -542,7 +570,8 @@ static int spi_gd32_wait_for_completion(const struct device *dev)
 			continue;
 		}
 #endif
-		LOG_ERR("%s timed out waiting for slave transfer completion", dev->name);
+		spi_gd32_note_fault(dev, -ETIMEDOUT, 0U,
+				    "timed out waiting for slave transfer completion");
 		return -ETIMEDOUT;
 	}
 
@@ -745,6 +774,25 @@ static void spi_gd32_reset_peripheral(const struct device *dev)
 	}
 }
 
+static void spi_gd32_force_recover(const struct device *dev, bool reset_peripheral)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+
+	spi_gd32_stop_transfer_engine(dev);
+	if (!spi_gd32_is_slave(data)) {
+		spi_context_cs_control(&data->ctx, false);
+	}
+	SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
+	spi_gd32_flush_stale_status(cfg);
+
+	if (reset_peripheral) {
+		spi_gd32_reset_peripheral(dev);
+		data->reset_count++;
+		spi_gd32_flush_stale_status(cfg);
+	}
+}
+
 static void spi_gd32_stop_transfer_engine(const struct device *dev)
 {
 	const struct spi_gd32_config *cfg = dev->config;
@@ -776,19 +824,12 @@ static int spi_gd32_cleanup_transfer(const struct device *dev, int status)
 		status = spi_gd32_wait_until_idle(dev);
 	}
 
-	spi_gd32_stop_transfer_engine(dev);
-
 	if (status < 0) {
 		spi_gd32_latch_fatal(data, status);
 	}
 
 	if (data->reset_needed) {
-		SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
-		if (!spi_gd32_is_slave(data)) {
-			spi_context_cs_control(&data->ctx, false);
-		}
-		spi_gd32_clear_errors(cfg, spi_gd32_stat(cfg));
-		spi_gd32_reset_peripheral(dev);
+		spi_gd32_force_recover(dev, true);
 		data->reset_needed = false;
 #ifdef CONFIG_SPI_ASYNC
 		if (!data->ctx.asynchronous) {
@@ -800,6 +841,7 @@ static int spi_gd32_cleanup_transfer(const struct device *dev, int status)
 		return status;
 	}
 
+	spi_gd32_stop_transfer_engine(dev);
 	if (!spi_gd32_is_slave(data)) {
 		spi_context_cs_control(&data->ctx, false);
 	}
@@ -823,6 +865,8 @@ static int spi_gd32_cleanup_transfer_step(const struct device *dev)
 		status = spi_gd32_wait_until_idle(dev);
 		if (status != 0) {
 			spi_gd32_latch_fatal(data, status);
+			spi_gd32_force_recover(dev, true);
+			data->reset_needed = false;
 			return status;
 		}
 	}
@@ -1448,7 +1492,7 @@ static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint3
 	}
 
 	if (status < 0) {
-		LOG_ERR("%s DMA error on channel %u: %d", dev->name, channel, status);
+		spi_gd32_note_fault(dev, status, channel, "DMA transfer failed");
 		spi_gd32_signal_completion(dev, status);
 		return;
 	}
@@ -1459,7 +1503,7 @@ static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint3
 
 	errors = spi_gd32_get_errors(cfg);
 	if (errors != 0U) {
-		spi_gd32_log_errors(dev, errors);
+		spi_gd32_note_fault(dev, -EIO, errors, "DMA completion saw SPI error status");
 		spi_gd32_clear_errors(cfg, errors);
 		spi_gd32_signal_completion(dev, -EIO);
 		return;
@@ -1539,7 +1583,7 @@ static void spi_gd32_isr(const struct device *dev)
 				continue;
 			}
 
-			spi_gd32_log_errors(dev, errors);
+			spi_gd32_note_fault(dev, -EIO, errors, "interrupt transfer saw SPI error status");
 			spi_gd32_clear_errors(cfg, stat);
 			spi_gd32_signal_completion(dev, -EIO);
 			return;
@@ -1748,6 +1792,7 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 	ret = spi_gd32_wait_for_completion(dev);
 
 	if ((ret == -ETIMEDOUT) && spi_gd32_mark_transfer_inactive(data)) {
+		spi_gd32_note_fault(dev, ret, 0U, "timed out waiting for transfer completion");
 		spi_gd32_latch_fatal(data, ret);
 		spi_gd32_stop_transfer_engine(dev);
 	}
@@ -1783,16 +1828,26 @@ static int spi_gd32_transceive_async(const struct device *dev, const struct spi_
 static int spi_gd32_release(const struct device *dev, const struct spi_config *config)
 {
 	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
+	bool transfer_was_active = false;
 
 	ARG_UNUSED(config);
 
-	spi_gd32_stop_transfer_engine(dev);
-	if (!spi_gd32_is_slave(data)) {
-		spi_context_cs_control(&data->ctx, false);
+	if (data->transfer_active) {
+#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
+		transfer_was_active = spi_gd32_mark_transfer_inactive(data);
+#else
+		transfer_was_active = true;
+		data->transfer_active = false;
+#endif
+		if (transfer_was_active) {
+			data->reset_needed = true;
+			spi_gd32_note_fault(dev, -ECANCELED, 0U, "transfer aborted by release");
+		}
 	}
-	SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
-	spi_gd32_flush_stale_status(cfg);
+
+	spi_gd32_force_recover(dev, transfer_was_active || data->reset_needed);
+	data->reset_needed = false;
+	data->ctx.config = NULL;
 	spi_context_unlock_unconditionally(&data->ctx);
 
 	return 0;
