@@ -598,6 +598,7 @@ static int gd32_i2s_stream_start(struct stream *stream)
 	stream->dma_cfg.dest_burst_length = 1U;
 	stream->dma_cfg.source_data_size = 2U;
 	stream->dma_cfg.dest_data_size = 2U;
+	stream->dma_blk.fifo_mode_control = stream->fifo_threshold;
 
 	if (stream->dir == I2S_DIR_RX) {
 		const uint32_t rx_reg = gd32_i2s_rx_reg(cfg);
@@ -1109,7 +1110,9 @@ static int i2s_gd32_init(const struct device *dev)
 				    (DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),          \
 		.config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),                          \
 		.fifo_threshold = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),        \
-					      (DT_INST_DMAS_CELL_BY_NAME(idx, dir, fifo_threshold)), (0)), \
+					      (GD32_DMA_DT_FIFO_MODE(                                    \
+						      DT_INST_DMAS_CELL_BY_NAME(                          \
+							      idx, dir, fifo_threshold))), (0)), \
 	}
 
 #define DMA_BY_NAME(idx, dir)                                                           \

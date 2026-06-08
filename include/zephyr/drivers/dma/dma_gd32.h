@@ -15,6 +15,12 @@
 #define GD32_DMA_CONFIG_PERIPHERAL_INC_FIXED(config) ((config >> 15) & 0x1)
 #define GD32_DMA_CONFIG_PRIORITY(config)	     ((config >> 16) & 0x3)
 
-#define GD32_DMA_FEATURES_FIFO_THRESHOLD(threshold) (threshold & 0x3)
+#define GD32_DMA_FEATURES_FIFO_THRESHOLD(threshold) ((threshold) & 0x3U)
+#define GD32_DMA_FEATURES_FIFO_REQUEST	      0x4U
+#define GD32_DMA_FEATURES_FIFO_REQUESTED(fifo_mode_control)                                   \
+	((((fifo_mode_control) & GD32_DMA_FEATURES_FIFO_REQUEST) != 0U) ||                   \
+	 (GD32_DMA_FEATURES_FIFO_THRESHOLD(fifo_mode_control) != 0U))
+#define GD32_DMA_DT_FIFO_MODE(threshold)                                                     \
+	(GD32_DMA_FEATURES_FIFO_THRESHOLD(threshold) | GD32_DMA_FEATURES_FIFO_REQUEST)
 
 #endif /* ZEPHYR_INCLUDE_DRIVERS_DMA_GD32_H_ */

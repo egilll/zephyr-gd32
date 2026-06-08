@@ -845,6 +845,7 @@ static int i2c_gd32_dma_setup(const struct device *dev, bool is_read)
 	memset(&data->dma_blk, 0, sizeof(data->dma_blk));
 
 	data->dma_blk.block_size = data->xfer_len;
+	data->dma_blk.fifo_mode_control = dma->fifo_threshold;
 
 	data->dma_cfg.source_burst_length = 1;
 	data->dma_cfg.dest_burst_length = 1;
@@ -1407,7 +1408,9 @@ static int i2c_gd32_init(const struct device *dev)
 				    (DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),                            \
 			 .config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),                    \
 			 .fifo_threshold = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1), \
-					      (DT_INST_DMAS_CELL_BY_NAME(idx, dir, fifo_threshold)), \
+					      (GD32_DMA_DT_FIFO_MODE(                         \
+						      DT_INST_DMAS_CELL_BY_NAME(               \
+							      idx, dir, fifo_threshold))), \
 					      (0)),         \
 			 }
 

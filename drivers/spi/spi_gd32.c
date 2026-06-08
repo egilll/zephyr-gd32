@@ -94,6 +94,8 @@ struct spi_gd32_stats {
 	uint32_t timeouts;
 	uint32_t errors;
 	uint32_t resets;
+	uint32_t dma_inferred;
+	uint32_t dma_timeout_recoveries;
 	uint32_t last_detail;
 	int last_status;
 };
@@ -145,6 +147,11 @@ static void spi_gd32_iodev_complete(const struct device *dev, int status);
 #endif
 #ifdef CONFIG_SPI_ASYNC
 static void spi_gd32_complete_async(const struct device *dev, int status);
+#endif
+#ifdef CONFIG_SPI_GD32_DMA
+static int spi_gd32_dma_prepare_chunk(const struct device *dev);
+static int spi_gd32_dma_start_chunk(const struct device *dev);
+static int spi_gd32_dma_recover_completion(const struct device *dev, bool timeout_path);
 #endif
 
 static inline uint32_t spi_gd32_stat(const struct spi_gd32_config *cfg)
@@ -217,10 +224,12 @@ static void spi_gd32_note_fault(const struct device *dev, int status, uint32_t d
 	LOG_WRN_RATELIMIT_RATE(
 		5000,
 		"%s %s: status=%d detail=0x%08x mode=%s stat=0x%04x ctl1=0x%04x "
-		"frames_left=%u rx_pending=%u timeouts=%u errors=%u resets=%u",
+		"frames_left=%u rx_pending=%u timeouts=%u errors=%u resets=%u "
+		"dma_inferred=%u dma_timeout_recoveries=%u",
 		dev->name, reason, status, detail, mode_str[data->xfer_mode], stat, ctl1,
 		(unsigned int)data->frames_left, (unsigned int)data->rx_pending,
-		data->stats.timeouts, data->stats.errors, data->stats.resets);
+		data->stats.timeouts, data->stats.errors, data->stats.resets,
+		data->stats.dma_inferred, data->stats.dma_timeout_recoveries);
 }
 
 static void spi_gd32_clear_errors(const struct spi_gd32_config *cfg, uint32_t stat)
@@ -546,6 +555,11 @@ static void spi_gd32_timeout_work_handler(struct k_work *work)
 		spi_gd32_refresh_timeout(dev);
 		return;
 	}
+#ifdef CONFIG_SPI_GD32_DMA
+	if (spi_gd32_dma_recover_completion(dev, true) > 0) {
+		return;
+	}
+#endif
 
 	if (!spi_gd32_mark_transfer_inactive(data)) {
 		return;
@@ -660,18 +674,27 @@ static bool spi_gd32_shift_slave(const struct device *dev, uint32_t *stat)
 	struct spi_gd32_data *data = dev->data;
 	const struct spi_gd32_config *cfg = dev->config;
 	bool progressed = false;
+	uint32_t outer_iters = spi_gd32_spin_iters(data);
 
-	while (true) {
+	while (outer_iters-- != 0U) {
 		bool worked = false;
 
 		if (!spi_gd32_is_rx_only(data)) {
+			uint32_t tx_iters = spi_gd32_spin_iters(data);
 			while ((*stat & SPI_STAT_TBE) != 0U && spi_gd32_can_write_frame(data)) {
+				if (tx_iters-- == 0U) {
+					return progressed;
+				}
 				spi_gd32_write_frame(dev);
 				worked = true;
 				*stat = spi_gd32_stat(cfg);
 			}
 		}
+		uint32_t rx_iters = spi_gd32_spin_iters(data);
 		while ((*stat & SPI_STAT_RBNE) != 0U) {
+			if (rx_iters-- == 0U) {
+				return progressed || worked;
+			}
 			spi_gd32_handle_slave_rx_frame(dev);
 			worked = true;
 			*stat = spi_gd32_stat(cfg);
@@ -682,6 +705,8 @@ static bool spi_gd32_shift_slave(const struct device *dev, uint32_t *stat)
 			return progressed;
 		}
 	}
+
+	return progressed;
 }
 
 static bool spi_gd32_shift_master(const struct device *dev, uint32_t *stat)
@@ -736,7 +761,15 @@ static bool spi_gd32_recover_slave_overrun(const struct device *dev, uint32_t st
 		return false;
 	}
 
+	uint32_t drain_iters = spi_gd32_spin_iters(data);
+
 	while ((spi_gd32_stat(cfg) & SPI_STAT_RBNE) != 0U) {
+		if (drain_iters-- == 0U) {
+			spi_gd32_note_fault(dev, -EIO,
+					    spi_gd32_stat(cfg),
+					    "slave overrun drain exceeded budget");
+			break;
+		}
 		spi_gd32_handle_slave_rx_frame(dev);
 		drained = true;
 	}
@@ -755,7 +788,33 @@ static int spi_gd32_polling_transfer(const struct device *dev)
 	const struct spi_gd32_config *cfg = dev->config;
 	struct spi_gd32_data *data = dev->data;
 
+	/* Hard wall-clock deadline so this loop cannot pin the CPU even if
+	 * the controller wedges in a way the inner timeouts miss. Budget is
+	 * (bit-time * frames) + tolerance, with a floor so very small
+	 * transfers still get a reasonable bail-out window.
+	 */
+	const uint32_t total_frames = MAX(data->frames_left + data->rx_pending, 2U);
+	uint64_t deadline_us = spi_gd32_frame_timeout_us(data, total_frames);
+
+	if (deadline_us < 2000ULL) {
+		deadline_us = 2000ULL;
+	}
+	const int64_t deadline_ticks = k_uptime_ticks() +
+				       (int64_t)k_us_to_ticks_ceil64(deadline_us);
+
+	uint32_t last_frames_left = data->frames_left;
+	uint32_t last_rx_pending = data->rx_pending;
+	uint32_t stalled_iters = 0U;
+	uint32_t loop_iters = 0U;
+
 	while (!spi_gd32_transfer_done(data)) {
+		if (k_uptime_ticks() >= deadline_ticks) {
+			spi_gd32_note_fault(dev, -ETIMEDOUT, spi_gd32_stat(cfg),
+					    "polling transfer wall-clock deadline exceeded");
+			spi_gd32_force_recover(dev, true);
+			return -ETIMEDOUT;
+		}
+
 		uint32_t stat = spi_gd32_stat(cfg);
 
 		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
@@ -765,10 +824,14 @@ static int spi_gd32_polling_transfer(const struct device *dev)
 			spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
 					    "polling saw SPI error status");
 			spi_gd32_clear_errors(cfg, stat);
+			spi_gd32_force_recover(dev, false);
 			return -EIO;
 		}
 
 		if (spi_gd32_shift(dev, &stat)) {
+			last_frames_left = data->frames_left;
+			last_rx_pending = data->rx_pending;
+			stalled_iters = 0U;
 			continue;
 		}
 
@@ -778,7 +841,35 @@ static int spi_gd32_polling_transfer(const struct device *dev)
 		int ret = spi_gd32_wait_for_status(dev, wait_for, NULL);
 
 		if (ret != 0) {
+			spi_gd32_force_recover(dev, ret == -EIO);
 			return ret;
+		}
+
+		/* wait_for_status returned 0 (flag observed) but the next
+		 * shift made no progress: count it and bail out before we
+		 * can busy-spin a higher-priority thread to death.
+		 */
+		if (data->frames_left == last_frames_left &&
+		    data->rx_pending == last_rx_pending) {
+			if (++stalled_iters >= 16U) {
+				spi_gd32_note_fault(dev, -EIO,
+						    spi_gd32_stat(cfg),
+						    "polling transfer stalled without progress");
+				spi_gd32_force_recover(dev, true);
+				return -EIO;
+			}
+		} else {
+			last_frames_left = data->frames_left;
+			last_rx_pending = data->rx_pending;
+			stalled_iters = 0U;
+		}
+
+		/* Cooperatively yield every so often so a high-priority
+		 * caller polling SPI cannot starve other threads (most
+		 * importantly the task watchdog feeders) on this CPU.
+		 */
+		if ((++loop_iters & 0x3FU) == 0U) {
+			k_yield();
 		}
 	}
 
@@ -886,6 +977,159 @@ static bool spi_gd32_dma_possible(const struct device *dev, const struct spi_buf
 
 static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				  int status);
+
+/**
+ * DMA terminal callbacks are treated as wakeups, not the only completion
+ * proof. On GD32 this SPI workload can reach NDT==0 on one channel without the
+ * matching callback, so the SPI driver always re-checks hardware state before
+ * advancing the transfer.
+ */
+static bool spi_gd32_dma_channel_complete(const struct spi_gd32_dma_config *dma, bool callback_done)
+{
+	struct dma_status status;
+
+	if (callback_done) {
+		return true;
+	}
+	if (dma_get_status(dma->dev, dma->channel, &status) != 0) {
+		return false;
+	}
+
+	return status.pending_length == 0U;
+}
+
+/**
+ * Fold callback observations and live DMA state into a single "both channels
+ * are done" decision. Missing callbacks are counted silently here; user-visible
+ * logging is reserved for the timeout path.
+ */
+static bool spi_gd32_dma_reconcile_completion(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	bool done[NUM_OF_DIRECTION];
+	bool inferred[NUM_OF_DIRECTION] = {false};
+	unsigned int key;
+
+	key = irq_lock();
+	if (!data->transfer_active) {
+		irq_unlock(key);
+		return false;
+	}
+	done[RX] = data->dma_done[RX];
+	done[TX] = data->dma_done[TX];
+	irq_unlock(key);
+
+	for (size_t dir = 0U; dir < NUM_OF_DIRECTION; dir++) {
+		if (done[dir]) {
+			continue;
+		}
+
+		done[dir] = spi_gd32_dma_channel_complete(&cfg->dma[dir], false);
+		inferred[dir] = done[dir];
+	}
+
+	if (!done[RX] || !done[TX]) {
+		return false;
+	}
+
+	key = irq_lock();
+	if (!data->transfer_active) {
+		irq_unlock(key);
+		return false;
+	}
+	for (size_t dir = 0U; dir < NUM_OF_DIRECTION; dir++) {
+		if (!data->dma_done[dir] && done[dir]) {
+			data->dma_done[dir] = true;
+		} else {
+			inferred[dir] = false;
+		}
+	}
+	irq_unlock(key);
+
+	if (inferred[RX] || inferred[TX]) {
+		data->stats.dma_inferred++;
+	}
+
+	return true;
+}
+
+/**
+ * Once both DMA channels have consumed the current chunk, either queue the next
+ * chunk immediately or complete the SPI transfer. The final bus-idle wait still
+ * happens in the common cleanup path before CS is released.
+ */
+static int spi_gd32_dma_complete_chunk(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	uint32_t errs = spi_gd32_stat(cfg) & SPI_GD32_ERR_MASK;
+	int ret;
+
+	if (errs != 0U) {
+		spi_gd32_note_fault(dev, -EIO, errs, "DMA completion saw SPI error");
+		spi_gd32_clear_errors(cfg, spi_gd32_stat(cfg));
+		spi_gd32_signal_completion(dev, -EIO);
+		return -EIO;
+	}
+
+	spi_gd32_disable_dma_requests(cfg);
+
+	if (spi_context_tx_on(&data->ctx)) {
+		spi_context_update_tx(&data->ctx, data->dfs, data->dma_chunk_len);
+	}
+	if (spi_context_rx_on(&data->ctx)) {
+		spi_context_update_rx(&data->ctx, data->dfs, data->dma_chunk_len);
+	}
+
+	if (spi_context_max_continuous_chunk(&data->ctx) == 0U) {
+		spi_gd32_signal_completion(dev, 0);
+		return 0;
+	}
+
+	ret = spi_gd32_dma_prepare_chunk(dev);
+	if (ret == 0) {
+		ret = spi_gd32_dma_start_chunk(dev);
+	}
+	if (ret != 0) {
+		spi_gd32_signal_completion(dev, ret);
+	}
+
+	return ret;
+}
+
+static int spi_gd32_dma_recover_completion(const struct device *dev, bool timeout_path)
+{
+	struct spi_gd32_data *data = dev->data;
+	int ret;
+
+	if (data->xfer_mode != SPI_GD32_XFER_DMA || spi_gd32_is_slave(data)) {
+		return 0;
+	}
+	if (!spi_gd32_dma_reconcile_completion(dev)) {
+		return 0;
+	}
+
+	if (timeout_path) {
+		data->stats.dma_timeout_recoveries++;
+		LOG_WRN_RATELIMIT_RATE(
+			5000,
+			"%s recovered DMA completion after timeout "
+			"dma_inferred=%u dma_timeout_recoveries=%u",
+			dev->name, data->stats.dma_inferred,
+			data->stats.dma_timeout_recoveries);
+	}
+
+	ret = spi_gd32_dma_complete_chunk(dev);
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	if ((ret == 0) && data->transfer_active) {
+		spi_gd32_note_progress(dev);
+	}
+#endif
+
+	return ret == 0 ? 1 : ret;
+}
 
 static int spi_gd32_dma_setup(const struct device *dev, enum spi_gd32_dma_direction dir,
 			      size_t chunk_len)
@@ -1020,8 +1264,6 @@ static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint3
 	struct spi_gd32_data *data = dev->data;
 	enum spi_gd32_dma_direction dir;
 	bool both_done;
-	uint32_t errs;
-	int ret;
 
 	if (status < 0) {
 		spi_gd32_note_fault(dev, status, channel, "DMA transfer failed");
@@ -1059,37 +1301,10 @@ static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint3
 	spi_gd32_note_progress(dev);
 #endif
 	if (!both_done) {
-		return;
+		both_done = spi_gd32_dma_reconcile_completion(dev);
 	}
-
-	errs = spi_gd32_stat(cfg) & SPI_GD32_ERR_MASK;
-	if (errs != 0U) {
-		spi_gd32_note_fault(dev, -EIO, errs, "DMA completion saw SPI error");
-		spi_gd32_clear_errors(cfg, spi_gd32_stat(cfg));
-		spi_gd32_signal_completion(dev, -EIO);
-		return;
-	}
-
-	spi_gd32_disable_dma_requests(cfg);
-
-	if (spi_context_tx_on(&data->ctx)) {
-		spi_context_update_tx(&data->ctx, data->dfs, data->dma_chunk_len);
-	}
-	if (spi_context_rx_on(&data->ctx)) {
-		spi_context_update_rx(&data->ctx, data->dfs, data->dma_chunk_len);
-	}
-
-	if (spi_context_max_continuous_chunk(&data->ctx) == 0U) {
-		spi_gd32_signal_completion(dev, 0);
-		return;
-	}
-
-	ret = spi_gd32_dma_prepare_chunk(dev);
-	if (ret == 0) {
-		ret = spi_gd32_dma_start_chunk(dev);
-	}
-	if (ret != 0) {
-		spi_gd32_signal_completion(dev, ret);
+	if (both_done) {
+		(void)spi_gd32_dma_complete_chunk(dev);
 	}
 }
 #endif
@@ -1718,6 +1933,17 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 		spi_gd32_arm_timeout_on_start(dev);
 #endif
 		wait_ret = spi_gd32_wait_for_completion(dev);
+#ifdef CONFIG_SPI_GD32_DMA
+		if (wait_ret == -ETIMEDOUT && data->xfer_mode == SPI_GD32_XFER_DMA) {
+			int recover_ret = spi_gd32_dma_recover_completion(dev, true);
+
+			if (recover_ret > 0) {
+				wait_ret = spi_gd32_wait_for_completion(dev);
+			} else if (recover_ret < 0) {
+				wait_ret = recover_ret;
+			}
+		}
+#endif
 
 		if (wait_ret == -ETIMEDOUT && spi_gd32_mark_transfer_inactive(data)) {
 			spi_gd32_note_fault(dev, wait_ret, 0U,
@@ -1879,9 +2105,11 @@ static int spi_gd32_init(const struct device *dev)
 				    (DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),             \
 		.config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),                             \
 		.fifo_threshold = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),           \
-					      (DT_INST_DMAS_CELL_BY_NAME(idx, dir, fifo_threshold)),\
+					      (GD32_DMA_DT_FIFO_MODE(                            \
+						      DT_INST_DMAS_CELL_BY_NAME(                  \
+							      idx, dir, fifo_threshold))),      \
 					      (0)),                                                \
-	}
+		}
 
 #define DMAS_DECL(idx)                                                                             \
 	{                                                                                          \

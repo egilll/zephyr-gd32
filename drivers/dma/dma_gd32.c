@@ -8,6 +8,7 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/gd32.h>
 #include <zephyr/drivers/dma.h>
+#include <zephyr/drivers/dma/dma_gd32.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/logging/log.h>
 
@@ -80,6 +81,7 @@ struct dma_gd32_channel {
 	uint32_t periph_width;
 	bool busy;
 	bool cyclic;
+	bool fifo_mode;
 };
 
 struct dma_gd32_data {
@@ -128,7 +130,7 @@ static int dma_gd32_validate_transfer_size_and_alignment(const struct device *de
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
 static inline uint32_t dma_gd32_fifo_threshold(uint16_t fifo_mode_control)
 {
-	switch (fifo_mode_control & 0x3U) {
+	switch (GD32_DMA_FEATURES_FIFO_THRESHOLD(fifo_mode_control)) {
 	case 0U:
 		return DMA_FIFO_1_WORD;
 	case 1U:
@@ -243,6 +245,34 @@ gd32_dma_interrupt_disable(uint32_t reg, dma_channel_enum ch, uint32_t source)
 {
 	GD32_DMA_CHCTL(reg, ch) &= ~source;
 }
+
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1) && defined(DMA_CHXFCTL_FEEIE)
+static inline void
+gd32_dma_fifo_error_interrupt_enable(uint32_t reg, dma_channel_enum ch)
+{
+	DMA_CHFCTL(reg, ch) |= DMA_CHXFCTL_FEEIE;
+}
+
+static inline void
+gd32_dma_fifo_error_interrupt_disable(uint32_t reg, dma_channel_enum ch)
+{
+	DMA_CHFCTL(reg, ch) &= ~DMA_CHXFCTL_FEEIE;
+}
+#else
+static inline void
+gd32_dma_fifo_error_interrupt_enable(uint32_t reg, dma_channel_enum ch)
+{
+	ARG_UNUSED(reg);
+	ARG_UNUSED(ch);
+}
+
+static inline void
+gd32_dma_fifo_error_interrupt_disable(uint32_t reg, dma_channel_enum ch)
+{
+	ARG_UNUSED(reg);
+	ARG_UNUSED(ch);
+}
+#endif
 
 static inline void
 gd32_dma_priority_config(uint32_t reg, dma_channel_enum ch, uint32_t priority)
@@ -566,6 +596,17 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 				     dma_gd32_periph_width(periph_cfg->width));
 
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+	uint32_t ctl = GD32_DMA_CHCTL(cfg->reg, channel);
+	uint32_t fctl = DMA_CHFCTL(cfg->reg, channel);
+
+	ctl &= ~(DMA_CHXCTL_PBURST | DMA_CHXCTL_MBURST);
+	GD32_DMA_CHCTL(cfg->reg, channel) = ctl;
+	fctl &= ~(DMA_CHXFCTL_MDMEN | DMA_CHXFCTL_FCCV);
+#if defined(DMA_CHXFCTL_FEEIE)
+	fctl &= ~DMA_CHXFCTL_FEEIE;
+#endif
+	DMA_CHFCTL(cfg->reg, channel) = fctl;
+
 	if (dma_gd32_burst_cfg(dma_cfg->source_burst_length, false, &periph_burst) != 0) {
 		LOG_ERR("unsupported source burst length: %" PRIu32, dma_cfg->source_burst_length);
 		return -ENOTSUP;
@@ -582,21 +623,19 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 	}
 
 	/*
-	 * Use multi-data mode (FIFO) when burst transfer is requested or when a FIFO threshold is
-	 * specified. This matches the vendor SDIO examples and avoids single-data mode exceptions.
+	 * Use multi-data mode (FIFO) when burst transfer is requested or when the client explicitly
+	 * requests a FIFO threshold.
 	 */
 	use_multidata = (dma_cfg->source_burst_length > 1U) || (dma_cfg->dest_burst_length > 1U) ||
-			(dma_cfg->head_block->fifo_mode_control != 0U);
+			GD32_DMA_FEATURES_FIFO_REQUESTED(
+				dma_cfg->head_block->fifo_mode_control);
 
 	if (use_multidata) {
 		DMA_CHFCTL(cfg->reg, channel) |=
 			(DMA_CHXFCTL_MDMEN |
 			 dma_gd32_fifo_threshold(dma_cfg->head_block->fifo_mode_control));
-#if defined(DMA_CHXFCTL_FEEIE)
-		DMA_CHFCTL(cfg->reg, channel) |= DMA_CHXFCTL_FEEIE;
-#endif
 
-		uint32_t ctl = GD32_DMA_CHCTL(cfg->reg, channel);
+		ctl = GD32_DMA_CHCTL(cfg->reg, channel);
 		ctl &= ~(DMA_CHXCTL_PBURST | DMA_CHXCTL_MBURST);
 		ctl |= periph_burst | mem_burst;
 		GD32_DMA_CHCTL(cfg->reg, channel) = ctl;
@@ -620,6 +659,7 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel,
 	data->channels[channel].direction = dma_cfg->channel_direction;
 	data->channels[channel].periph_width = periph_cfg->width;
 	data->channels[channel].cyclic = dma_cfg->cyclic;
+	data->channels[channel].fifo_mode = use_multidata;
 
 	return 0;
 }
@@ -684,11 +724,14 @@ static int dma_gd32_start(const struct device *dev, uint32_t ch)
 				      DMA_FLAG_FTF | DMA_FLAG_HTF |
 				      GD32_DMA_FLAG_ERRORS);
 
+	data->channels[ch].busy = true;
 	gd32_dma_interrupt_enable(cfg->reg, ch,
 				  DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS |
 				  (data->channels[ch].cyclic ? DMA_CHXCTL_HTFIE : 0));
+	if (data->channels[ch].fifo_mode) {
+		gd32_dma_fifo_error_interrupt_enable(cfg->reg, ch);
+	}
 	gd32_dma_channel_enable(cfg->reg, ch);
-	data->channels[ch].busy = true;
 
 	return 0;
 }
@@ -707,6 +750,7 @@ static int dma_gd32_stop(const struct device *dev, uint32_t ch)
 	gd32_dma_interrupt_disable(
 		cfg->reg, ch,
 		DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS | DMA_CHXCTL_HTFIE);
+	gd32_dma_fifo_error_interrupt_disable(cfg->reg, ch);
 	gd32_dma_interrupt_flag_clear(cfg->reg, ch,
 				      DMA_FLAG_FTF | DMA_FLAG_HTF | GD32_DMA_FLAG_ERRORS);
 	gd32_dma_channel_disable(cfg->reg, ch);
@@ -763,6 +807,7 @@ static int dma_gd32_init(const struct device *dev)
 	for (uint32_t i = 0; i < cfg->channels; i++) {
 		gd32_dma_interrupt_disable(cfg->reg, i,
 			   DMA_CHXCTL_FTFIE | GD32_DMA_INTERRUPT_ERRORS);
+		gd32_dma_fifo_error_interrupt_disable(cfg->reg, i);
 		gd32_dma_deinit(cfg->reg, i);
 	}
 
@@ -785,6 +830,13 @@ static void dma_gd32_isr(const struct device *dev)
 		htfflag = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_HTF);
 
 		if (errflag == 0 && ftfflag == 0 && htfflag == 0) {
+			continue;
+		}
+
+		if (!data->channels[i].busy && !data->channels[i].cyclic) {
+			gd32_dma_interrupt_flag_clear(cfg->reg, i,
+						      DMA_FLAG_FTF | DMA_FLAG_HTF |
+						      GD32_DMA_FLAG_ERRORS);
 			continue;
 		}
 
