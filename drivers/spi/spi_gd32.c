@@ -33,10 +33,19 @@ LOG_MODULE_REGISTER(spi_gd32, CONFIG_SPI_LOG_LEVEL);
 
 #include "spi_context.h"
 
-#define SPI_GD32_ERR_MASK             (SPI_STAT_TXURERR | SPI_STAT_RXORERR | SPI_STAT_CONFERR | SPI_STAT_CRCERR | SPI_STAT_FERR)
-#define SPI_GD32_PSC_MAX              0x7U
-#define SPI_GD32_RX_CAPACITY_FRAMES   2U
-#define SPI_GD32_INIT_MASK            0x00003040U
+/* TXURERR is I2S-only on GD32 SPI; we never program I2S mode so leave it out
+ * to avoid spuriously aborting transfers.
+ */
+#define SPI_GD32_ERR_MASK              (SPI_STAT_RXORERR | SPI_STAT_CONFERR | \
+					SPI_STAT_CRCERR | SPI_STAT_FERR)
+#define SPI_GD32_PSC_MAX               0x7U
+/* The peripheral is single-buffered; at most one frame may sit in the TX
+ * register while a second is shifting, otherwise the next frame to land in
+ * RX overruns.
+ */
+#define SPI_GD32_INFLIGHT_MAX          2U
+#define SPI_GD32_INIT_MASK             0x00003040U
+#define SPI_GD32_FLUSH_MAX_ITERATIONS  32U
 
 enum spi_gd32_xfer_mode {
 	SPI_GD32_XFER_POLLING,
@@ -45,11 +54,10 @@ enum spi_gd32_xfer_mode {
 };
 
 #ifdef CONFIG_SPI_GD32_DMA
-
 enum spi_gd32_dma_direction {
 	RX = 0,
 	TX,
-	NUM_OF_DIRECTION
+	NUM_OF_DIRECTION,
 };
 
 struct spi_gd32_dma_config {
@@ -70,11 +78,25 @@ struct spi_gd32_dma_data {
 #else
 #define SPI_GD32_DMA_DUMMY_ATTR
 #endif
-
-static uint32_t dummy_tx SPI_GD32_DMA_DUMMY_ATTR;
-static uint32_t dummy_rx SPI_GD32_DMA_DUMMY_ATTR;
-
 #endif
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+struct spi_gd32_async_state {
+	struct k_work completion_work;
+	struct k_work_delayable timeout_work;
+	int completion_status;
+	bool completion_suppressed;
+	bool progress_seen;
+};
+#endif
+
+struct spi_gd32_stats {
+	uint32_t timeouts;
+	uint32_t errors;
+	uint32_t resets;
+	uint32_t last_detail;
+	int last_status;
+};
 
 struct spi_gd32_config {
 	uint32_t reg;
@@ -83,6 +105,8 @@ struct spi_gd32_config {
 	const struct pinctrl_dev_config *pcfg;
 #ifdef CONFIG_SPI_GD32_DMA
 	const struct spi_gd32_dma_config dma[NUM_OF_DIRECTION];
+	uint32_t *dummy_tx;
+	uint32_t *dummy_rx;
 #endif
 #ifdef CONFIG_SPI_GD32_INTERRUPT
 	void (*irq_configure)(const struct device *dev);
@@ -97,17 +121,17 @@ struct spi_gd32_data {
 	size_t rx_pending;
 	bool transfer_tx;
 	bool transfer_rx;
-	enum spi_gd32_xfer_mode xfer_mode;
 	bool transfer_active;
+	enum spi_gd32_xfer_mode xfer_mode;
 #ifdef CONFIG_SPI_GD32_DMA
 	struct spi_gd32_dma_data dma[NUM_OF_DIRECTION];
+	bool dma_done[NUM_OF_DIRECTION];
+	size_t dma_chunk_len;
 #endif
-	bool reset_needed;
-	uint32_t timeout_count;
-	uint32_t error_count;
-	uint32_t reset_count;
-	uint32_t last_fault_detail;
-	int last_fault_status;
+	struct spi_gd32_stats stats;
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	struct spi_gd32_async_state async;
+#endif
 #ifdef CONFIG_SPI_RTIO
 	struct spi_rtio *rtio_ctx;
 	struct k_work rtio_work;
@@ -115,38 +139,12 @@ struct spi_gd32_data {
 #endif
 };
 
-#ifdef CONFIG_SPI_GD32_DMA
-static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
-				  int status);
-static int spi_gd32_dma_prepare_chunk(const struct device *dev);
-static int spi_gd32_dma_start_chunk(const struct device *dev);
-static bool spi_gd32_dma_bufs_usable(const struct spi_buf_set *bufs, uint8_t dfs);
-static int spi_gd32_dma_setup(const struct device *dev, enum spi_gd32_dma_direction dir,
-			      size_t chunk_len);
-static void spi_gd32_enable_rx_dma_request(const struct spi_gd32_config *cfg);
-static void spi_gd32_enable_tx_dma_request(const struct spi_gd32_config *cfg);
-#endif
-#ifdef CONFIG_SPI_GD32_INTERRUPT
-static int spi_gd32_start_interrupt_transfer(const struct device *dev);
-static void spi_gd32_isr(const struct device *dev);
-#endif
-static int spi_gd32_polling_transfer(const struct device *dev);
-static int spi_gd32_cleanup_transfer(const struct device *dev, int status);
-static int spi_gd32_configure(const struct device *dev, const struct spi_config *config);
-static enum spi_gd32_xfer_mode spi_gd32_select_xfer_mode(const struct device *dev,
-							 const struct spi_buf_set *tx_bufs,
-							 const struct spi_buf_set *rx_bufs);
-static int spi_gd32_start_transfer(const struct device *dev);
-static void spi_gd32_stop_transfer_engine(const struct device *dev);
-static void spi_gd32_force_recover(const struct device *dev, bool reset_peripheral);
-static bool spi_gd32_can_write_frame(const struct spi_gd32_data *data);
-static bool spi_gd32_is_slave(const struct spi_gd32_data *data);
-static bool spi_gd32_is_rx_only(const struct spi_gd32_data *data);
-static bool spi_gd32_shift_slave(const struct device *dev, uint32_t *stat);
 #ifdef CONFIG_SPI_RTIO
-static void spi_gd32_iodev_complete(const struct device *dev, int status);
 static void spi_gd32_iodev_start(const struct device *dev);
-static void spi_gd32_rtio_work_handler(struct k_work *work);
+static void spi_gd32_iodev_complete(const struct device *dev, int status);
+#endif
+#ifdef CONFIG_SPI_ASYNC
+static void spi_gd32_complete_async(const struct device *dev, int status);
 #endif
 
 static inline uint32_t spi_gd32_stat(const struct spi_gd32_config *cfg)
@@ -154,81 +152,116 @@ static inline uint32_t spi_gd32_stat(const struct spi_gd32_config *cfg)
 	return SPI_STAT(cfg->reg);
 }
 
-#ifdef CONFIG_SPI_GD32_DMA
-static uint32_t spi_gd32_get_errors(const struct spi_gd32_config *cfg)
+static inline uint8_t spi_gd32_dfs_from_op(uint16_t operation)
 {
-	return spi_gd32_stat(cfg) & SPI_GD32_ERR_MASK;
+	return SPI_WORD_SIZE_GET(operation) > 8U ? 2U : 1U;
 }
-#endif
+
+static inline bool spi_gd32_is_slave_op(uint16_t operation)
+{
+	return SPI_OP_MODE_GET(operation) == SPI_OP_MODE_SLAVE;
+}
+
+static inline bool spi_gd32_is_slave(const struct spi_gd32_data *data)
+{
+	return data->ctx.config != NULL && spi_gd32_is_slave_op(data->ctx.config->operation);
+}
+
+static inline bool spi_gd32_is_rx_only(const struct spi_gd32_data *data)
+{
+	return data->transfer_rx && !data->transfer_tx;
+}
+
+static inline bool spi_gd32_transfer_done(const struct spi_gd32_data *data)
+{
+	if (spi_gd32_is_slave(data) && spi_gd32_is_rx_only(data)) {
+		return data->frames_left == 0U;
+	}
+	return data->frames_left == 0U && data->rx_pending == 0U;
+}
+
+static inline bool spi_gd32_can_write_frame(const struct spi_gd32_data *data)
+{
+	return data->frames_left != 0U && data->rx_pending < SPI_GD32_INFLIGHT_MAX;
+}
+
+static inline bool spi_gd32_keep_enabled(const struct spi_gd32_data *data)
+{
+	if (data->ctx.config == NULL || spi_gd32_is_slave(data)) {
+		return false;
+	}
+	return (data->ctx.config->operation & SPI_HOLD_ON_CS) != 0U;
+}
 
 static void spi_gd32_note_fault(const struct device *dev, int status, uint32_t detail,
 				const char *reason)
 {
+	const struct spi_gd32_config *cfg = dev->config;
 	struct spi_gd32_data *data = dev->data;
+	uint32_t stat = spi_gd32_stat(cfg);
+	uint32_t ctl1 = SPI_CTL1(cfg->reg);
+	static const char *const mode_str[] = {
+		[SPI_GD32_XFER_POLLING] = "poll",
+		[SPI_GD32_XFER_INTERRUPT] = "irq",
+		[SPI_GD32_XFER_DMA] = "dma",
+	};
 
 	if (status == -ETIMEDOUT) {
-		data->timeout_count++;
+		data->stats.timeouts++;
 	} else {
-		data->error_count++;
+		data->stats.errors++;
 	}
-
-	data->last_fault_status = status;
-	data->last_fault_detail = detail;
+	data->stats.last_status = status;
+	data->stats.last_detail = detail;
 
 	LOG_WRN_RATELIMIT_RATE(
-		5000, "%s %s: status=%d detail=0x%08x timeouts=%u errors=%u resets=%u",
-		dev->name, reason, status, detail, data->timeout_count, data->error_count,
-		data->reset_count);
+		5000,
+		"%s %s: status=%d detail=0x%08x mode=%s stat=0x%04x ctl1=0x%04x "
+		"frames_left=%u rx_pending=%u timeouts=%u errors=%u resets=%u",
+		dev->name, reason, status, detail, mode_str[data->xfer_mode], stat, ctl1,
+		(unsigned int)data->frames_left, (unsigned int)data->rx_pending,
+		data->stats.timeouts, data->stats.errors, data->stats.resets);
 }
 
 static void spi_gd32_clear_errors(const struct spi_gd32_config *cfg, uint32_t stat)
 {
-	if ((stat & SPI_STAT_TXURERR) != 0U) {
-		(void)SPI_STAT(cfg->reg);
-	}
-
 	if ((stat & SPI_STAT_RXORERR) != 0U) {
 		(void)SPI_DATA(cfg->reg);
 		(void)SPI_STAT(cfg->reg);
 	}
-
 	if ((stat & SPI_STAT_CONFERR) != 0U) {
 		uint32_t ctl0 = SPI_CTL0(cfg->reg);
 
 		(void)SPI_STAT(cfg->reg);
 		SPI_CTL0(cfg->reg) = ctl0;
 	}
-
 	if ((stat & SPI_STAT_CRCERR) != 0U) {
-		SPI_STAT(cfg->reg) &= ~SPI_STAT_CRCERR;
+		SPI_STAT(cfg->reg) = stat & ~SPI_STAT_CRCERR;
 	}
-
 	if ((stat & SPI_STAT_FERR) != 0U) {
-		SPI_STAT(cfg->reg) &= ~SPI_STAT_FERR;
+		SPI_STAT(cfg->reg) = stat & ~SPI_STAT_FERR;
 	}
-}
-
-static uint16_t spi_gd32_discard_frame(const struct spi_gd32_config *cfg)
-{
-	return (uint16_t)SPI_DATA(cfg->reg);
 }
 
 static void spi_gd32_flush_stale_status(const struct spi_gd32_config *cfg)
 {
-	uint32_t stat;
-
-	do {
-		stat = spi_gd32_stat(cfg);
+	for (unsigned int i = 0U; i < SPI_GD32_FLUSH_MAX_ITERATIONS; i++) {
+		uint32_t stat = spi_gd32_stat(cfg);
 
 		while ((stat & SPI_STAT_RBNE) != 0U) {
-			(void)spi_gd32_discard_frame(cfg);
+			(void)SPI_DATA(cfg->reg);
 			stat = spi_gd32_stat(cfg);
 		}
-
 		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
 			spi_gd32_clear_errors(cfg, stat);
 		}
-	} while ((stat & (SPI_STAT_RBNE | SPI_GD32_ERR_MASK)) != 0U);
+		stat = spi_gd32_stat(cfg);
+		if ((stat & (SPI_STAT_RBNE | SPI_GD32_ERR_MASK)) == 0U) {
+			return;
+		}
+	}
+
+	LOG_WRN_RATELIMIT_RATE(5000, "spi_gd32: flush_stale_status did not converge");
 }
 
 static void spi_gd32_disable_interrupts(const struct spi_gd32_config *cfg)
@@ -236,539 +269,43 @@ static void spi_gd32_disable_interrupts(const struct spi_gd32_config *cfg)
 	SPI_CTL1(cfg->reg) &= ~(SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE | SPI_CTL1_ERRIE);
 }
 
-#ifdef CONFIG_SPI_GD32_INTERRUPT
-static void spi_gd32_update_interrupt_mask(const struct spi_gd32_config *cfg,
-					   const struct spi_gd32_data *data)
-{
-	uint32_t ctl1 = SPI_CTL1(cfg->reg);
-
-	ctl1 &= ~(SPI_CTL1_ERRIE | SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE);
-	ctl1 |= SPI_CTL1_ERRIE;
-
-	if (spi_gd32_is_slave(data)) {
-		if (data->transfer_rx || data->transfer_tx) {
-			ctl1 |= SPI_CTL1_RBNEIE;
-		}
-
-		if (!spi_gd32_is_rx_only(data) && spi_gd32_can_write_frame(data)) {
-			ctl1 |= SPI_CTL1_TBEIE;
-		}
-	} else {
-		if ((data->rx_pending != 0U) || data->transfer_rx) {
-			ctl1 |= SPI_CTL1_RBNEIE;
-		}
-
-		if (spi_gd32_can_write_frame(data)) {
-			ctl1 |= SPI_CTL1_TBEIE;
-		}
-	}
-
-	SPI_CTL1(cfg->reg) = ctl1;
-}
-#endif
-
-static bool spi_gd32_is_slave_operation(uint16_t operation)
-{
-	return SPI_OP_MODE_GET(operation) == SPI_OP_MODE_SLAVE;
-}
-
-static bool spi_gd32_is_slave_config(const struct spi_config *config)
-{
-	return (config != NULL) && spi_gd32_is_slave_operation(config->operation);
-}
-
-static bool spi_gd32_is_slave(const struct spi_gd32_data *data)
-{
-	return spi_gd32_is_slave_config(data->ctx.config);
-}
-
-static bool spi_gd32_is_rx_only(const struct spi_gd32_data *data)
-{
-	return !data->transfer_tx && data->transfer_rx;
-}
-
-static bool spi_gd32_is_tx_only(const struct spi_gd32_data *data)
-{
-	return data->transfer_tx && !data->transfer_rx;
-}
-
-static bool spi_gd32_can_write_frame(const struct spi_gd32_data *data)
-{
-	size_t capacity = SPI_GD32_RX_CAPACITY_FRAMES;
-
-	if ((data->xfer_mode == SPI_GD32_XFER_POLLING) && !spi_gd32_is_slave(data) &&
-	    spi_gd32_is_tx_only(data)) {
-		capacity = 1U;
-	}
-
-	return (data->frames_left != 0U) && (data->rx_pending < capacity);
-}
-static size_t spi_gd32_remaining_frames(struct spi_context *ctx, uint8_t dfs)
-{
-	return DIV_ROUND_UP(MAX(spi_context_total_tx_len(ctx), spi_context_total_rx_len(ctx)), dfs);
-}
-
-static bool spi_gd32_keep_enabled(const struct spi_gd32_data *data)
-{
-	return !spi_gd32_is_slave(data) && (data->ctx.config != NULL) &&
-	       ((data->ctx.config->operation & SPI_HOLD_ON_CS) != 0U);
-}
-
 #ifdef CONFIG_SPI_GD32_DMA
-static bool spi_gd32_dma_enabled(const struct device *dev)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-
-	return (cfg->dma[TX].dev != NULL) && (cfg->dma[RX].dev != NULL);
-}
-
 static void spi_gd32_disable_dma_requests(const struct spi_gd32_config *cfg)
 {
 	SPI_CTL1(cfg->reg) &= ~(SPI_CTL1_DMATEN | SPI_CTL1_DMAREN);
 }
-
-static void spi_gd32_stop_dma(const struct device *dev)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-
-	if (!spi_gd32_dma_enabled(dev)) {
-		return;
-	}
-
-	for (size_t i = 0; i < NUM_OF_DIRECTION; i++) {
-		(void)dma_stop(cfg->dma[i].dev, cfg->dma[i].channel);
-	}
-}
-
-static bool spi_gd32_dma_addr_ok(uintptr_t addr, size_t len)
-{
-#if IS_ENABLED(CONFIG_MEM_ATTR)
-	int ret;
-
-	if (IS_ENABLED(CONFIG_MMU) || (len == 0U)) {
-		return true;
-	}
-
-	if ((addr + len) < addr) {
-		return false;
-	}
-
-	ret = mem_attr_check_buf((void *)addr, len, DT_MEM_DMA);
-	if (ret == 0 || ret == -ENOSYS) {
-		return true;
-	}
-
-	return ret == -ENOBUFS;
 #else
-	ARG_UNUSED(addr);
-	ARG_UNUSED(len);
-#endif
-
-	return true;
-}
-
-static bool spi_gd32_dma_bufs_usable(const struct spi_buf_set *bufs, uint8_t dfs)
-{
-	if (bufs == NULL) {
-		return true;
-	}
-
-	for (size_t i = 0; i < bufs->count; i++) {
-		const struct spi_buf *buf = &bufs->buffers[i];
-
-		if ((buf->buf == NULL) || (buf->len == 0U)) {
-			continue;
-		}
-
-		if ((dfs == 2U) && !IS_ALIGNED((uintptr_t)buf->buf, 2U)) {
-			return false;
-		}
-
-		if (!spi_gd32_dma_addr_ok((uintptr_t)buf->buf, buf->len)) {
-			return false;
-		}
-	}
-
-	return true;
-}
-
-static bool spi_gd32_dma_possible(const struct device *dev, const struct spi_buf_set *tx_bufs,
-				  const struct spi_buf_set *rx_bufs)
-{
-	struct spi_gd32_data *data = dev->data;
-
-	if (spi_gd32_is_slave(data) || !spi_gd32_dma_enabled(dev)) {
-		return false;
-	}
-
-	return spi_gd32_dma_bufs_usable(tx_bufs, data->dfs) &&
-	       spi_gd32_dma_bufs_usable(rx_bufs, data->dfs);
-}
-#else
-static void spi_gd32_disable_dma_requests(const struct spi_gd32_config *cfg)
+static inline void spi_gd32_disable_dma_requests(const struct spi_gd32_config *cfg)
 {
 	ARG_UNUSED(cfg);
 }
 #endif
 
-static uint32_t spi_gd32_frame_timeout_us(const struct spi_gd32_data *data, size_t frames)
+static void spi_gd32_stop_transfer_engine(const struct device *dev)
 {
-	if (spi_gd32_is_slave(data)) {
-		return MAX((uint32_t)CONFIG_SPI_COMPLETION_TIMEOUT_TOLERANCE * USEC_PER_MSEC, 1U);
-	}
-
-	uint32_t bits = SPI_WORD_SIZE_GET(data->ctx.config->operation);
-	uint64_t timeout_us;
-
-	timeout_us = (uint64_t)MAX(frames, 1U) * bits * USEC_PER_SEC;
-	timeout_us = DIV_ROUND_UP(timeout_us, data->ctx.config->frequency);
-	timeout_us += (uint64_t)CONFIG_SPI_COMPLETION_TIMEOUT_TOLERANCE * USEC_PER_MSEC;
-
-	return (uint32_t)MIN(timeout_us, (uint64_t)UINT32_MAX);
-}
-
-#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
-static k_timeout_t spi_gd32_completion_timeout(const struct spi_gd32_data *data)
-{
-	return K_USEC(spi_gd32_frame_timeout_us(data, MAX(data->frames_left, 2U)));
-}
-#endif
-
-#ifdef CONFIG_SPI_SLAVE
-struct spi_gd32_slave_progress {
-	size_t frames_left;
-	size_t rx_pending;
-	int recv_frames;
-};
-
-static struct spi_gd32_slave_progress spi_gd32_get_slave_progress(struct spi_gd32_data *data)
-{
-	struct spi_gd32_slave_progress progress;
-	unsigned int key = irq_lock();
-
-	progress.frames_left = data->frames_left;
-	progress.rx_pending = data->rx_pending;
-	progress.recv_frames = data->ctx.recv_frames;
-
-	irq_unlock(key);
-
-	return progress;
-}
-
-static bool spi_gd32_slave_progressed(const struct spi_gd32_slave_progress *before,
-				      const struct spi_gd32_slave_progress *after)
-{
-	return (before->frames_left != after->frames_left) ||
-	       (before->rx_pending != after->rx_pending) ||
-	       (before->recv_frames != after->recv_frames);
-}
-#endif
-
-static uint32_t spi_gd32_spin_timeout(const struct spi_gd32_data *data, size_t frames)
-{
-	uint64_t timeout = (uint64_t)spi_gd32_frame_timeout_us(data, frames) * 64U;
-
-	return (uint32_t)MAX(MIN(timeout, (uint64_t)UINT32_MAX), 1000U);
-}
-
-static int spi_gd32_wait_for_status(const struct device *dev, uint32_t flags, uint32_t *stat_out)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	uint32_t timeout = spi_gd32_spin_timeout(data, 2U);
-	uint32_t stat;
-
-	while (timeout-- != 0U) {
-		stat = spi_gd32_stat(cfg);
-		if (((stat & SPI_GD32_ERR_MASK) != 0U) || ((stat & flags) != 0U)) {
-			goto out;
-		}
-	}
-
-	spi_gd32_note_fault(dev, -ETIMEDOUT, flags, "timed out waiting for SPI flags");
-	return -ETIMEDOUT;
-
-out:
-	if ((stat & SPI_GD32_ERR_MASK) != 0U) {
-		spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
-				    "saw SPI error status while waiting for flags");
-		spi_gd32_clear_errors(cfg, stat);
-		return -EIO;
-	}
-
-	if (stat_out != NULL) {
-		*stat_out = stat;
-	}
-
-	return 0;
-}
-
-static int spi_gd32_wait_until_idle(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	uint32_t timeout = spi_gd32_spin_timeout(data, 2U);
-	uint32_t stat;
-
-	while (timeout-- != 0U) {
-		stat = spi_gd32_stat(cfg);
-		if (((stat & SPI_GD32_ERR_MASK) != 0U) ||
-		    (((stat & SPI_STAT_TBE) != 0U) && ((stat & SPI_STAT_TRANS) == 0U))) {
-			goto out;
-		}
-	}
-
-	spi_gd32_note_fault(dev, -ETIMEDOUT, spi_gd32_stat(cfg), "timed out waiting for SPI idle");
-	return -ETIMEDOUT;
-
-out:
-	if ((stat & SPI_GD32_ERR_MASK) != 0U) {
-		spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
-				    "saw SPI error status while waiting for idle");
-		spi_gd32_clear_errors(cfg, stat);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
-static bool spi_gd32_mark_transfer_inactive(struct spi_gd32_data *data)
-{
-	unsigned int key = irq_lock();
-	bool active = data->transfer_active;
-
-	if (active) {
-		data->transfer_active = false;
-	}
-
-	irq_unlock(key);
-
-	return active;
-}
-#endif
-
-#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
-static int spi_gd32_wait_for_completion(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	struct spi_context *ctx = &data->ctx;
-#ifdef CONFIG_SPI_SLAVE
-	struct spi_gd32_slave_progress progress = spi_gd32_get_slave_progress(data);
-#endif
-
-	if (!spi_gd32_is_slave(data)) {
-		return spi_context_wait_for_completion(ctx);
-	}
-
-	while (k_sem_take(&ctx->sync, spi_gd32_completion_timeout(data)) != 0) {
-#ifdef CONFIG_SPI_SLAVE
-		struct spi_gd32_slave_progress current = spi_gd32_get_slave_progress(data);
-
-		if (spi_gd32_slave_progressed(&progress, &current)) {
-			progress = current;
-			continue;
-		}
-#endif
-		spi_gd32_note_fault(dev, -ETIMEDOUT, 0U,
-				    "timed out waiting for slave transfer completion");
-		return -ETIMEDOUT;
-	}
-
-#ifdef CONFIG_SPI_SLAVE
-	if (ctx->sync_status == 0) {
-		return ctx->recv_frames;
-	}
-#endif
-
-	return ctx->sync_status;
-}
-#endif
-
-static void spi_gd32_write_frame(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	struct spi_context *ctx = &data->ctx;
-	uint16_t frame = 0U;
-
-	if (data->dfs == 1U) {
-		if (spi_context_tx_buf_on(ctx)) {
-			frame = UNALIGNED_GET((uint8_t *)ctx->tx_buf);
-		}
-	} else if (spi_context_tx_buf_on(ctx)) {
-		frame = UNALIGNED_GET((uint16_t *)ctx->tx_buf);
-	}
-
-	SPI_DATA(cfg->reg) = frame;
-
-	if (spi_context_tx_on(ctx)) {
-		spi_context_update_tx(ctx, data->dfs, 1U);
-	}
-
-	data->frames_left--;
-	data->rx_pending++;
-}
-
-static void spi_gd32_read_frame(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	struct spi_context *ctx = &data->ctx;
-	uint16_t frame = SPI_DATA(cfg->reg);
-
-	if (data->dfs == 1U) {
-		if (spi_context_rx_buf_on(ctx)) {
-			UNALIGNED_PUT((uint8_t)frame, (uint8_t *)ctx->rx_buf);
-		}
-	} else if (spi_context_rx_buf_on(ctx)) {
-		UNALIGNED_PUT(frame, (uint16_t *)ctx->rx_buf);
-	}
-
-	if (spi_context_rx_on(ctx)) {
-		spi_context_update_rx(ctx, data->dfs, 1U);
-	}
-
-	if (data->rx_pending != 0U) {
-		data->rx_pending--;
-	}
-}
-
-static void spi_gd32_drop_frame(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
 	const struct spi_gd32_config *cfg = dev->config;
 
-	(void)SPI_DATA(cfg->reg);
+	spi_gd32_disable_interrupts(cfg);
+	spi_gd32_disable_dma_requests(cfg);
 
-	if (data->rx_pending != 0U) {
-		data->rx_pending--;
-	}
-}
-
-static void spi_gd32_handle_slave_rx_frame(const struct device *dev)
-{
+#ifdef CONFIG_SPI_GD32_DMA
 	struct spi_gd32_data *data = dev->data;
-	struct spi_context *ctx = &data->ctx;
 
-	if (spi_gd32_is_rx_only(data)) {
-		spi_gd32_read_frame(dev);
-		data->frames_left--;
-	} else if (data->rx_pending != 0U) {
-		if (data->transfer_rx && spi_context_rx_on(ctx)) {
-			spi_gd32_read_frame(dev);
-		} else {
-			spi_gd32_drop_frame(dev);
-		}
-	} else {
-		spi_gd32_drop_frame(dev);
-	}
-}
-
-static bool spi_gd32_shift_slave(const struct device *dev, uint32_t *stat)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	bool progressed = false;
-
-	if (!spi_gd32_is_rx_only(data)) {
-		while (((*stat) & SPI_STAT_TBE) != 0U && spi_gd32_can_write_frame(data)) {
-			spi_gd32_write_frame(dev);
-			progressed = true;
-			*stat = spi_gd32_stat(cfg);
+	if (data->xfer_mode == SPI_GD32_XFER_DMA) {
+		for (size_t i = 0; i < NUM_OF_DIRECTION; i++) {
+			if (cfg->dma[i].dev != NULL) {
+				(void)dma_stop(cfg->dma[i].dev, cfg->dma[i].channel);
+			}
 		}
 	}
-
-	while (((*stat) & SPI_STAT_RBNE) != 0U) {
-		spi_gd32_handle_slave_rx_frame(dev);
-		progressed = true;
-		*stat = spi_gd32_stat(cfg);
-	}
-
-	if (!spi_gd32_is_rx_only(data)) {
-		while (((*stat) & SPI_STAT_TBE) != 0U && spi_gd32_can_write_frame(data)) {
-			spi_gd32_write_frame(dev);
-			progressed = true;
-			*stat = spi_gd32_stat(cfg);
-		}
-	}
-
-	return progressed;
-}
-
-#ifdef CONFIG_SPI_GD32_INTERRUPT
-
-static int spi_gd32_handle_slave_overrun(const struct device *dev, uint32_t stat)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	bool handled_data = false;
-
-	if (!spi_gd32_is_slave(data) || ((stat & SPI_GD32_ERR_MASK) != SPI_STAT_RXORERR)) {
-		return -EIO;
-	}
-
-	if ((stat & SPI_STAT_RBNE) != 0U) {
-		spi_gd32_handle_slave_rx_frame(dev);
-		handled_data = true;
-		stat = spi_gd32_stat(cfg);
-	}
-
-	if ((stat & SPI_STAT_RBNE) != 0U) {
-		spi_gd32_handle_slave_rx_frame(dev);
-		handled_data = true;
-	}
-
-	if (handled_data) {
-		(void)SPI_STAT(cfg->reg);
-	} else {
-		spi_gd32_clear_errors(cfg, stat);
-		return -EIO;
-	}
-
-	if ((data->frames_left == 0U) && (data->rx_pending == 0U)) {
-		return 1;
-	}
-
-	return 0;
-}
 #endif
-
-static void spi_gd32_prepare_transfer(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-
-	data->dfs = SPI_WORD_SIZE_GET(data->ctx.config->operation) > 8U ? 2U : 1U;
-	data->transfer_tx = spi_context_total_tx_len(&data->ctx) != 0U;
-	data->transfer_rx = spi_context_total_rx_len(&data->ctx) != 0U;
-	data->frames_left = spi_gd32_remaining_frames(&data->ctx, data->dfs);
-	data->rx_pending = 0U;
-	data->xfer_mode = SPI_GD32_XFER_POLLING;
-	data->transfer_active = false;
-	data->reset_needed = false;
-}
-
-static int spi_gd32_validate_buffers(const struct spi_buf_set *bufs, uint8_t dfs)
-{
-	if (bufs == NULL) {
-		return 0;
-	}
-
-	for (size_t i = 0; i < bufs->count; i++) {
-		if ((bufs->buffers[i].len % dfs) != 0U) {
-			return -EINVAL;
-		}
-	}
-
-	return 0;
 }
 
 static void spi_gd32_reset_peripheral(const struct device *dev)
 {
 	const struct spi_gd32_config *cfg = dev->config;
-	int ret;
+	int ret = reset_line_toggle_dt(&cfg->reset);
 
-	ret = reset_line_toggle_dt(&cfg->reset);
 	if (ret != 0) {
 		LOG_ERR("%s failed to reset SPI peripheral (%d)", dev->name, ret);
 	}
@@ -788,31 +325,1069 @@ static void spi_gd32_force_recover(const struct device *dev, bool reset_peripher
 
 	if (reset_peripheral) {
 		spi_gd32_reset_peripheral(dev);
-		data->reset_count++;
+		data->stats.resets++;
 		spi_gd32_flush_stale_status(cfg);
 	}
 }
 
-static void spi_gd32_stop_transfer_engine(const struct device *dev)
+#ifdef CONFIG_SPI_GD32_INTERRUPT
+static void spi_gd32_update_interrupt_mask(const struct spi_gd32_config *cfg,
+					    const struct spi_gd32_data *data)
+{
+	uint32_t ctl1 = SPI_CTL1(cfg->reg);
+	bool slave_rx_only = spi_gd32_is_slave(data) && spi_gd32_is_rx_only(data);
+
+	ctl1 &= ~(SPI_CTL1_ERRIE | SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE);
+	ctl1 |= SPI_CTL1_ERRIE;
+
+	if (data->rx_pending != 0U || data->transfer_rx) {
+		ctl1 |= SPI_CTL1_RBNEIE;
+	}
+	/* Slave RX-only never writes — the master clocks data in. Master
+	 * RX-only still has to write zeros to generate the clock, so TBEIE
+	 * must stay enabled there.
+	 */
+	if (spi_gd32_can_write_frame(data) && !slave_rx_only) {
+		ctl1 |= SPI_CTL1_TBEIE;
+	}
+
+	SPI_CTL1(cfg->reg) = ctl1;
+}
+#endif
+
+static uint32_t spi_gd32_frame_timeout_us(const struct spi_gd32_data *data, size_t frames)
+{
+	if (spi_gd32_is_slave(data)) {
+		return MAX((uint32_t)CONFIG_SPI_COMPLETION_TIMEOUT_TOLERANCE * USEC_PER_MSEC, 1U);
+	}
+
+	uint32_t bits = SPI_WORD_SIZE_GET(data->ctx.config->operation);
+	uint64_t us = (uint64_t)MAX(frames, 1U) * bits * USEC_PER_SEC;
+
+	us = DIV_ROUND_UP(us, data->ctx.config->frequency);
+	us += (uint64_t)CONFIG_SPI_COMPLETION_TIMEOUT_TOLERANCE * USEC_PER_MSEC;
+
+	return (uint32_t)MIN(us, (uint64_t)UINT32_MAX);
+}
+
+#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA) || \
+	defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+static k_timeout_t spi_gd32_completion_timeout(const struct spi_gd32_data *data)
+{
+	return K_USEC(spi_gd32_frame_timeout_us(data, MAX(data->frames_left, 2U)));
+}
+#endif
+
+static uint32_t spi_gd32_spin_iters(const struct spi_gd32_data *data)
+{
+	uint64_t budget = (uint64_t)spi_gd32_frame_timeout_us(data, 2U) * 64U;
+
+	return (uint32_t)CLAMP(budget, 1000ULL, (uint64_t)UINT32_MAX);
+}
+
+static int spi_gd32_wait_for_status(const struct device *dev, uint32_t flags, uint32_t *stat_out)
 {
 	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	uint32_t iters = spi_gd32_spin_iters(data);
+	uint32_t stat;
 
-	spi_gd32_disable_interrupts(cfg);
-	spi_gd32_disable_dma_requests(cfg);
-#ifdef CONFIG_SPI_GD32_DMA
+	while (iters-- != 0U) {
+		stat = spi_gd32_stat(cfg);
+		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
+			spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
+					    "error while polling status");
+			spi_gd32_clear_errors(cfg, stat);
+			return -EIO;
+		}
+		if ((stat & flags) != 0U) {
+			if (stat_out != NULL) {
+				*stat_out = stat;
+			}
+			return 0;
+		}
+	}
+
+	spi_gd32_note_fault(dev, -ETIMEDOUT, flags, "timeout polling status");
+	return -ETIMEDOUT;
+}
+
+static int spi_gd32_wait_until_idle(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	uint32_t iters = spi_gd32_spin_iters(data);
+
+	while (iters-- != 0U) {
+		uint32_t stat = spi_gd32_stat(cfg);
+
+		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
+			spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
+					    "error while waiting for idle");
+			spi_gd32_clear_errors(cfg, stat);
+			return -EIO;
+		}
+		if ((stat & SPI_STAT_TBE) != 0U && (stat & SPI_STAT_TRANS) == 0U) {
+			return 0;
+		}
+	}
+
+	spi_gd32_note_fault(dev, -ETIMEDOUT, spi_gd32_stat(cfg), "timeout waiting for idle");
+	return -ETIMEDOUT;
+}
+
+#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA) || \
+	defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+static bool spi_gd32_mark_transfer_inactive(struct spi_gd32_data *data)
+{
+	unsigned int key = irq_lock();
+	bool was_active = data->transfer_active;
+
+	data->transfer_active = false;
+	irq_unlock(key);
+
+	return was_active;
+}
+#endif
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+static bool spi_gd32_has_deferred_completion(const struct spi_gd32_data *data)
+{
+#ifdef CONFIG_SPI_RTIO
+	if (data->rtio_active) {
+		return true;
+	}
+#endif
+#ifdef CONFIG_SPI_ASYNC
+	return data->ctx.asynchronous;
+#else
+	return false;
+#endif
+}
+
+static void spi_gd32_disarm_timeout(struct spi_gd32_data *data)
+{
+	if (spi_gd32_has_deferred_completion(data)) {
+		(void)k_work_cancel_delayable(&data->async.timeout_work);
+	}
+}
+
+static void spi_gd32_refresh_timeout(const struct device *dev)
+{
 	struct spi_gd32_data *data = dev->data;
 
-	if (data->xfer_mode == SPI_GD32_XFER_DMA) {
-		spi_gd32_stop_dma(dev);
+	if (!data->transfer_active || !spi_gd32_has_deferred_completion(data)) {
+		return;
+	}
+	(void)k_work_reschedule(&data->async.timeout_work, spi_gd32_completion_timeout(data));
+}
+
+static void spi_gd32_arm_timeout_on_start(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	if (spi_gd32_is_slave(data)) {
+		return;
+	}
+	spi_gd32_refresh_timeout(dev);
+}
+
+static void spi_gd32_note_progress(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	data->async.progress_seen = true;
+	spi_gd32_refresh_timeout(dev);
+}
+
+static void spi_gd32_queue_completion_work(const struct device *dev, int status)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	data->async.completion_status = status;
+	(void)k_work_submit(&data->async.completion_work);
+}
+
+static void spi_gd32_completion_work_handler(struct k_work *work)
+{
+	struct spi_gd32_data *data = CONTAINER_OF(work, struct spi_gd32_data, async.completion_work);
+	const struct device *dev = data->dev;
+	int status = data->async.completion_status;
+
+	if (data->async.completion_suppressed || data->ctx.config == NULL) {
+		return;
+	}
+
+#ifdef CONFIG_SPI_RTIO
+	if (data->rtio_active) {
+		spi_gd32_iodev_complete(dev, status);
+		return;
+	}
+#endif
+#ifdef CONFIG_SPI_ASYNC
+	if (data->ctx.asynchronous) {
+		spi_gd32_complete_async(dev, status);
 	}
 #endif
 }
 
-static void spi_gd32_latch_fatal(struct spi_gd32_data *data, int status)
+static void spi_gd32_timeout_work_handler(struct k_work *work)
 {
-	if (status < 0) {
-		data->reset_needed = true;
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct spi_gd32_data *data = CONTAINER_OF(dwork, struct spi_gd32_data, async.timeout_work);
+	const struct device *dev = data->dev;
+	const struct spi_gd32_config *cfg = dev->config;
+
+	if (!data->transfer_active) {
+		return;
 	}
+
+	if (spi_gd32_is_slave(data) && !data->async.progress_seen) {
+		spi_gd32_refresh_timeout(dev);
+		return;
+	}
+
+	if (!spi_gd32_mark_transfer_inactive(data)) {
+		return;
+	}
+	spi_gd32_stop_transfer_engine(dev);
+
+	spi_gd32_note_fault(dev, -ETIMEDOUT, spi_gd32_stat(cfg),
+			    "timeout waiting for async transfer progress");
+	spi_gd32_queue_completion_work(dev, -ETIMEDOUT);
+}
+#endif
+
+#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
+/* Central completion path for IRQ/DMA contexts. Stops the engine *before*
+ * deferring user-visible completion so we cannot IRQ-storm in the gap
+ * before the work queue runs cleanup.
+ */
+static void spi_gd32_signal_completion(const struct device *dev, int status)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	if (!spi_gd32_mark_transfer_inactive(data)) {
+		return;
+	}
+
+	spi_gd32_stop_transfer_engine(dev);
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	spi_gd32_disarm_timeout(data);
+	if (spi_gd32_has_deferred_completion(data)) {
+		spi_gd32_queue_completion_work(dev, status);
+		return;
+	}
+#endif
+
+	spi_context_complete(&data->ctx, dev, status);
+}
+#endif
+
+static void spi_gd32_write_frame(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_context *ctx = &data->ctx;
+	uint16_t frame = 0U;
+
+	if (spi_context_tx_buf_on(ctx)) {
+		frame = (data->dfs == 1U) ? UNALIGNED_GET((uint8_t *)ctx->tx_buf)
+					  : UNALIGNED_GET((uint16_t *)ctx->tx_buf);
+	}
+	SPI_DATA(cfg->reg) = frame;
+
+	if (spi_context_tx_on(ctx)) {
+		spi_context_update_tx(ctx, data->dfs, 1U);
+	}
+	data->frames_left--;
+	data->rx_pending++;
+}
+
+static void spi_gd32_read_frame(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_context *ctx = &data->ctx;
+	uint16_t frame = (uint16_t)SPI_DATA(cfg->reg);
+
+	if (spi_context_rx_buf_on(ctx)) {
+		if (data->dfs == 1U) {
+			UNALIGNED_PUT((uint8_t)frame, (uint8_t *)ctx->rx_buf);
+		} else {
+			UNALIGNED_PUT(frame, (uint16_t *)ctx->rx_buf);
+		}
+	}
+	if (spi_context_rx_on(ctx)) {
+		spi_context_update_rx(ctx, data->dfs, 1U);
+	}
+	if (data->rx_pending != 0U) {
+		data->rx_pending--;
+	}
+}
+
+static void spi_gd32_drop_frame(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+
+	(void)SPI_DATA(cfg->reg);
+	if (data->rx_pending != 0U) {
+		data->rx_pending--;
+	}
+}
+
+static void spi_gd32_handle_slave_rx_frame(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_context *ctx = &data->ctx;
+
+	if (spi_gd32_is_rx_only(data)) {
+		spi_gd32_read_frame(dev);
+		data->frames_left--;
+		return;
+	}
+	if (data->rx_pending != 0U && data->transfer_rx && spi_context_rx_on(ctx)) {
+		spi_gd32_read_frame(dev);
+		return;
+	}
+	spi_gd32_drop_frame(dev);
+}
+
+static bool spi_gd32_shift_slave(const struct device *dev, uint32_t *stat)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	bool progressed = false;
+
+	while (true) {
+		bool worked = false;
+
+		if (!spi_gd32_is_rx_only(data)) {
+			while ((*stat & SPI_STAT_TBE) != 0U && spi_gd32_can_write_frame(data)) {
+				spi_gd32_write_frame(dev);
+				worked = true;
+				*stat = spi_gd32_stat(cfg);
+			}
+		}
+		while ((*stat & SPI_STAT_RBNE) != 0U) {
+			spi_gd32_handle_slave_rx_frame(dev);
+			worked = true;
+			*stat = spi_gd32_stat(cfg);
+		}
+
+		progressed = progressed || worked;
+		if (!worked) {
+			return progressed;
+		}
+	}
+}
+
+static bool spi_gd32_shift_master(const struct device *dev, uint32_t *stat)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	bool progressed = false;
+
+	while ((*stat & SPI_STAT_RBNE) != 0U) {
+		if (data->rx_pending != 0U) {
+			spi_gd32_read_frame(dev);
+		} else {
+			spi_gd32_drop_frame(dev);
+		}
+		progressed = true;
+		*stat = spi_gd32_stat(cfg);
+	}
+	while ((*stat & SPI_STAT_TBE) != 0U && spi_gd32_can_write_frame(data)) {
+		spi_gd32_write_frame(dev);
+		progressed = true;
+		*stat = spi_gd32_stat(cfg);
+	}
+	return progressed;
+}
+
+static bool spi_gd32_shift(const struct device *dev, uint32_t *stat)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	return spi_gd32_is_slave(data) ? spi_gd32_shift_slave(dev, stat)
+				       : spi_gd32_shift_master(dev, stat);
+}
+
+/* Drain whatever frames are sitting in the RX register before clearing the
+ * RXORERR flag, so an in-flight overrun does not cost us live data. Returns
+ * true if recovery succeeded, false to abort the transfer.
+ */
+static bool spi_gd32_recover_slave_overrun(const struct device *dev, uint32_t stat)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	uint32_t errs = stat & SPI_GD32_ERR_MASK;
+	bool drained = false;
+
+	if (!spi_gd32_is_slave(data)) {
+		return false;
+	}
+	if ((errs & ~(SPI_STAT_RXORERR | SPI_STAT_FERR)) != 0U) {
+		return false;
+	}
+	if ((errs & SPI_STAT_RXORERR) == 0U) {
+		return false;
+	}
+
+	while ((spi_gd32_stat(cfg) & SPI_STAT_RBNE) != 0U) {
+		spi_gd32_handle_slave_rx_frame(dev);
+		drained = true;
+	}
+
+	(void)SPI_STAT(cfg->reg);
+
+	if ((errs & SPI_STAT_FERR) != 0U) {
+		SPI_STAT(cfg->reg) = spi_gd32_stat(cfg) & ~SPI_STAT_FERR;
+	}
+
+	return drained;
+}
+
+static int spi_gd32_polling_transfer(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+
+	while (!spi_gd32_transfer_done(data)) {
+		uint32_t stat = spi_gd32_stat(cfg);
+
+		if ((stat & SPI_GD32_ERR_MASK) != 0U) {
+			if (spi_gd32_recover_slave_overrun(dev, stat)) {
+				continue;
+			}
+			spi_gd32_note_fault(dev, -EIO, stat & SPI_GD32_ERR_MASK,
+					    "polling saw SPI error status");
+			spi_gd32_clear_errors(cfg, stat);
+			return -EIO;
+		}
+
+		if (spi_gd32_shift(dev, &stat)) {
+			continue;
+		}
+
+		uint32_t wait_for = spi_gd32_is_rx_only(data)
+					    ? SPI_STAT_RBNE
+					    : (SPI_STAT_TBE | SPI_STAT_RBNE);
+		int ret = spi_gd32_wait_for_status(dev, wait_for, NULL);
+
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
+static int spi_gd32_wait_for_completion(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_context *ctx = &data->ctx;
+
+	if (!spi_gd32_is_slave(data)) {
+		return spi_context_wait_for_completion(ctx);
+	}
+
+	size_t last_frames = data->frames_left;
+	size_t last_pending = data->rx_pending;
+
+	while (k_sem_take(&ctx->sync, spi_gd32_completion_timeout(data)) != 0) {
+		unsigned int key = irq_lock();
+		size_t frames = data->frames_left;
+		size_t pending = data->rx_pending;
+
+		irq_unlock(key);
+
+		if (frames != last_frames || pending != last_pending) {
+			last_frames = frames;
+			last_pending = pending;
+			continue;
+		}
+		spi_gd32_note_fault(dev, -ETIMEDOUT, 0U,
+				    "timed out waiting for slave completion");
+		return -ETIMEDOUT;
+	}
+
+#ifdef CONFIG_SPI_SLAVE
+	if (ctx->sync_status == 0) {
+		return ctx->recv_frames;
+	}
+#endif
+	return ctx->sync_status;
+}
+#endif
+
+#ifdef CONFIG_SPI_GD32_DMA
+static bool spi_gd32_dma_enabled(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+
+	return cfg->dma[TX].dev != NULL && cfg->dma[RX].dev != NULL;
+}
+
+static bool spi_gd32_dma_addr_ok(uintptr_t addr, size_t len)
+{
+#if IS_ENABLED(CONFIG_MEM_ATTR)
+	if (IS_ENABLED(CONFIG_MMU) || len == 0U) {
+		return true;
+	}
+	if (addr + len < addr) {
+		return false;
+	}
+
+	int ret = mem_attr_check_buf((void *)addr, len, DT_MEM_DMA);
+
+	return ret == 0 || ret == -ENOSYS || ret == -ENOBUFS;
+#else
+	ARG_UNUSED(addr);
+	ARG_UNUSED(len);
+	return true;
+#endif
+}
+
+static bool spi_gd32_dma_bufs_usable(const struct spi_buf_set *bufs, uint8_t dfs)
+{
+	if (bufs == NULL) {
+		return true;
+	}
+	for (size_t i = 0; i < bufs->count; i++) {
+		const struct spi_buf *buf = &bufs->buffers[i];
+
+		if (buf->buf == NULL || buf->len == 0U) {
+			continue;
+		}
+		if (dfs == 2U && !IS_ALIGNED((uintptr_t)buf->buf, 2U)) {
+			return false;
+		}
+		if (!spi_gd32_dma_addr_ok((uintptr_t)buf->buf, buf->len)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool spi_gd32_dma_possible(const struct device *dev, const struct spi_buf_set *tx_bufs,
+				  const struct spi_buf_set *rx_bufs, uint8_t dfs)
+{
+	struct spi_gd32_data *data = dev->data;
+
+	if (spi_gd32_is_slave(data) || !spi_gd32_dma_enabled(dev)) {
+		return false;
+	}
+	return spi_gd32_dma_bufs_usable(tx_bufs, dfs) && spi_gd32_dma_bufs_usable(rx_bufs, dfs);
+}
+
+static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
+				  int status);
+
+static int spi_gd32_dma_setup(const struct device *dev, enum spi_gd32_dma_direction dir,
+			      size_t chunk_len)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	struct dma_config *dma_cfg = &data->dma[dir].config;
+	struct dma_block_config *block_cfg = &data->dma[dir].block;
+	const struct spi_gd32_dma_config *dma = &cfg->dma[dir];
+	struct spi_context *ctx = &data->ctx;
+
+	if (chunk_len == 0U) {
+		return 0;
+	}
+
+	*dma_cfg = (struct dma_config){
+		.source_burst_length = 1U,
+		.dest_burst_length = 1U,
+		.user_data = (void *)dev,
+		.dma_callback = spi_gd32_dma_callback,
+		.block_count = 1U,
+		.head_block = block_cfg,
+		.dma_slot = dma->slot,
+		.channel_priority = GD32_DMA_CONFIG_PRIORITY(dma->config),
+		.channel_direction = (dir == TX) ? MEMORY_TO_PERIPHERAL : PERIPHERAL_TO_MEMORY,
+		.source_data_size = data->dfs,
+		.dest_data_size = data->dfs,
+	};
+
+	*block_cfg = (struct dma_block_config){
+		.block_size = chunk_len * data->dfs,
+		.fifo_mode_control = dma->fifo_threshold,
+	};
+
+	if (dir == TX) {
+		block_cfg->dest_address = (uint32_t)&SPI_DATA(cfg->reg);
+		block_cfg->dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+		if (spi_context_tx_buf_on(ctx)) {
+			block_cfg->source_address = (uint32_t)ctx->tx_buf;
+			block_cfg->source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+		} else {
+			block_cfg->source_address = (uint32_t)cfg->dummy_tx;
+			block_cfg->source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+		}
+	} else {
+		block_cfg->source_address = (uint32_t)&SPI_DATA(cfg->reg);
+		block_cfg->source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+		if (spi_context_rx_buf_on(ctx)) {
+			block_cfg->dest_address = (uint32_t)ctx->rx_buf;
+			block_cfg->dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+		} else {
+			block_cfg->dest_address = (uint32_t)cfg->dummy_rx;
+			block_cfg->dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+		}
+	}
+
+	if (dma_config(dma->dev, dma->channel, dma_cfg) != 0) {
+		LOG_ERR("%s failed to configure %s DMA channel", dev->name,
+			dir == TX ? "TX" : "RX");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int spi_gd32_dma_prepare_chunk(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	size_t chunk_len = spi_context_max_continuous_chunk(&data->ctx);
+	int ret;
+
+	if (chunk_len == 0U) {
+		return -EIO;
+	}
+
+#if defined(CONFIG_CACHE_MANAGEMENT) && defined(CONFIG_DCACHE) && !defined(CONFIG_NOCACHE_MEMORY)
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_context *ctx = &data->ctx;
+
+	if (!spi_context_tx_buf_on(ctx)) {
+		*cfg->dummy_tx = 0U;
+		(void)sys_cache_data_flush_range(cfg->dummy_tx, sizeof(*cfg->dummy_tx));
+	}
+	if (!spi_context_rx_buf_on(ctx)) {
+		(void)sys_cache_data_invd_range(cfg->dummy_rx, sizeof(*cfg->dummy_rx));
+	}
+#endif
+
+	ret = spi_gd32_dma_setup(dev, RX, chunk_len);
+	if (ret != 0) {
+		return ret;
+	}
+	return spi_gd32_dma_setup(dev, TX, chunk_len);
+}
+
+static int spi_gd32_dma_start_chunk(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	size_t chunk_len = spi_context_max_continuous_chunk(&data->ctx);
+
+	if (chunk_len == 0U) {
+		return -EIO;
+	}
+
+	spi_gd32_disable_dma_requests(cfg);
+	data->dma_chunk_len = chunk_len;
+	data->dma_done[RX] = false;
+	data->dma_done[TX] = false;
+
+	if (dma_start(cfg->dma[RX].dev, cfg->dma[RX].channel) != 0) {
+		LOG_ERR("%s failed to start RX DMA channel", dev->name);
+		return -EIO;
+	}
+	if (dma_start(cfg->dma[TX].dev, cfg->dma[TX].channel) != 0) {
+		LOG_ERR("%s failed to start TX DMA channel", dev->name);
+		(void)dma_stop(cfg->dma[RX].dev, cfg->dma[RX].channel);
+		return -EIO;
+	}
+
+	SPI_CTL1(cfg->reg) |= SPI_CTL1_ERRIE;
+	SPI_CTL1(cfg->reg) |= SPI_CTL1_DMAREN | SPI_CTL1_DMATEN;
+
+	return 0;
+}
+
+static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
+				  int status)
+{
+	const struct device *dev = arg;
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	enum spi_gd32_dma_direction dir;
+	bool both_done;
+	uint32_t errs;
+	int ret;
+
+	if (status < 0) {
+		spi_gd32_note_fault(dev, status, channel, "DMA transfer failed");
+		spi_gd32_signal_completion(dev, status);
+		return;
+	}
+	if (status == DMA_STATUS_BLOCK) {
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+		spi_gd32_note_progress(dev);
+#endif
+		return;
+	}
+
+	if (dma_dev == cfg->dma[RX].dev && channel == cfg->dma[RX].channel) {
+		dir = RX;
+	} else if (dma_dev == cfg->dma[TX].dev && channel == cfg->dma[TX].channel) {
+		dir = TX;
+	} else {
+		spi_gd32_note_fault(dev, -EIO, channel, "DMA callback from unexpected channel");
+		spi_gd32_signal_completion(dev, -EIO);
+		return;
+	}
+
+	unsigned int key = irq_lock();
+
+	if (!data->transfer_active) {
+		irq_unlock(key);
+		return;
+	}
+	data->dma_done[dir] = true;
+	both_done = data->dma_done[RX] && data->dma_done[TX];
+	irq_unlock(key);
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	spi_gd32_note_progress(dev);
+#endif
+	if (!both_done) {
+		return;
+	}
+
+	errs = spi_gd32_stat(cfg) & SPI_GD32_ERR_MASK;
+	if (errs != 0U) {
+		spi_gd32_note_fault(dev, -EIO, errs, "DMA completion saw SPI error");
+		spi_gd32_clear_errors(cfg, spi_gd32_stat(cfg));
+		spi_gd32_signal_completion(dev, -EIO);
+		return;
+	}
+
+	spi_gd32_disable_dma_requests(cfg);
+
+	if (spi_context_tx_on(&data->ctx)) {
+		spi_context_update_tx(&data->ctx, data->dfs, data->dma_chunk_len);
+	}
+	if (spi_context_rx_on(&data->ctx)) {
+		spi_context_update_rx(&data->ctx, data->dfs, data->dma_chunk_len);
+	}
+
+	if (spi_context_max_continuous_chunk(&data->ctx) == 0U) {
+		spi_gd32_signal_completion(dev, 0);
+		return;
+	}
+
+	ret = spi_gd32_dma_prepare_chunk(dev);
+	if (ret == 0) {
+		ret = spi_gd32_dma_start_chunk(dev);
+	}
+	if (ret != 0) {
+		spi_gd32_signal_completion(dev, ret);
+	}
+}
+#endif
+
+#ifdef CONFIG_SPI_GD32_INTERRUPT
+static void spi_gd32_isr(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+
+	if (!data->transfer_active) {
+		/* Belt-and-suspenders: a pending IRQ after completion must
+		 * not be able to storm. The flags are level-driven, so we
+		 * must silence the IE bits on this path too.
+		 */
+		spi_gd32_disable_interrupts(cfg);
+		return;
+	}
+
+	while (true) {
+		uint32_t stat = spi_gd32_stat(cfg);
+		uint32_t errs = stat & SPI_GD32_ERR_MASK;
+		bool progressed;
+
+		if (errs != 0U) {
+			if (spi_gd32_recover_slave_overrun(dev, stat)) {
+				spi_gd32_update_interrupt_mask(cfg, data);
+				continue;
+			}
+			spi_gd32_note_fault(dev, -EIO, errs, "ISR saw SPI error status");
+			spi_gd32_clear_errors(cfg, stat);
+			spi_gd32_signal_completion(dev, -EIO);
+			return;
+		}
+
+		progressed = spi_gd32_shift(dev, &stat);
+
+		if (spi_gd32_transfer_done(data)) {
+			spi_gd32_signal_completion(dev, 0);
+			return;
+		}
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+		if (progressed) {
+			spi_gd32_note_progress(dev);
+		}
+#endif
+		spi_gd32_update_interrupt_mask(cfg, data);
+
+		if (!progressed) {
+			return;
+		}
+	}
+}
+#endif
+
+static int spi_gd32_configure(const struct device *dev, const struct spi_config *config)
+{
+	struct spi_gd32_data *data = dev->data;
+	const struct spi_gd32_config *cfg = dev->config;
+	bool slave = spi_gd32_is_slave_op(config->operation);
+	bool ti = (config->operation & SPI_FRAME_FORMAT_TI) != 0U;
+	uint32_t prescaler = 0U;
+	uint32_t bus_freq;
+	int ret;
+
+	if (spi_context_configured(&data->ctx, config)) {
+		return 0;
+	}
+
+	if (slave && !IS_ENABLED(CONFIG_SPI_SLAVE)) {
+		LOG_ERR("Slave mode support is disabled");
+		return -ENOTSUP;
+	}
+	if ((config->operation & SPI_HALF_DUPLEX) != 0U) {
+		LOG_ERR("Half-duplex mode not supported");
+		return -ENOTSUP;
+	}
+	if ((config->operation & SPI_MODE_LOOP) != 0U) {
+		LOG_ERR("Loopback mode not supported");
+		return -ENOTSUP;
+	}
+	if (IS_ENABLED(CONFIG_SPI_EXTENDED_MODES) &&
+	    (config->operation & SPI_LINES_MASK) != SPI_LINES_SINGLE) {
+		LOG_ERR("Only single-line SPI is supported");
+		return -ENOTSUP;
+	}
+	if (SPI_WORD_SIZE_GET(config->operation) != 8U &&
+	    SPI_WORD_SIZE_GET(config->operation) != 16U) {
+		LOG_ERR("Only 8-bit and 16-bit words are supported");
+		return -ENOTSUP;
+	}
+	if (ti && (config->operation & SPI_TRANSFER_LSB) != 0U) {
+		LOG_ERR("TI frame format requires MSB-first transfers");
+		return -ENOTSUP;
+	}
+	if (!spi_cs_is_gpio(config) && (config->operation & SPI_CS_ACTIVE_HIGH) != 0U) {
+		LOG_ERR("Active-high native CS not supported");
+		return -ENOTSUP;
+	}
+	if (slave && spi_cs_is_gpio(config)) {
+		LOG_ERR("GPIO CS is not supported in slave mode");
+		return -ENOTSUP;
+	}
+	if (ti && spi_cs_is_gpio(config)) {
+		LOG_ERR("TI frame format requires native NSS");
+		return -ENOTSUP;
+	}
+	if (!slave && config->frequency == 0U) {
+		return -EINVAL;
+	}
+
+	if (!slave || config->frequency != 0U) {
+		ret = clock_control_get_rate(GD32_CLOCK_CONTROLLER,
+					     (clock_control_subsys_t)&cfg->clkid, &bus_freq);
+		if (ret != 0) {
+			LOG_ERR("Failed to get SPI clock rate");
+			return -EIO;
+		}
+
+		if (!slave) {
+			prescaler = SPI_GD32_PSC_MAX;
+		}
+		if (config->frequency != 0U) {
+			for (uint32_t i = 0U; i <= SPI_GD32_PSC_MAX; i++) {
+				if ((bus_freq >> (i + 1U)) <= config->frequency) {
+					prescaler = i;
+					break;
+				}
+			}
+		}
+	}
+
+	SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
+	spi_gd32_disable_interrupts(cfg);
+	spi_gd32_disable_dma_requests(cfg);
+	spi_gd32_flush_stale_status(cfg);
+	spi_gd32_reset_peripheral(dev);
+
+	uint32_t ctl0 = SPI_CTL0(cfg->reg) & SPI_GD32_INIT_MASK;
+	uint32_t ctl1 = SPI_CTL1(cfg->reg) &
+		~(SPI_CTL1_DMATEN | SPI_CTL1_DMAREN | SPI_CTL1_NSSDRV |
+		  SPI_CTL1_TMOD | SPI_CTL1_ERRIE | SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE);
+
+	ctl0 |= slave ? SPI_SLAVE : SPI_MASTER;
+	ctl0 |= SPI_TRANSMODE_FULLDUPLEX;
+	ctl0 |= (SPI_WORD_SIZE_GET(config->operation) == 16U) ? SPI_FRAMESIZE_16BIT
+							      : SPI_FRAMESIZE_8BIT;
+	ctl0 |= slave ? SPI_NSS_HARD
+		      : (spi_cs_is_gpio(config) ? SPI_NSS_SOFT : SPI_NSS_HARD);
+	ctl0 |= (config->operation & SPI_TRANSFER_LSB) != 0U ? SPI_ENDIAN_LSB : SPI_ENDIAN_MSB;
+
+	if ((config->operation & SPI_MODE_CPOL) != 0U) {
+		ctl0 |= (config->operation & SPI_MODE_CPHA) != 0U ? SPI_CK_PL_HIGH_PH_2EDGE
+								  : SPI_CK_PL_HIGH_PH_1EDGE;
+	} else {
+		ctl0 |= (config->operation & SPI_MODE_CPHA) != 0U ? SPI_CK_PL_LOW_PH_2EDGE
+								  : SPI_CK_PL_LOW_PH_1EDGE;
+	}
+
+	ctl0 |= CTL0_PSC(prescaler);
+
+	SPI_CTL0(cfg->reg) = ctl0;
+	SPI_I2SCTL(cfg->reg) &= ~SPI_I2SCTL_I2SSEL;
+
+	if (ti) {
+		ctl1 |= SPI_CTL1_TMOD;
+	}
+	if (!slave && !spi_cs_is_gpio(config)) {
+		ctl1 |= SPI_CTL1_NSSDRV;
+	}
+
+	SPI_CTL1(cfg->reg) = ctl1;
+
+	data->ctx.config = config;
+	data->dfs = spi_gd32_dfs_from_op(config->operation);
+
+	return 0;
+}
+
+static int spi_gd32_validate_buffers(const struct spi_buf_set *bufs, uint8_t dfs)
+{
+	if (bufs == NULL) {
+		return 0;
+	}
+	for (size_t i = 0; i < bufs->count; i++) {
+		if ((bufs->buffers[i].len % dfs) != 0U) {
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+static void spi_gd32_prepare_transfer(const struct device *dev)
+{
+	struct spi_gd32_data *data = dev->data;
+	struct spi_context *ctx = &data->ctx;
+
+	data->transfer_tx = spi_context_total_tx_len(ctx) != 0U;
+	data->transfer_rx = spi_context_total_rx_len(ctx) != 0U;
+	data->frames_left = MAX(spi_context_total_tx_len(ctx), spi_context_total_rx_len(ctx)) /
+			    data->dfs;
+	data->rx_pending = 0U;
+	data->xfer_mode = SPI_GD32_XFER_POLLING;
+	data->transfer_active = false;
+#ifdef CONFIG_SPI_GD32_DMA
+	data->dma_done[RX] = false;
+	data->dma_done[TX] = false;
+	data->dma_chunk_len = 0U;
+#endif
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	spi_gd32_disarm_timeout(data);
+	data->async.completion_status = 0;
+	data->async.completion_suppressed = false;
+	data->async.progress_seen = false;
+#endif
+}
+
+static enum spi_gd32_xfer_mode spi_gd32_select_xfer_mode(const struct device *dev,
+							 const struct spi_buf_set *tx_bufs,
+							 const struct spi_buf_set *rx_bufs,
+							 uint8_t dfs)
+{
+#ifdef CONFIG_SPI_GD32_DMA
+	if (spi_gd32_dma_possible(dev, tx_bufs, rx_bufs, dfs)) {
+		return SPI_GD32_XFER_DMA;
+	}
+#else
+	ARG_UNUSED(tx_bufs);
+	ARG_UNUSED(rx_bufs);
+	ARG_UNUSED(dfs);
+#endif
+	ARG_UNUSED(dev);
+#ifdef CONFIG_SPI_GD32_INTERRUPT
+	return SPI_GD32_XFER_INTERRUPT;
+#else
+	return SPI_GD32_XFER_POLLING;
+#endif
+}
+
+static int spi_gd32_start_transfer(const struct device *dev)
+{
+	const struct spi_gd32_config *cfg = dev->config;
+	struct spi_gd32_data *data = dev->data;
+	bool slave = spi_gd32_is_slave(data);
+
+	spi_gd32_stop_transfer_engine(dev);
+	spi_gd32_flush_stale_status(cfg);
+	data->transfer_active = true;
+
+#ifdef CONFIG_SPI_GD32_DMA
+	if (data->xfer_mode == SPI_GD32_XFER_DMA) {
+		int ret = spi_gd32_dma_prepare_chunk(dev);
+
+		if (ret != 0) {
+			data->transfer_active = false;
+			return ret;
+		}
+	}
+#endif
+
+	SPI_CTL0(cfg->reg) |= SPI_CTL0_SPIEN;
+	if (!slave) {
+		spi_context_cs_control(&data->ctx, true);
+	}
+
+#ifdef CONFIG_SPI_GD32_DMA
+	if (data->xfer_mode == SPI_GD32_XFER_DMA) {
+		int ret = spi_gd32_dma_start_chunk(dev);
+
+		if (ret != 0) {
+			data->transfer_active = false;
+			return ret;
+		}
+		return 0;
+	}
+#endif
+
+	/* In slave mode the first frame must be queued after SPIEN is set and
+	 * before the master starts clocking, otherwise the first response
+	 * frame is shifted out as zeros.
+	 */
+	if (slave && !spi_gd32_is_rx_only(data)) {
+		uint32_t stat = spi_gd32_stat(cfg);
+
+		while ((stat & SPI_STAT_TBE) != 0U && spi_gd32_can_write_frame(data)) {
+			spi_gd32_write_frame(dev);
+			stat = spi_gd32_stat(cfg);
+		}
+	}
+
+#ifdef CONFIG_SPI_GD32_INTERRUPT
+	if (data->xfer_mode == SPI_GD32_XFER_INTERRUPT) {
+		spi_gd32_update_interrupt_mask(cfg, data);
+	}
+#endif
+
+	return 0;
 }
 
 static int spi_gd32_cleanup_transfer(const struct device *dev, int status)
@@ -820,17 +1395,16 @@ static int spi_gd32_cleanup_transfer(const struct device *dev, int status)
 	struct spi_gd32_data *data = dev->data;
 	const struct spi_gd32_config *cfg = dev->config;
 
-	if ((status == 0) && !data->reset_needed && !spi_gd32_is_slave(data)) {
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	spi_gd32_disarm_timeout(data);
+#endif
+
+	if (status == 0 && !spi_gd32_is_slave(data)) {
 		status = spi_gd32_wait_until_idle(dev);
 	}
 
 	if (status < 0) {
-		spi_gd32_latch_fatal(data, status);
-	}
-
-	if (data->reset_needed) {
 		spi_gd32_force_recover(dev, true);
-		data->reset_needed = false;
 #ifdef CONFIG_SPI_ASYNC
 		if (!data->ctx.asynchronous) {
 			data->ctx.config = NULL;
@@ -849,6 +1423,7 @@ static int spi_gd32_cleanup_transfer(const struct device *dev, int status)
 		SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
 	}
 	spi_gd32_flush_stale_status(cfg);
+
 	return 0;
 }
 
@@ -857,20 +1432,17 @@ static int spi_gd32_cleanup_transfer_step(const struct device *dev)
 {
 	struct spi_gd32_data *data = dev->data;
 	const struct spi_gd32_config *cfg = dev->config;
-	int status = 0;
 
 	spi_gd32_stop_transfer_engine(dev);
 
 	if (!spi_gd32_is_slave(data)) {
-		status = spi_gd32_wait_until_idle(dev);
-		if (status != 0) {
-			spi_gd32_latch_fatal(data, status);
+		int ret = spi_gd32_wait_until_idle(dev);
+
+		if (ret != 0) {
 			spi_gd32_force_recover(dev, true);
-			data->reset_needed = false;
-			return status;
+			return ret;
 		}
 	}
-
 	spi_gd32_flush_stale_status(cfg);
 	return 0;
 }
@@ -880,19 +1452,12 @@ static int spi_gd32_iodev_setup_buffers(const struct device *dev)
 	struct spi_gd32_data *data = dev->data;
 	struct spi_rtio *rtio_ctx = data->rtio_ctx;
 	struct rtio_sqe *sqe = &rtio_ctx->txn_curr->sqe;
-	struct spi_buf tx_buf = { 0 };
-	struct spi_buf rx_buf = { 0 };
-	struct spi_buf_set tx_bufs = {
-		.buffers = &tx_buf,
-		.count = 1U,
-	};
-	struct spi_buf_set rx_bufs = {
-		.buffers = &rx_buf,
-		.count = 1U,
-	};
+	struct spi_buf tx_buf = {0};
+	struct spi_buf rx_buf = {0};
+	struct spi_buf_set tx_bufs = {.buffers = &tx_buf, .count = 1U};
+	struct spi_buf_set rx_bufs = {.buffers = &rx_buf, .count = 1U};
 	const struct spi_buf_set *tx_set = NULL;
 	const struct spi_buf_set *rx_set = NULL;
-	uint8_t dfs;
 	int ret;
 
 	switch (sqe->op) {
@@ -923,21 +1488,17 @@ static int spi_gd32_iodev_setup_buffers(const struct device *dev)
 		return -EINVAL;
 	}
 
-	dfs = SPI_WORD_SIZE_GET(data->ctx.config->operation) > 8U ? 2U : 1U;
-
-	ret = spi_gd32_validate_buffers(tx_set, dfs);
+	ret = spi_gd32_validate_buffers(tx_set, data->dfs);
+	if (ret == 0) {
+		ret = spi_gd32_validate_buffers(rx_set, data->dfs);
+	}
 	if (ret != 0) {
 		return ret;
 	}
 
-	ret = spi_gd32_validate_buffers(rx_set, dfs);
-	if (ret != 0) {
-		return ret;
-	}
-
-	data->xfer_mode = spi_gd32_select_xfer_mode(dev, tx_set, rx_set);
-	spi_context_buffers_setup(&data->ctx, tx_set, rx_set, dfs);
+	spi_context_buffers_setup(&data->ctx, tx_set, rx_set, data->dfs);
 	spi_gd32_prepare_transfer(dev);
+	data->xfer_mode = spi_gd32_select_xfer_mode(dev, tx_set, rx_set, data->dfs);
 
 	return 0;
 }
@@ -948,18 +1509,17 @@ static int spi_gd32_iodev_prepare_start(const struct device *dev)
 	struct spi_rtio *rtio_ctx = data->rtio_ctx;
 	struct rtio_iodev_sqe *txn_curr = rtio_ctx->txn_curr;
 	struct spi_dt_spec *spi_dt_spec;
-	int ret;
 
 	if (txn_curr == NULL) {
 		return -EINVAL;
 	}
-
 	spi_dt_spec = txn_curr->sqe.iodev->data;
 
 	if (!data->rtio_active) {
+		int ret;
+
 		spi_context_lock(&data->ctx, false, NULL, NULL, &spi_dt_spec->config);
 		data->rtio_active = true;
-
 		ret = spi_gd32_configure(dev, &spi_dt_spec->config);
 		if (ret != 0) {
 			return ret;
@@ -968,16 +1528,7 @@ static int spi_gd32_iodev_prepare_start(const struct device *dev)
 		return -EINVAL;
 	}
 
-	ret = spi_gd32_iodev_setup_buffers(dev);
-	if (ret != 0) {
-		return ret;
-	}
-
-	if (data->frames_left == 0U) {
-		return 0;
-	}
-
-	return 0;
+	return spi_gd32_iodev_setup_buffers(dev);
 }
 
 static void spi_gd32_iodev_start(const struct device *dev)
@@ -985,13 +1536,11 @@ static void spi_gd32_iodev_start(const struct device *dev)
 	struct spi_gd32_data *data = dev->data;
 	struct spi_rtio *rtio_ctx = data->rtio_ctx;
 	bool new_transaction = !data->rtio_active;
-	int ret;
+	int ret = spi_gd32_iodev_prepare_start(dev);
 
-	ret = spi_gd32_iodev_prepare_start(dev);
 	if (ret != 0) {
 		goto out_error;
 	}
-
 	if (data->frames_left == 0U) {
 		spi_gd32_iodev_complete(dev, 0);
 		return;
@@ -1002,12 +1551,15 @@ static void spi_gd32_iodev_start(const struct device *dev)
 		goto out_error;
 	}
 
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	spi_gd32_arm_timeout_on_start(dev);
+#endif
 	if (data->xfer_mode == SPI_GD32_XFER_POLLING) {
-		ret = spi_gd32_polling_transfer(dev);
-		data->transfer_active = false;
-		spi_gd32_iodev_complete(dev, ret);
-	}
+		int xret = spi_gd32_polling_transfer(dev);
 
+		data->transfer_active = false;
+		spi_gd32_iodev_complete(dev, xret);
+	}
 	return;
 
 out_error:
@@ -1035,7 +1587,7 @@ static void spi_gd32_iodev_complete(const struct device *dev, int status)
 	struct spi_gd32_data *data = dev->data;
 	struct spi_rtio *rtio_ctx = data->rtio_ctx;
 
-	if ((status == 0) && ((rtio_ctx->txn_curr->sqe.flags & RTIO_SQE_TRANSACTION) != 0U)) {
+	if (status == 0 && (rtio_ctx->txn_curr->sqe.flags & RTIO_SQE_TRANSACTION) != 0U) {
 		status = spi_gd32_cleanup_transfer_step(dev);
 		if (status == 0) {
 			rtio_ctx->txn_curr = rtio_txn_next(rtio_ctx->txn_curr);
@@ -1069,7 +1621,7 @@ static void spi_gd32_rtio_work_handler(struct k_work *work)
 {
 	struct spi_gd32_data *data = CONTAINER_OF(work, struct spi_gd32_data, rtio_work);
 
-	if (!data->rtio_active && (data->rtio_ctx->txn_curr != NULL)) {
+	if (!data->rtio_active && data->rtio_ctx->txn_curr != NULL) {
 		spi_gd32_iodev_start(data->dev);
 	}
 }
@@ -1088,659 +1640,34 @@ static void spi_gd32_complete_async(const struct device *dev, int status)
 }
 #endif
 
-#if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
-static void spi_gd32_signal_completion(const struct device *dev, int status)
-{
-	struct spi_gd32_data *data = dev->data;
-
-	if (!spi_gd32_mark_transfer_inactive(data)) {
-		return;
-	}
-
-#ifdef CONFIG_SPI_RTIO
-	if (data->rtio_active) {
-		spi_gd32_iodev_complete(dev, status);
-		return;
-	}
-#endif
-
-#ifdef CONFIG_SPI_ASYNC
-	if (data->ctx.asynchronous) {
-		spi_gd32_complete_async(dev, status);
-		return;
-	}
-#endif
-
-	spi_gd32_latch_fatal(data, status);
-	spi_gd32_stop_transfer_engine(dev);
-	spi_context_complete(&data->ctx, dev, status);
-}
-#endif
-
-static int spi_gd32_configure(const struct device *dev, const struct spi_config *config)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	bool slave = spi_gd32_is_slave_config(config);
-	bool ti_mode = (config->operation & SPI_FRAME_FORMAT_TI) != 0U;
-	uint32_t bus_freq;
-	uint32_t prescaler = 0U;
-
-	if (spi_context_configured(&data->ctx, config)) {
-		return 0;
-	}
-
-	if (slave && !IS_ENABLED(CONFIG_SPI_SLAVE)) {
-		LOG_ERR("Slave mode support is disabled");
-		return -ENOTSUP;
-	}
-
-	if ((config->operation & SPI_HALF_DUPLEX) != 0U) {
-		LOG_ERR("Half-duplex mode not supported");
-		return -ENOTSUP;
-	}
-
-	if ((config->operation & SPI_MODE_LOOP) != 0U) {
-		LOG_ERR("Loopback mode not supported");
-		return -ENOTSUP;
-	}
-
-	if (IS_ENABLED(CONFIG_SPI_EXTENDED_MODES) &&
-	    ((config->operation & SPI_LINES_MASK) != SPI_LINES_SINGLE)) {
-		LOG_ERR("Only single-line SPI is supported");
-		return -ENOTSUP;
-	}
-
-	if (SPI_WORD_SIZE_GET(config->operation) != 8U &&
-	    SPI_WORD_SIZE_GET(config->operation) != 16U) {
-		LOG_ERR("Only 8-bit and 16-bit words are supported");
-		return -ENOTSUP;
-	}
-
-	if (ti_mode && ((config->operation & SPI_TRANSFER_LSB) != 0U)) {
-		LOG_ERR("TI frame format requires MSB-first transfers");
-		return -ENOTSUP;
-	}
-
-	if (!spi_cs_is_gpio(config) && ((config->operation & SPI_CS_ACTIVE_HIGH) != 0U)) {
-		LOG_ERR("Active-high native CS not supported");
-		return -ENOTSUP;
-	}
-
-	if (slave && spi_cs_is_gpio(config)) {
-		LOG_ERR("GPIO CS is not supported in slave mode");
-		return -ENOTSUP;
-	}
-
-	if (ti_mode && spi_cs_is_gpio(config)) {
-		LOG_ERR("TI frame format requires native NSS");
-		return -ENOTSUP;
-	}
-
-	if (!slave && (config->frequency == 0U)) {
-		return -EINVAL;
-	}
-
-	if (!slave || (config->frequency != 0U)) {
-		if (clock_control_get_rate(GD32_CLOCK_CONTROLLER,
-					   (clock_control_subsys_t)&cfg->clkid, &bus_freq) != 0) {
-			LOG_ERR("Failed to get SPI clock rate");
-			return -EIO;
-		}
-
-		if (!slave) {
-			prescaler = SPI_GD32_PSC_MAX;
-		}
-
-		if (config->frequency != 0U) {
-			for (uint32_t i = 0U; i <= SPI_GD32_PSC_MAX; i++) {
-				if ((bus_freq >> (i + 1U)) <= config->frequency) {
-					prescaler = i;
-					break;
-				}
-			}
-		}
-	}
-
-	SPI_CTL0(cfg->reg) &= ~SPI_CTL0_SPIEN;
-	spi_gd32_disable_interrupts(cfg);
-	spi_gd32_disable_dma_requests(cfg);
-	spi_gd32_flush_stale_status(cfg);
-	spi_gd32_reset_peripheral(dev);
-
-	/* Match the vendor HAL spi_init() field programming after a reset. */
-	uint32_t ctl0 = SPI_CTL0(cfg->reg) & SPI_GD32_INIT_MASK;
-	uint32_t ctl1 = SPI_CTL1(cfg->reg) &
-		~(SPI_CTL1_DMATEN | SPI_CTL1_DMAREN | SPI_CTL1_NSSDRV |
-		  SPI_CTL1_TMOD | SPI_CTL1_ERRIE | SPI_CTL1_RBNEIE | SPI_CTL1_TBEIE);
-
-	ctl0 |= slave ? SPI_SLAVE : SPI_MASTER;
-	ctl0 |= SPI_TRANSMODE_FULLDUPLEX;
-	ctl0 |= (SPI_WORD_SIZE_GET(config->operation) == 16U) ?
-		SPI_FRAMESIZE_16BIT : SPI_FRAMESIZE_8BIT;
-	ctl0 |= slave ? SPI_NSS_HARD :
-		(spi_cs_is_gpio(config) ? SPI_NSS_SOFT : SPI_NSS_HARD);
-	ctl0 |= (config->operation & SPI_TRANSFER_LSB) != 0U ?
-		SPI_ENDIAN_LSB : SPI_ENDIAN_MSB;
-
-	if ((config->operation & SPI_MODE_CPOL) != 0U) {
-		ctl0 |= (config->operation & SPI_MODE_CPHA) != 0U ?
-			SPI_CK_PL_HIGH_PH_2EDGE : SPI_CK_PL_HIGH_PH_1EDGE;
-	} else {
-		ctl0 |= (config->operation & SPI_MODE_CPHA) != 0U ?
-			SPI_CK_PL_LOW_PH_2EDGE : SPI_CK_PL_LOW_PH_1EDGE;
-	}
-
-	ctl0 |= CTL0_PSC(prescaler);
-
-	SPI_CTL0(cfg->reg) = ctl0;
-	SPI_I2SCTL(cfg->reg) &= ~SPI_I2SCTL_I2SSEL;
-
-	if (ti_mode) {
-		ctl1 |= SPI_CTL1_TMOD;
-	}
-
-	if (!slave && !spi_cs_is_gpio(config)) {
-		ctl1 |= SPI_CTL1_NSSDRV;
-	}
-
-	SPI_CTL1(cfg->reg) = ctl1;
-
-	data->ctx.config = config;
-
-	return 0;
-}
-
-static int spi_gd32_polling_transfer(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	int ret;
-
-	if (spi_gd32_is_slave(data) && spi_gd32_is_rx_only(data)) {
-		while (data->frames_left != 0U) {
-			ret = spi_gd32_wait_for_status(dev, SPI_STAT_RBNE, NULL);
-			if (ret != 0) {
-				return ret;
-			}
-
-			uint32_t stat = spi_gd32_stat(cfg);
-
-			(void)spi_gd32_shift_slave(dev, &stat);
-		}
-
-		return 0;
-	}
-
-	if (spi_gd32_is_slave(data)) {
-		while ((data->rx_pending != 0U) || (data->frames_left != 0U)) {
-			uint32_t stat = spi_gd32_stat(cfg);
-			bool progressed = spi_gd32_shift_slave(dev, &stat);
-
-			if ((data->frames_left == 0U) && (data->rx_pending == 0U)) {
-				return 0;
-			}
-
-			if (progressed) {
-				continue;
-			}
-
-			ret = spi_gd32_wait_for_status(dev, SPI_STAT_TBE | SPI_STAT_RBNE, NULL);
-			if (ret != 0) {
-				return ret;
-			}
-		}
-
-		return 0;
-	}
-
-	while (data->frames_left != 0U) {
-		ret = spi_gd32_wait_for_status(dev, SPI_STAT_TBE, NULL);
-		if (ret != 0) {
-			return ret;
-		}
-
-		spi_gd32_write_frame(dev);
-
-		ret = spi_gd32_wait_for_status(dev, SPI_STAT_RBNE, NULL);
-		if (ret != 0) {
-			return ret;
-		}
-
-		spi_gd32_read_frame(dev);
-	}
-
-	return 0;
-}
-
-static enum spi_gd32_xfer_mode spi_gd32_select_xfer_mode(const struct device *dev,
-							 const struct spi_buf_set *tx_bufs,
-							 const struct spi_buf_set *rx_bufs)
-{
-#ifdef CONFIG_SPI_GD32_DMA
-	if (spi_gd32_dma_possible(dev, tx_bufs, rx_bufs)) {
-		return SPI_GD32_XFER_DMA;
-	}
-#endif
-
-#ifdef CONFIG_SPI_GD32_INTERRUPT
-	return SPI_GD32_XFER_INTERRUPT;
-#endif
-
-	return SPI_GD32_XFER_POLLING;
-}
-
-#ifdef CONFIG_SPI_GD32_DMA
-static void spi_gd32_enable_rx_dma_request(const struct spi_gd32_config *cfg)
-{
-	SPI_CTL1(cfg->reg) |= SPI_CTL1_DMAREN;
-}
-
-static void spi_gd32_enable_tx_dma_request(const struct spi_gd32_config *cfg)
-{
-	SPI_CTL1(cfg->reg) |= SPI_CTL1_DMATEN;
-}
-
-static int spi_gd32_dma_setup(const struct device *dev, enum spi_gd32_dma_direction dir,
-			      size_t chunk_len)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-	struct spi_gd32_data *data = dev->data;
-	struct dma_config *dma_cfg = &data->dma[dir].config;
-	struct dma_block_config *block_cfg = &data->dma[dir].block;
-	const struct spi_gd32_dma_config *dma = &cfg->dma[dir];
-	struct spi_context *ctx = &data->ctx;
-
-	if (chunk_len == 0U) {
-		return 0;
-	}
-
-	memset(dma_cfg, 0, sizeof(*dma_cfg));
-	memset(block_cfg, 0, sizeof(*block_cfg));
-
-	dma_cfg->source_burst_length = 1U;
-	dma_cfg->dest_burst_length = 1U;
-	dma_cfg->user_data = (void *)dev;
-	dma_cfg->dma_callback = spi_gd32_dma_callback;
-	dma_cfg->block_count = 1U;
-	dma_cfg->head_block = block_cfg;
-	dma_cfg->dma_slot = dma->slot;
-	dma_cfg->channel_priority = GD32_DMA_CONFIG_PRIORITY(dma->config);
-	dma_cfg->channel_direction = (dir == TX) ? MEMORY_TO_PERIPHERAL : PERIPHERAL_TO_MEMORY;
-	dma_cfg->source_data_size = data->dfs;
-	dma_cfg->dest_data_size = data->dfs;
-
-	block_cfg->block_size = chunk_len * data->dfs;
-	block_cfg->fifo_mode_control = dma->fifo_threshold;
-
-	if (dir == TX) {
-		block_cfg->dest_address = (uint32_t)&SPI_DATA(cfg->reg);
-		block_cfg->dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-		if (spi_context_tx_buf_on(ctx)) {
-			block_cfg->source_address = (uint32_t)ctx->tx_buf;
-			block_cfg->source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-		} else {
-			block_cfg->source_address = (uint32_t)&dummy_tx;
-			block_cfg->source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-		}
-	} else {
-		block_cfg->source_address = (uint32_t)&SPI_DATA(cfg->reg);
-		block_cfg->source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-		if (spi_context_rx_buf_on(ctx)) {
-			block_cfg->dest_address = (uint32_t)ctx->rx_buf;
-			block_cfg->dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-		} else {
-			block_cfg->dest_address = (uint32_t)&dummy_rx;
-			block_cfg->dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-		}
-	}
-
-	if (dma_config(dma->dev, dma->channel, dma_cfg) != 0) {
-		LOG_ERR("%s failed to configure %s DMA channel", dev->name,
-			(dir == TX) ? "TX" : "RX");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int spi_gd32_dma_start(const struct device *dev, enum spi_gd32_dma_direction dir)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-	const struct spi_gd32_dma_config *dma = &cfg->dma[dir];
-
-	if (dma_start(dma->dev, dma->channel) != 0) {
-		LOG_ERR("%s failed to start %s DMA channel", dev->name, (dir == TX) ? "TX" : "RX");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int spi_gd32_dma_prepare_chunk(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	size_t chunk_len = spi_context_max_continuous_chunk(&data->ctx);
-	int ret;
-
-	if (chunk_len == 0U) {
-		return -EIO;
-	}
-
-#if defined(CONFIG_CACHE_MANAGEMENT) && defined(CONFIG_DCACHE) && !defined(CONFIG_NOCACHE_MEMORY)
-	struct spi_context *ctx = &data->ctx;
-
-	if (!spi_context_tx_buf_on(ctx)) {
-		dummy_tx = 0U;
-		(void)sys_cache_data_flush_range((void *)&dummy_tx, sizeof(dummy_tx));
-	}
-
-	if (!spi_context_rx_buf_on(ctx)) {
-		(void)sys_cache_data_invd_range((void *)&dummy_rx, sizeof(dummy_rx));
-	}
-#endif
-
-	ret = spi_gd32_dma_setup(dev, RX, chunk_len);
-	if (ret != 0) {
-		return ret;
-	}
-
-	ret = spi_gd32_dma_setup(dev, TX, chunk_len);
-	if (ret != 0) {
-		return ret;
-	}
-
-	return 0;
-}
-
-static int spi_gd32_dma_start_chunk(const struct device *dev)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-	int ret;
-
-	spi_gd32_disable_dma_requests(cfg);
-
-	ret = spi_gd32_dma_start(dev, RX);
-	if (ret != 0) {
-		return ret;
-	}
-
-	ret = spi_gd32_dma_start(dev, TX);
-	if (ret != 0) {
-		(void)dma_stop(cfg->dma[RX].dev, cfg->dma[RX].channel);
-		return ret;
-	}
-
-	spi_gd32_enable_rx_dma_request(cfg);
-	spi_gd32_enable_tx_dma_request(cfg);
-
-	return 0;
-}
-
-static void spi_gd32_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
-				  int status)
-{
-	const struct device *dev = arg;
-	const struct spi_gd32_config *cfg = dev->config;
-	struct spi_gd32_data *data = dev->data;
-	size_t chunk_len;
-	uint32_t errors;
-	int ret;
-
-	if (!data->transfer_active) {
-		return;
-	}
-
-	if (status < 0) {
-		spi_gd32_note_fault(dev, status, channel, "DMA transfer failed");
-		spi_gd32_signal_completion(dev, status);
-		return;
-	}
-
-	if (status == DMA_STATUS_BLOCK) {
-		return;
-	}
-
-	errors = spi_gd32_get_errors(cfg);
-	if (errors != 0U) {
-		spi_gd32_note_fault(dev, -EIO, errors, "DMA completion saw SPI error status");
-		spi_gd32_clear_errors(cfg, errors);
-		spi_gd32_signal_completion(dev, -EIO);
-		return;
-	}
-
-	if ((dma_dev != cfg->dma[RX].dev) || (channel != cfg->dma[RX].channel)) {
-		return;
-	}
-
-	spi_gd32_disable_dma_requests(cfg);
-	chunk_len = spi_context_max_continuous_chunk(&data->ctx);
-
-	if (spi_context_tx_on(&data->ctx)) {
-		spi_context_update_tx(&data->ctx, data->dfs, chunk_len);
-	}
-
-	if (spi_context_rx_on(&data->ctx)) {
-		spi_context_update_rx(&data->ctx, data->dfs, chunk_len);
-	}
-
-	if (spi_context_max_continuous_chunk(&data->ctx) == 0U) {
-		spi_gd32_signal_completion(dev, 0);
-		return;
-	}
-
-	ret = spi_gd32_dma_prepare_chunk(dev);
-	if (ret != 0) {
-		spi_gd32_signal_completion(dev, ret);
-		return;
-	}
-
-	ret = spi_gd32_dma_start_chunk(dev);
-	if (ret != 0) {
-		spi_gd32_signal_completion(dev, ret);
-		return;
-	}
-}
-#endif
-
-#ifdef CONFIG_SPI_GD32_INTERRUPT
-static int spi_gd32_start_interrupt_transfer(const struct device *dev)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-	struct spi_gd32_data *data = dev->data;
-
-	spi_gd32_update_interrupt_mask(cfg, data);
-
-	return 0;
-}
-
-static void spi_gd32_isr(const struct device *dev)
-{
-	const struct spi_gd32_config *cfg = dev->config;
-	struct spi_gd32_data *data = dev->data;
-	uint32_t stat;
-	uint32_t errors;
-
-	if (!data->transfer_active) {
-		return;
-	}
-
-	while (true) {
-		bool progressed = false;
-
-		stat = spi_gd32_stat(cfg);
-		errors = stat & SPI_GD32_ERR_MASK;
-		if (errors != 0U) {
-			int overrun = spi_gd32_handle_slave_overrun(dev, stat);
-
-			if (overrun > 0) {
-				spi_gd32_signal_completion(dev, 0);
-				return;
-			}
-			if (overrun == 0) {
-				progressed = true;
-				spi_gd32_update_interrupt_mask(cfg, data);
-				continue;
-			}
-
-			spi_gd32_note_fault(dev, -EIO, errors, "interrupt transfer saw SPI error status");
-			spi_gd32_clear_errors(cfg, stat);
-			spi_gd32_signal_completion(dev, -EIO);
-			return;
-		}
-
-		if (spi_gd32_is_slave(data) && spi_gd32_is_rx_only(data)) {
-			progressed = spi_gd32_shift_slave(dev, &stat);
-
-			if (data->frames_left == 0U) {
-				spi_gd32_signal_completion(dev, 0);
-			}
-
-			return;
-		}
-
-		if (spi_gd32_is_slave(data) && data->transfer_tx && data->transfer_rx) {
-			progressed = spi_gd32_shift_slave(dev, &stat);
-
-			if ((data->frames_left == 0U) && (data->rx_pending == 0U)) {
-				spi_gd32_signal_completion(dev, 0);
-				return;
-			}
-
-			spi_gd32_update_interrupt_mask(cfg, data);
-
-			if (!progressed) {
-				return;
-			}
-
-			continue;
-		}
-
-		while (((stat & SPI_STAT_RBNE) != 0U) && (data->rx_pending != 0U)) {
-			spi_gd32_read_frame(dev);
-			progressed = true;
-			stat = spi_gd32_stat(cfg);
-		}
-
-		if (((stat & SPI_STAT_RBNE) != 0U) && (data->rx_pending == 0U)) {
-			spi_gd32_drop_frame(dev);
-			progressed = true;
-			stat = spi_gd32_stat(cfg);
-		}
-
-		if (((stat & SPI_STAT_TBE) != 0U) && spi_gd32_can_write_frame(data)) {
-			spi_gd32_write_frame(dev);
-			progressed = true;
-		}
-
-		if ((data->frames_left == 0U) && (data->rx_pending == 0U)) {
-			spi_gd32_signal_completion(dev, 0);
-			return;
-		}
-
-		spi_gd32_update_interrupt_mask(cfg, data);
-
-		if (!progressed) {
-			return;
-		}
-	}
-}
-#endif
-
-static int spi_gd32_start_transfer(const struct device *dev)
-{
-	struct spi_gd32_data *data = dev->data;
-	const struct spi_gd32_config *cfg = dev->config;
-	bool slave = spi_gd32_is_slave(data);
-#ifdef CONFIG_SPI_GD32_DMA
-	bool dma = data->xfer_mode == SPI_GD32_XFER_DMA;
-	int ret;
-#endif
-
-	spi_gd32_stop_transfer_engine(dev);
-	spi_gd32_flush_stale_status(cfg);
-	data->transfer_active = true;
-
-#ifdef CONFIG_SPI_GD32_DMA
-	if (dma) {
-		ret = spi_gd32_dma_prepare_chunk(dev);
-		if (ret != 0) {
-			data->transfer_active = false;
-			return ret;
-		}
-	}
-#endif
-
-	SPI_CTL0(cfg->reg) |= SPI_CTL0_SPIEN;
-
-	if (!slave) {
-		spi_context_cs_control(&data->ctx, true);
-	}
-
-#ifdef CONFIG_SPI_GD32_DMA
-	if (dma) {
-		ret = spi_gd32_dma_start_chunk(dev);
-		if (ret != 0) {
-			data->transfer_active = false;
-			return ret;
-		}
-
-		return 0;
-	}
-#endif
-
-	if (slave && !spi_gd32_is_rx_only(data)) {
-		/* In slave mode the first frame must be queued after SPIEN is set and before the
-		 * master starts clocking data.
-		 */
-		while (((spi_gd32_stat(cfg) & SPI_STAT_TBE) != 0U) &&
-		       spi_gd32_can_write_frame(data)) {
-			spi_gd32_write_frame(dev);
-		}
-	}
-
-#ifdef CONFIG_SPI_GD32_INTERRUPT
-	if (data->xfer_mode == SPI_GD32_XFER_INTERRUPT) {
-		return spi_gd32_start_interrupt_transfer(dev);
-	}
-#endif
-
-	return 0;
-}
-
 static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_config *config,
 				    const struct spi_buf_set *tx_bufs,
-				    const struct spi_buf_set *rx_bufs, spi_callback_t cb,
-				    void *userdata)
+				    const struct spi_buf_set *rx_bufs, bool asynchronous,
+				    spi_callback_t cb, void *userdata)
 {
 	struct spi_gd32_data *data = dev->data;
 	int ret;
 
-	if ((tx_bufs == NULL) && (rx_bufs == NULL)) {
+	if (tx_bufs == NULL && rx_bufs == NULL) {
 		return 0;
 	}
 
-	spi_context_lock(&data->ctx, (cb != NULL), cb, userdata, config);
+	spi_context_lock(&data->ctx, asynchronous, cb, userdata, config);
 
 	ret = spi_gd32_configure(dev, config);
 	if (ret != 0) {
 		goto out_release;
 	}
 
-	ret = spi_gd32_validate_buffers(tx_bufs,
-					SPI_WORD_SIZE_GET(config->operation) > 8U ? 2U : 1U);
+	ret = spi_gd32_validate_buffers(tx_bufs, data->dfs);
+	if (ret == 0) {
+		ret = spi_gd32_validate_buffers(rx_bufs, data->dfs);
+	}
 	if (ret != 0) {
 		goto out_release;
 	}
 
-	ret = spi_gd32_validate_buffers(rx_bufs,
-					SPI_WORD_SIZE_GET(config->operation) > 8U ? 2U : 1U);
-	if (ret != 0) {
-		goto out_release;
-	}
-
-	spi_context_buffers_setup(&data->ctx, tx_bufs, rx_bufs,
-				  SPI_WORD_SIZE_GET(config->operation) > 8U ? 2U : 1U);
+	spi_context_buffers_setup(&data->ctx, tx_bufs, rx_bufs, data->dfs);
 	spi_gd32_prepare_transfer(dev);
 
 	if (data->frames_left == 0U) {
@@ -1748,10 +1675,10 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 		goto out_release;
 	}
 
-	data->xfer_mode = spi_gd32_select_xfer_mode(dev, tx_bufs, rx_bufs);
+	data->xfer_mode = spi_gd32_select_xfer_mode(dev, tx_bufs, rx_bufs, data->dfs);
 
 #ifdef CONFIG_SPI_ASYNC
-	if (data->ctx.asynchronous && (data->xfer_mode == SPI_GD32_XFER_POLLING)) {
+	if (asynchronous && data->xfer_mode == SPI_GD32_XFER_POLLING) {
 		ret = -ENOTSUP;
 		goto out_release;
 	}
@@ -1764,16 +1691,12 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 	}
 
 	if (data->xfer_mode == SPI_GD32_XFER_POLLING) {
-		int cleanup_ret;
+		int xfer_ret = spi_gd32_polling_transfer(dev);
 
-		ret = spi_gd32_polling_transfer(dev);
 		data->transfer_active = false;
-		cleanup_ret = spi_gd32_cleanup_transfer(dev, ret);
-		if (cleanup_ret != 0) {
-			ret = cleanup_ret;
-		}
+		ret = spi_gd32_cleanup_transfer(dev, xfer_ret);
 #ifdef CONFIG_SPI_SLAVE
-		else if ((ret == 0) && spi_gd32_is_slave(data)) {
+		if (ret == 0 && spi_gd32_is_slave(data)) {
 			ret = data->ctx.recv_frames;
 		}
 #endif
@@ -1782,37 +1705,38 @@ static int spi_gd32_transceive_impl(const struct device *dev, const struct spi_c
 
 #ifdef CONFIG_SPI_ASYNC
 	if (data->ctx.asynchronous) {
+		spi_gd32_arm_timeout_on_start(dev);
 		return 0;
 	}
 #endif
 
 #if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
-	int cleanup_ret;
+	{
+		int wait_ret;
 
-	ret = spi_gd32_wait_for_completion(dev);
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+		spi_gd32_arm_timeout_on_start(dev);
+#endif
+		wait_ret = spi_gd32_wait_for_completion(dev);
 
-	if ((ret == -ETIMEDOUT) && spi_gd32_mark_transfer_inactive(data)) {
-		spi_gd32_note_fault(dev, ret, 0U, "timed out waiting for transfer completion");
-		spi_gd32_latch_fatal(data, ret);
-		spi_gd32_stop_transfer_engine(dev);
-	}
-
-	cleanup_ret = spi_gd32_cleanup_transfer(dev, ret);
-	if (cleanup_ret != 0) {
-		ret = cleanup_ret;
+		if (wait_ret == -ETIMEDOUT && spi_gd32_mark_transfer_inactive(data)) {
+			spi_gd32_note_fault(dev, wait_ret, 0U,
+					    "timeout waiting for transfer completion");
+			spi_gd32_stop_transfer_engine(dev);
+		}
+		ret = spi_gd32_cleanup_transfer(dev, wait_ret);
 	}
 #endif
 
 out_release:
 	spi_context_release(&data->ctx, ret);
-
 	return ret;
 }
 
 static int spi_gd32_transceive(const struct device *dev, const struct spi_config *config,
 			       const struct spi_buf_set *tx_bufs, const struct spi_buf_set *rx_bufs)
 {
-	return spi_gd32_transceive_impl(dev, config, tx_bufs, rx_bufs, NULL, NULL);
+	return spi_gd32_transceive_impl(dev, config, tx_bufs, rx_bufs, false, NULL, NULL);
 }
 
 #ifdef CONFIG_SPI_ASYNC
@@ -1821,35 +1745,41 @@ static int spi_gd32_transceive_async(const struct device *dev, const struct spi_
 				     const struct spi_buf_set *rx_bufs, spi_callback_t cb,
 				     void *userdata)
 {
-	return spi_gd32_transceive_impl(dev, config, tx_bufs, rx_bufs, cb, userdata);
+	return spi_gd32_transceive_impl(dev, config, tx_bufs, rx_bufs, true, cb, userdata);
 }
 #endif
 
 static int spi_gd32_release(const struct device *dev, const struct spi_config *config)
 {
 	struct spi_gd32_data *data = dev->data;
-	bool transfer_was_active = false;
+	bool was_active = false;
 
 	ARG_UNUSED(config);
 
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	data->async.completion_suppressed = true;
+	spi_gd32_disarm_timeout(data);
+#endif
+
 	if (data->transfer_active) {
 #if defined(CONFIG_SPI_GD32_INTERRUPT) || defined(CONFIG_SPI_GD32_DMA)
-		transfer_was_active = spi_gd32_mark_transfer_inactive(data);
+		was_active = spi_gd32_mark_transfer_inactive(data);
 #else
-		transfer_was_active = true;
+		was_active = true;
 		data->transfer_active = false;
 #endif
-		if (transfer_was_active) {
-			data->reset_needed = true;
-			spi_gd32_note_fault(dev, -ECANCELED, 0U, "transfer aborted by release");
+		if (was_active) {
+			spi_gd32_note_fault(dev, -ECANCELED, 0U,
+					    "transfer aborted by release");
 		}
 	}
 
-	spi_gd32_force_recover(dev, transfer_was_active || data->reset_needed);
-	data->reset_needed = false;
-	data->ctx.config = NULL;
-	spi_context_unlock_unconditionally(&data->ctx);
+	if (was_active) {
+		spi_gd32_force_recover(dev, true);
+		data->ctx.config = NULL;
+	}
 
+	spi_context_unlock_unconditionally(&data->ctx);
 	return 0;
 }
 
@@ -1869,9 +1799,6 @@ static int spi_gd32_init(const struct device *dev)
 	struct spi_gd32_data *data = dev->data;
 	const struct spi_gd32_config *cfg = dev->config;
 	int ret;
-#ifdef CONFIG_SPI_GD32_DMA
-	uint32_t ch_filter;
-#endif
 
 	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clkid);
 	if (ret != 0) {
@@ -1898,18 +1825,19 @@ static int spi_gd32_init(const struct device *dev)
 		LOG_ERR("DMA must be provided for both RX and TX");
 		return -ENODEV;
 	}
-
 	if (spi_gd32_dma_enabled(dev)) {
 		for (size_t i = 0; i < NUM_OF_DIRECTION; i++) {
+			uint32_t ch_filter;
+
 			if (!device_is_ready(cfg->dma[i].dev)) {
 				LOG_ERR("DMA controller %s not ready", cfg->dma[i].dev->name);
 				return -ENODEV;
 			}
-
 			ch_filter = BIT(cfg->dma[i].channel);
 			ret = dma_request_channel(cfg->dma[i].dev, &ch_filter);
 			if (ret < 0) {
-				LOG_ERR("Failed to request DMA channel %u", cfg->dma[i].channel);
+				LOG_ERR("Failed to request DMA channel %u",
+					cfg->dma[i].channel);
 				return ret;
 			}
 		}
@@ -1924,6 +1852,11 @@ static int spi_gd32_init(const struct device *dev)
 #ifdef CONFIG_SPI_RTIO
 	k_work_init(&data->rtio_work, spi_gd32_rtio_work_handler);
 	spi_rtio_init(data->rtio_ctx, dev);
+#endif
+
+#if defined(CONFIG_SPI_ASYNC) || defined(CONFIG_SPI_RTIO)
+	k_work_init(&data->async.completion_work, spi_gd32_completion_work_handler);
+	k_work_init_delayable(&data->async.timeout_work, spi_gd32_timeout_work_handler);
 #endif
 
 #ifdef CONFIG_SPI_GD32_INTERRUPT
@@ -1942,23 +1875,21 @@ static int spi_gd32_init(const struct device *dev)
 	{                                                                                          \
 		.dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, dir)),                         \
 		.channel = DT_INST_DMAS_CELL_BY_NAME(idx, dir, channel),                           \
-		.slot = COND_CODE_1(                                           \
-			DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),             \
-			(DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),                            \
-			 .config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),                    \
-			 .fifo_threshold = COND_CODE_1(                                 \
-			DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),             \
-			(DT_INST_DMAS_CELL_BY_NAME(idx, dir, fifo_threshold)), \
-			(0)),         \
-			 }
+		.slot = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),                     \
+				    (DT_INST_DMAS_CELL_BY_NAME(idx, dir, slot)), (0)),             \
+		.config = DT_INST_DMAS_CELL_BY_NAME(idx, dir, config),                             \
+		.fifo_threshold = COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1),           \
+					      (DT_INST_DMAS_CELL_BY_NAME(idx, dir, fifo_threshold)),\
+					      (0)),                                                \
+	}
 
 #define DMAS_DECL(idx)                                                                             \
 	{                                                                                          \
-		COND_CODE_1(DT_INST_DMAS_HAS_NAME(idx, rx),                    \
-			    (DMA_INITIALIZER(idx, rx)), ({0})),                                          \
-			 COND_CODE_1(DT_INST_DMAS_HAS_NAME(idx, tx),                    \
-			    (DMA_INITIALIZER(idx, tx)), ({0})),       \
-			 }
+		COND_CODE_1(DT_INST_DMAS_HAS_NAME(idx, rx),                                        \
+			    (DMA_INITIALIZER(idx, rx)), ({0})),                                    \
+		COND_CODE_1(DT_INST_DMAS_HAS_NAME(idx, tx),                                        \
+			    (DMA_INITIALIZER(idx, tx)), ({0})),                                    \
+	}
 
 #define GD32_IRQ_CONFIGURE(idx)                                                                    \
 	static void spi_gd32_irq_configure_##idx(const struct device *dev)                         \
@@ -1969,27 +1900,42 @@ static int spi_gd32_init(const struct device *dev)
 		irq_enable(DT_INST_IRQN(idx));                                                     \
 	}
 
+#ifdef CONFIG_SPI_GD32_DMA
+#define GD32_SPI_DMA_DUMMY_DEFINE(idx)                                                             \
+	static uint32_t spi_gd32_dummy_tx_##idx SPI_GD32_DMA_DUMMY_ATTR;                           \
+	static uint32_t spi_gd32_dummy_rx_##idx SPI_GD32_DMA_DUMMY_ATTR;
+#define GD32_SPI_DMA_CFG(idx)                                                                      \
+	.dma = DMAS_DECL(idx),                                                                     \
+	.dummy_tx = &spi_gd32_dummy_tx_##idx,                                                      \
+	.dummy_rx = &spi_gd32_dummy_rx_##idx,
+#else
+#define GD32_SPI_DMA_DUMMY_DEFINE(idx)
+#define GD32_SPI_DMA_CFG(idx)
+#endif
+
 #define GD32_SPI_INIT(idx)                                                                         \
 	PINCTRL_DT_INST_DEFINE(idx);                                                               \
-	IF_ENABLED(CONFIG_SPI_GD32_INTERRUPT, (GD32_IRQ_CONFIGURE(idx)));                           \
-	IF_ENABLED(CONFIG_SPI_RTIO,								       \
-		   (SPI_RTIO_DEFINE(spi_gd32_rtio_##idx,				       \
-				    CONFIG_SPI_GD32_RTIO_SQ_SIZE,			       \
-				    CONFIG_SPI_GD32_RTIO_CQ_SIZE);))		       \
+	IF_ENABLED(CONFIG_SPI_GD32_INTERRUPT, (GD32_IRQ_CONFIGURE(idx)))                            \
+	IF_ENABLED(CONFIG_SPI_RTIO,                                                                \
+		   (SPI_RTIO_DEFINE(spi_gd32_rtio_##idx,                                           \
+				    CONFIG_SPI_GD32_RTIO_SQ_SIZE,                                  \
+				    CONFIG_SPI_GD32_RTIO_CQ_SIZE);))                               \
+	GD32_SPI_DMA_DUMMY_DEFINE(idx)                                                             \
 	static struct spi_gd32_data spi_gd32_data_##idx = {                                        \
 		SPI_CONTEXT_INIT_LOCK(spi_gd32_data_##idx, ctx),                                   \
 		SPI_CONTEXT_INIT_SYNC(spi_gd32_data_##idx, ctx),                                   \
-		SPI_CONTEXT_CS_GPIOS_INITIALIZE(DT_DRV_INST(idx), ctx)			       \
-		IF_ENABLED(CONFIG_SPI_RTIO, (.rtio_ctx = &spi_gd32_rtio_##idx,))		       \
-	};                                                                                       \
+		SPI_CONTEXT_CS_GPIOS_INITIALIZE(DT_DRV_INST(idx), ctx)                             \
+		IF_ENABLED(CONFIG_SPI_RTIO, (.rtio_ctx = &spi_gd32_rtio_##idx,))                   \
+	};                                                                                         \
 	static const struct spi_gd32_config spi_gd32_config_##idx = {                              \
 		.reg = DT_INST_REG_ADDR(idx),                                                      \
 		.clkid = DT_INST_CLOCKS_CELL(idx, id),                                             \
 		.reset = RESET_DT_SPEC_INST_GET(idx),                                              \
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),                                       \
-		IF_ENABLED(CONFIG_SPI_GD32_DMA, (.dma = DMAS_DECL(idx),))                                                                         \
-				    IF_ENABLED(CONFIG_SPI_GD32_INTERRUPT,			       \
-			   (.irq_configure = spi_gd32_irq_configure_## idx,)) };  \
+		GD32_SPI_DMA_CFG(idx)                                                              \
+		IF_ENABLED(CONFIG_SPI_GD32_INTERRUPT,                                              \
+			   (.irq_configure = spi_gd32_irq_configure_##idx,))                       \
+	};                                                                                         \
 	SPI_DEVICE_DT_INST_DEFINE(idx, spi_gd32_init, NULL, &spi_gd32_data_##idx,                  \
 				  &spi_gd32_config_##idx, POST_KERNEL, CONFIG_SPI_INIT_PRIORITY,   \
 				  &spi_gd32_driver_api);
