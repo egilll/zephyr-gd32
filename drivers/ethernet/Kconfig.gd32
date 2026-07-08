@@ -44,6 +44,16 @@ config ETH_GD32_ACCEPT_ALL_MULTICAST
 	  When disabled, multicast addresses (IGMP/MLD) requested by the stack
 	  are programmed into the MAC hash filter table.
 
+config ETH_GD32_DEBUG_COUNTERS
+	bool "RX/TX debug counters and periodic diagnostic dump"
+	default n
+	help
+	  Track ISR/RBU/RX-overflow/rx_work/delivered/alloc-fail counters and log
+	  them once a second from a dedicated thread, together with the RX ring
+	  state (DMA-owned descriptor count, rx_tail, hardware current descriptor
+	  index, DMA receive-process state). Used to diagnose RX stalls/overflows.
+	  Do not enable in production: it adds a thread and periodic logging.
+
 config ETH_GD32_TX_OSF
 	bool "TxDMA operate on second frame (OSF)"
 	default y

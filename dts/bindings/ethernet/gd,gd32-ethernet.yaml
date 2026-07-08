@@ -29,6 +29,14 @@ properties:
     required: false
     description: PHY phandle; if omitted, link is handled externally.
 
+  ethernet-reset-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional PHY hardware reset line (active-low nRST). When present, the
+      driver asserts it, then releases it with the RMII reference clock running
+      so the PHY latches its strap configuration cleanly at init.
+
   pinctrl-0:
     required: true
 

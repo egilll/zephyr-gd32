@@ -33,6 +33,8 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/dt-bindings/clock/gd32f4xx-clocks.h>
+#include <zephyr/devicetree/gpio.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/ethernet.h>
@@ -162,6 +164,15 @@ struct eth_gd32_data {
 	atomic_t link_up;
 #if defined(CONFIG_NET_STATISTICS_ETHERNET)
 	struct net_stats_eth stats;
+#endif
+#if defined(CONFIG_ETH_GD32_DEBUG_COUNTERS)
+	atomic_t dbg_isr;
+	atomic_t dbg_rs;
+	atomic_t dbg_rbu;
+	atomic_t dbg_ro;
+	atomic_t dbg_rxwork;
+	atomic_t dbg_delivered;
+	atomic_t dbg_alloc_fail;
 #endif
 	uint8_t mcast_hash_refcnt[64];
 	uint16_t rx_tail;
@@ -535,6 +546,9 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 							   K_NO_WAIT);
 			if (!pkt) {
 				rx_ok = false;
+#if defined(CONFIG_ETH_GD32_DEBUG_COUNTERS)
+				atomic_inc(&data->dbg_alloc_fail);
+#endif
 			}
 		}
 
@@ -584,6 +598,11 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 			eth_stats_update_errors_rx(data->iface);
 			net_pkt_unref(pkt);
 		}
+#if defined(CONFIG_ETH_GD32_DEBUG_COUNTERS)
+		else {
+			atomic_inc(&data->dbg_delivered);
+		}
+#endif
 	}
 
 	if (rbu_seen) {
@@ -594,6 +613,10 @@ static void eth_gd32_rx(const struct device *dev, bool rbu_seen)
 static void eth_gd32_rx_work_handler(struct k_work *work)
 {
 	struct eth_gd32_data *data = CONTAINER_OF(work, struct eth_gd32_data, rx_work);
+
+#if defined(CONFIG_ETH_GD32_DEBUG_COUNTERS)
+	atomic_inc(&data->dbg_rxwork);
+#endif
 
 	for (;;) {
 		atomic_val_t flags = atomic_clear(&data->rx_work_flags);
@@ -641,6 +664,19 @@ static void eth_gd32_isr(const struct device *dev)
 	struct eth_gd32_data *data = dev->data;
 	uint32_t stat = ENET_DMA_STAT;
 	uint32_t clear = 0U;
+
+#if defined(CONFIG_ETH_GD32_DEBUG_COUNTERS)
+	atomic_inc(&data->dbg_isr);
+	if (stat & ENET_DMA_STAT_RS) {
+		atomic_inc(&data->dbg_rs);
+	}
+	if (stat & ENET_DMA_STAT_RBU) {
+		atomic_inc(&data->dbg_rbu);
+	}
+	if (stat & ENET_DMA_STAT_RO) {
+		atomic_inc(&data->dbg_ro);
+	}
+#endif
 
 	clear |= stat &
 		 (ENET_DMA_STAT_TS | ENET_DMA_STAT_TBU | ENET_DMA_STAT_TJT | ENET_DMA_STAT_TU);
@@ -1328,6 +1364,63 @@ static int eth_gd32_hw_init(const struct device *dev)
 	(void)atomic_clear(&data->recovering);
 	(void)atomic_clear(&data->link_up);
 
+	/*
+	 * Order matters: the RMII/MII interface selection and the RMII reference
+	 * clock must both be in place BEFORE the ENET MAC clocks are enabled. The
+	 * MAC latches the SYSCFG PHY-interface selection as it comes out of reset;
+	 * selecting RMII after the MAC clock is already running leaves the datapath
+	 * in MII mode even though SYSCFG_CFG1 reads back RMII, which corrupts every
+	 * received frame (100% CRC/alignment errors) while TX still appears to work.
+	 */
+	ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
+	if (ret < 0) {
+		return ret;
+	}
+
+	uint16_t clk_syscfg = GD32_CLOCK_SYSCFG;
+	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_syscfg);
+
+	if (cfg->phy_mode == 0) {
+		syscfg_enet_phy_interface_config(SYSCFG_ENET_PHY_RMII);
+	} else {
+		syscfg_enet_phy_interface_config(SYSCFG_ENET_PHY_MII);
+	}
+
+#if DT_INST_PROP(0, gd_phy_clk_out)
+	{
+		uint16_t clk_gpioa = GD32_CLOCK_GPIOA;
+		(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_gpioa);
+		gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_8);
+		gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, GPIO_PIN_8);
+		gpio_af_set(GPIOA, GPIO_AF_0, GPIO_PIN_8);
+		rcu_ckout0_config(RCU_CKOUT0SRC_PLLP, RCU_CKOUT0_DIV4);
+	}
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, ethernet_reset_gpios)
+	{
+		/*
+		 * Give the PHY a clean hardware reset with the RMII reference clock
+		 * already running, so it latches its strap configuration correctly. The
+		 * gdzone wires PHY nRST to GPIOG; the pin/polarity come from devicetree.
+		 */
+		uint16_t clk_gpiog = GD32_CLOCK_GPIOG;
+		uint32_t rst_pin = BIT(DT_INST_GPIO_PIN(0, ethernet_reset_gpios));
+		bool active_low =
+			(DT_INST_GPIO_FLAGS(0, ethernet_reset_gpios) & GPIO_ACTIVE_LOW) != 0U;
+
+		(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_gpiog);
+		gpio_mode_set(GPIOG, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, rst_pin);
+		gpio_output_options_set(GPIOG, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, rst_pin);
+
+		gpio_bit_write(GPIOG, rst_pin, active_low ? RESET : SET);
+		k_msleep(10);
+		gpio_bit_write(GPIOG, rst_pin, active_low ? SET : RESET);
+		k_msleep(50);
+	}
+#endif
+
+	/* Bring up the MAC/TX/RX clocks now; this latches the RMII selection. */
 	ret = clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clk_mac);
 	ret |= clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clk_tx);
 	ret |= clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&cfg->clk_rx);
@@ -1359,31 +1452,6 @@ static int eth_gd32_hw_init(const struct device *dev)
 	if (cfg->rst3.dev) {
 		(void)reset_line_toggle_dt(&cfg->rst3);
 	}
-#endif
-
-	ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
-	if (ret < 0) {
-		return ret;
-	}
-
-	uint16_t clk_syscfg = GD32_CLOCK_SYSCFG;
-	(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_syscfg);
-
-	if (cfg->phy_mode == 0) {
-		syscfg_enet_phy_interface_config(SYSCFG_ENET_PHY_RMII);
-	} else {
-		syscfg_enet_phy_interface_config(SYSCFG_ENET_PHY_MII);
-	}
-
-#if DT_INST_PROP(0, gd_phy_clk_out)
-		{
-			uint16_t clk_gpioa = GD32_CLOCK_GPIOA;
-			(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_gpioa);
-			gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_8);
-			gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, GPIO_PIN_8);
-			gpio_af_set(GPIOA, GPIO_AF_0, GPIO_PIN_8);
-			rcu_ckout0_config(RCU_CKOUT0SRC_PLLP, RCU_CKOUT0_DIV4);
-		}
 #endif
 
 	if (cfg->config_func) {
@@ -1455,6 +1523,45 @@ static const struct eth_gd32_config eth0_config = {
 };
 
 static struct eth_gd32_data eth0_data;
+
+#if defined(CONFIG_ETH_GD32_DEBUG_COUNTERS)
+static void eth_gd32_dbg_thread(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+	struct eth_gd32_data *data = &eth0_data;
+
+	for (;;) {
+		k_sleep(K_MSEC(1000));
+
+		uint16_t dma_owned = 0U;
+
+		for (uint16_t i = 0U; i < GD32_ETH_RX_DESC_COUNT; i++) {
+			if (rx_desc_dma_owned(&eth0_dma.rx_desc[i])) {
+				dma_owned++;
+			}
+		}
+
+		uint32_t stat = ENET_DMA_STAT;
+		uint32_t rps = (stat >> 17) & 0x7U;
+		uint32_t base = (uint32_t)(uintptr_t)eth0_dma.rx_desc;
+		int hw_idx = (int)(((uint32_t)ENET_DMA_CRDADDR - base) /
+				   sizeof(enet_descriptors_struct));
+
+		LOG_INF("rx: isr=%ld rs=%ld rbu=%ld ro=%ld work=%ld deliv=%ld allocfail=%ld | "
+			"dma_owned=%u/%u rx_tail=%u hw_idx=%d rps=%u stat=0x%08x link=%ld recov=%ld",
+			atomic_get(&data->dbg_isr), atomic_get(&data->dbg_rs),
+			atomic_get(&data->dbg_rbu), atomic_get(&data->dbg_ro),
+			atomic_get(&data->dbg_rxwork), atomic_get(&data->dbg_delivered),
+			atomic_get(&data->dbg_alloc_fail), dma_owned,
+			(unsigned int)GD32_ETH_RX_DESC_COUNT, data->rx_tail, hw_idx, rps, stat,
+			atomic_get(&data->link_up), atomic_get(&data->recovering));
+	}
+}
+
+K_THREAD_DEFINE(eth_gd32_dbg, 1024, eth_gd32_dbg_thread, NULL, NULL, NULL, 7, 0, 0);
+#endif /* CONFIG_ETH_GD32_DEBUG_COUNTERS */
 
 ETH_NET_DEVICE_DT_INST_DEFINE(0, eth_gd32_init, NULL, &eth0_data, &eth0_config,
 			      CONFIG_ETH_INIT_PRIORITY, &eth_api, NET_ETH_MTU);
