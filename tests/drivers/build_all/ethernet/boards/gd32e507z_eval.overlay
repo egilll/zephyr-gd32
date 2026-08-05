@@ -1,0 +1,22 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&timer0 {
+	status = "disabled";
+};
+
+&rcu {
+	gd,ckout0-source = "pll2";
+	gd,ckout0-pll2-multiplier = <10>;
+};
+
+&enet {
+	status = "okay";
+	pinctrl-0 = <&enet_ckout_default>;
+};
+
+&mdio {
+	status = "okay";
+};

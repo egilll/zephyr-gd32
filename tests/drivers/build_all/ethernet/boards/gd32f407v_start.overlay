@@ -1,0 +1,40 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&pinctrl {
+	enet_build_default: enet_build_default {
+		group1 {
+			pinmux = <ENET_RMII_REF_CLK_PA1>, <ENET_RMII_CRS_DV_PA7>,
+				 <ENET_RMII_RXD0_PC4>, <ENET_RMII_RXD1_PC5>,
+				 <ENET_RMII_TX_EN_PB11>, <ENET_RMII_TXD0_PB12>,
+				 <ENET_RMII_TXD1_PB13>;
+		};
+	};
+
+	mdio_build_default: mdio_build_default {
+		group1 {
+			pinmux = <ENET_MDIO_PA2>, <ENET_MDC_PC1>;
+		};
+	};
+};
+
+&enet {
+	status = "okay";
+	pinctrl-0 = <&enet_build_default>;
+	pinctrl-names = "default";
+	phy-connection-type = "rmii";
+	phy-handle = <&build_phy>;
+};
+
+&mdio {
+	status = "okay";
+	pinctrl-0 = <&mdio_build_default>;
+	pinctrl-names = "default";
+
+	build_phy: ethernet-phy@0 {
+		compatible = "ethernet-phy";
+		reg = <0>;
+	};
+};

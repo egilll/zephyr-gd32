@@ -37,3 +37,10 @@ tests:
       - stm32h573i_dk
       - esp32_ethernet_kit/esp32/procpu
       - esp32p4x_function_ev_board/esp32p4/hpcore
+      - gd32f407v_start
+      - gd32f450i_eval
+      - gd32f450v_start
+      - gd32f450z_eval
+      - gd32f470i_eval
+      - gd32e507v_start
+      - gd32e507z_eval
