@@ -20,4 +20,5 @@ supported:
   - uart
   - watchdog
   - dma
+  - netif:eth
 vendor: gd
