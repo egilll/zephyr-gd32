@@ -36,6 +36,21 @@ config ETH_ESP32_DWC_ETHER_1000
 	help
 	  This enables the Synopsys DesignWare MAC driver for ESP32 SoCs.
 
+config ETH_GD32_DWC_ETHER_1000
+	bool "Driver for DWC Ethernet MAC-based GD32"
+	depends on DT_HAS_GD_GD32_ETHERNET_ENABLED
+	select ETH_DWC_ETHER_1000_CORE
+	select NOCACHE_MEMORY if ARCH_HAS_NOCACHE_MEMORY_SUPPORT
+	select PINCTRL
+	select HWINFO
+	select CRC
+	select RESET
+	select SYSCON
+	select SYSCON_GENERIC
+	default y
+	help
+	  This enables the Synopsys DesignWare MAC driver for GD32 SoCs.
+
 config ETH_STM32_DWC_ETHER_QOS
 	bool "Driver for DWC Ethernet QoS-based STM32"
 	depends on !ETH_STM32_HAL
@@ -140,12 +155,15 @@ config ETH_DWC_ETHER_TX_HW_CHECKSUM
 	bool "Use TX hardware checksum"
 	select NET_CHECKSUM_OFFLOAD_SUPPORTED if NET_L2_ETHERNET
 	depends on !SOC_SERIES_ESP32P4
-	default y
+	default y if !ETH_GD32_DWC_ETHER_1000
 	help
 	  Enable transmit checksum offload to enhance throughput
 	  performances. Only supported when store and forward mode
 	  is used for tx, which can't be used if the tx fifo is smaller
 	  than the maximum frame size.
+
+	  Off by default on GD32, where the offload has not been validated
+	  against hardware.
 
 config ETH_DWC_ETHER_TX_HW_CHECKSUM_EN
 	bool
@@ -156,10 +174,13 @@ config ETH_DWC_ETHER_TX_HW_CHECKSUM_EN
 config ETH_DWC_ETHER_RX_HW_CHECKSUM
 	bool "Use RX hardware checksum"
 	select NET_CHECKSUM_OFFLOAD_SUPPORTED if NET_L2_ETHERNET
-	default y
+	default y if !ETH_GD32_DWC_ETHER_1000
 	help
 	  Enable receive checksum offload to enhance throughput
 	  performances.
+
+	  Off by default on GD32, where the offload has not been validated
+	  against hardware.
 
 config ETH_DWC_ETHER_RX_HW_CHECKSUM_EN
 	bool
