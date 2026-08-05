@@ -5,6 +5,7 @@
  */
 
 #include <gd/gd32f4xx/gd32f4xx.dtsi>
+#include <gd/gd32f4xx/gd32f4xx-enet.dtsi>
 
 &cpu0 {
 	clock-frequency = <168000000>;

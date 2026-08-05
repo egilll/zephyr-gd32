@@ -203,7 +203,7 @@
 		};
 
 		afio: afio@40010000 {
-			compatible = "gd,gd32-afio";
+			compatible = "gd,gd32-afio", "syscon";
 			reg = <0x40010000 0x400>;
 			clocks = <&cctl GD32_CLOCK_AFIO>;
 			status = "okay";

@@ -1,0 +1,36 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	soc {
+		enet: ethernet@40028000 {
+			compatible = "gd,gd32-ethernet", "snps,dwmac";
+			reg = <0x40028000 0x2000>;
+			interrupts = <61 0>;
+			clocks = <&cctl GD32_CLOCK_ENET>,
+				 <&cctl GD32_CLOCK_ENETTX>,
+				 <&cctl GD32_CLOCK_ENETRX>,
+				 <&cctl GD32_CLOCK_ENETPTP>;
+			clock-names = "mac", "tx", "rx", "ptp";
+			resets = <&rctl GD32_RESET_ENET>;
+			snps,rx-chain-mode;
+			gd,phy-mode-selector = <&syscfg>;
+			gd,phy-mode-offset = <0x04>;
+			gd,phy-mode-mask = <0x00800000>;
+			status = "disabled";
+
+			mdio: mdio {
+				compatible = "snps,dwmac-mdio";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "disabled";
+			};
+
+			ptp_clock: ptp-clock {
+				compatible = "snps,dwmac-ptp-clock";
+			};
+		};
+	};
+};

@@ -300,7 +300,7 @@
 		};
 
 		syscfg: syscfg@40013800 {
-			compatible = "gd,gd32-syscfg";
+			compatible = "gd,gd32-syscfg", "syscon";
 			reg = <0x40013800 0x400>;
 			clocks = <&cctl GD32_CLOCK_SYSCFG>;
 		};

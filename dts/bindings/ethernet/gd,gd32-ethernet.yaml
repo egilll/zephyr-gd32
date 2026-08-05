@@ -1,0 +1,71 @@
+# Copyright (c) 2026, Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+title: GigaDevice GD32 Ethernet MAC
+
+description: |
+  Synopsys DesignWare Ethernet MAC 10/100/1G Universal integrated in
+  GigaDevice GD32 SoCs. GD32 integrations support 10 and 100 Mbit/s MII
+  and RMII interfaces.
+
+compatible: "gd,gd32-ethernet"
+
+include:
+  - name: snps,dwmac.yaml
+  - name: pinctrl-device.yaml
+  - name: reset-device.yaml
+
+properties:
+  reg:
+    required: true
+
+  clocks:
+    required: true
+
+  clock-names:
+    required: true
+
+  interrupts:
+    required: true
+
+  resets:
+    required: true
+
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true
+
+  phy-connection-type:
+    required: true
+
+  phy-handle:
+    required: true
+
+  gd,phy-mode-selector:
+    type: phandle
+    required: true
+    description: |
+      Syscon holding the MII/RMII selection register. Its clocks property
+      supplies the clock that must run before the register is written.
+
+  gd,phy-mode-offset:
+    type: int
+    required: true
+    description: |
+      Offset of the MII/RMII selection register within the selector
+      peripheral.
+
+  gd,phy-mode-mask:
+    type: int
+    required: true
+    description: |
+      Mask of the MII/RMII selection bit. A set bit selects RMII and a
+      cleared bit selects MII.
+
+  snps,clk-csr:
+    description: |
+      Use this property on integrations whose MDC divider table differs from
+      the standard DWMAC v3 table. In particular, GD32H7 CSR index 6 divides
+      the clock by 142 rather than 204.

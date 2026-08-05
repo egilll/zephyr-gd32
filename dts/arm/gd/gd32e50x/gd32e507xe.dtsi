@@ -6,6 +6,7 @@
 
 #include <mem.h>
 #include <arm/gd/gd32e50x/gd32e50x.dtsi>
+#include <arm/gd/gd32e50x/gd32e50x-enet.dtsi>
 
 / {
 	soc {
