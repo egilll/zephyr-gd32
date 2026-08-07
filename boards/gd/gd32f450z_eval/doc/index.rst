@@ -49,6 +49,14 @@ Serial Port
 The GD32F450Z-EVAL board has one serial communication port. The default port
 is USART0 with TX connected at PA9 and RX at PA10.
 
+Ethernet
+========
+
+The on-board DP83848 PHY is connected to the GD32F450 MAC using RMII and MDIO
+address 1. Ethernet is enabled by default. Applications can provide a MAC
+address through devicetree or NVMEM; otherwise the driver derives a stable,
+locally administered address from the device identifier.
+
 Programming and Debugging
 *************************
 

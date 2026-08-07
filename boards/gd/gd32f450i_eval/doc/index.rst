@@ -51,6 +51,23 @@ Serial Port
 The GD32F450I-EVAL board has one serial communication port. The default port
 is USART0 with TX connected at PA9 and RX at PA10.
 
+Ethernet
+========
+
+The board devicetree describes the RMII PHY at MDIO address 1, but leaves the
+interface disabled because RMII uses PG11, PG13 and PG14, which are also used
+by the enabled SPI5 flash. An application overlay can select Ethernet instead:
+
+.. code-block:: devicetree
+
+   &spi5 { status = "disabled"; };
+   &rcu {
+           gd,ckout0-source = "pllp";
+           gd,ckout0-divider = <4>;
+   };
+   &enet { status = "okay"; };
+   &mdio { status = "okay"; };
+
 Programming and Debugging
 *************************
 

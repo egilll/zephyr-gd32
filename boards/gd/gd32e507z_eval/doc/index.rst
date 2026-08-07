@@ -49,6 +49,27 @@ The GD32E507Z-EVAL board has one serial communication port. The default port
 is USART0 with TX connected at PA9 and RX at PA10. USART0 is exposed as a
 virtual COM port via the J1 USB connector.
 
+Ethernet
+========
+
+The board devicetree describes the RMII PHY at MDIO address 1. Ethernet is
+disabled by default because the vendor configuration uses PA8 to supply the
+PHY reference clock while Zephyr uses PA8 for the board's PWM example. An
+application can instead select Ethernet and the PLL2 clock output:
+
+.. code-block:: devicetree
+
+   &timer0 { status = "disabled"; };
+   &rcu {
+           gd,ckout0-source = "pll2";
+           gd,ckout0-pll2-multiplier = <10>;
+   };
+   &enet {
+           status = "okay";
+           pinctrl-0 = <&enet_ckout_default>;
+   };
+   &mdio { status = "okay"; };
+
 Programming and Debugging
 *************************
 
