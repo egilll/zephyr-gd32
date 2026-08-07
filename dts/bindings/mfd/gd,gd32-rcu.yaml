@@ -42,3 +42,29 @@ properties:
       set to "pll48m". This does not configure PLL/PLLSAI parameters; board
       clock configuration must ensure the selected source provides a valid
       48MHz clock domain.
+
+  gd,ckout0-source:
+    type: string
+    enum:
+      - "pllp"
+      - "pll2"
+    description: |
+      Select the CK_OUT0 clock source. "pllp" is available on GD32F4xx and
+      "pll2" is available on GD32E50x. The CK_OUT0 pin must also be present in
+      the board pin control state.
+
+  gd,ckout0-divider:
+    type: int
+    enum: [1, 2, 3, 4, 5]
+    default: 1
+    description: |
+      Divide the selected CK_OUT0 source. This property is used by GD32F4xx;
+      GD32E50x does not provide a CK_OUT0 divider.
+
+  gd,ckout0-pll2-multiplier:
+    type: int
+    enum: [10]
+    description: |
+      Configure and enable the GD32E50x PLL2 source before routing it to
+      CK_OUT0. The supported value produces the 50 MHz reference clock used
+      by GD32E507 evaluation-board Ethernet PHYs.

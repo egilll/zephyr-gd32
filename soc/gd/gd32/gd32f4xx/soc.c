@@ -64,8 +64,41 @@ static void gd32f4xx_ck48m_init(void)
 	}
 }
 
+static void gd32f4xx_ckout0_init(void)
+{
+#if DT_NODE_HAS_PROP(DT_NODELABEL(rcu), gd_ckout0_source)
+	uint32_t divider;
+
+	BUILD_ASSERT(DT_ENUM_IDX(DT_NODELABEL(rcu), gd_ckout0_source) == 0,
+		     "GD32F4xx CK_OUT0 supports the pllp devicetree source");
+
+	switch (DT_PROP(DT_NODELABEL(rcu), gd_ckout0_divider)) {
+	case 1:
+		divider = RCU_CKOUT0_DIV1;
+		break;
+	case 2:
+		divider = RCU_CKOUT0_DIV2;
+		break;
+	case 3:
+		divider = RCU_CKOUT0_DIV3;
+		break;
+	case 4:
+		divider = RCU_CKOUT0_DIV4;
+		break;
+	case 5:
+		divider = RCU_CKOUT0_DIV5;
+		break;
+	default:
+		CODE_UNREACHABLE;
+	}
+
+	rcu_ckout0_config(RCU_CKOUT0SRC_PLLP, divider);
+#endif
+}
+
 void soc_early_init_hook(void)
 {
 	SystemInit();
 	gd32f4xx_ck48m_init();
+	gd32f4xx_ckout0_init();
 }
