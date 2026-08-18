@@ -47,7 +47,11 @@ static uint16_t dns_dispatcher_addr_port(const struct net_sockaddr_storage *addr
 	return 0;
 }
 
+/* Both dispatcher->lock and, when pair is not NULL, pair->lock are held
+ * by the caller.
+ */
 static int dns_dispatch(struct dns_socket_dispatcher *dispatcher,
+			struct dns_socket_dispatcher *pair,
 			int sock, struct net_sockaddr *addr, size_t addrlen,
 			struct net_buf *dns_data, size_t buf_len)
 {
@@ -84,10 +88,8 @@ static int dns_dispatch(struct dns_socket_dispatcher *dispatcher,
 			ret = dispatcher->cb(dispatcher, sock,
 					     addr, addrlen,
 					     dns_data, data_len);
-		} else if (dispatcher->pair) {
-			ret = dispatcher->pair->cb(dispatcher->pair, sock,
-						   addr, addrlen,
-						   dns_data, data_len);
+		} else if (pair != NULL) {
+			ret = pair->cb(pair, sock, addr, addrlen, dns_data, data_len);
 		} else {
 			/* Discard the message as it was a query and there are none
 			 * expecting a query.
@@ -103,10 +105,8 @@ static int dns_dispatch(struct dns_socket_dispatcher *dispatcher,
 			ret = dispatcher->cb(dispatcher, sock,
 					     addr, addrlen,
 					     dns_data, data_len);
-		} else if (dispatcher->pair) {
-			ret = dispatcher->pair->cb(dispatcher->pair, sock,
-						   addr, addrlen,
-						   dns_data, data_len);
+		} else if (pair != NULL) {
+			ret = pair->cb(pair, sock, addr, addrlen, dns_data, data_len);
 		} else {
 			/* Discard the message as it was not a query reply and
 			 * we were a reply.
@@ -141,6 +141,7 @@ static int recv_data(struct net_socket_service_event *pev)
 {
 	struct socket_dispatch_table *table = pev->user_data;
 	struct dns_socket_dispatcher *dispatcher;
+	struct dns_socket_dispatcher *pair;
 	net_socklen_t optlen = sizeof(int);
 	struct net_buf *dns_data = NULL;
 	struct net_sockaddr_storage addr = {0};
@@ -148,11 +149,13 @@ static int recv_data(struct net_socket_service_event *pev)
 	int family, sock_error;
 	int ret = 0, len;
 
-	/* Look up the dispatcher and take its lock while holding the global
-	 * lock. This keeps the lookup atomic with respect to
-	 * dns_dispatcher_unregister(): once it has cleared the slot, no new
-	 * dispatch can start on this context, so its wait on ctx->lock is
-	 * guaranteed to outlast any dispatch that got the context here.
+	/* Look up the dispatcher and its pair and take their locks while
+	 * holding the global lock. This keeps the lookup atomic with respect
+	 * to dns_dispatcher_unregister(), which clears the slot and the pair
+	 * pointer under that lock: once cleared, no new dispatch can start on
+	 * either context, and one that did already holds the context's lock,
+	 * which the wait in unregister outlasts. The order is the global
+	 * lock, then the dispatching context, then its pair.
 	 */
 	k_mutex_lock(&lock, K_FOREVER);
 
@@ -166,7 +169,11 @@ static int recv_data(struct net_socket_service_event *pev)
 		return 0;
 	}
 
+	pair = dispatcher->pair;
 	k_mutex_lock(&dispatcher->lock, K_FOREVER);
+	if (pair != NULL) {
+		k_mutex_lock(&pair->lock, K_FOREVER);
+	}
 	k_mutex_unlock(&lock);
 
 	(void)zsock_getsockopt(pev->event.fd, ZSOCK_SOL_SOCKET,
@@ -214,7 +221,7 @@ static int recv_data(struct net_socket_service_event *pev)
 
 	len = ret;
 
-	ret = dns_dispatch(dispatcher, pev->event.fd,
+	ret = dns_dispatch(dispatcher, pair, pev->event.fd,
 			   net_sad(&addr), addrlen,
 			   dns_data, len);
 free_buf:
@@ -223,6 +230,9 @@ free_buf:
 	}
 
 unlock:
+	if (pair != NULL) {
+		k_mutex_unlock(&pair->lock);
+	}
 	k_mutex_unlock(&dispatcher->lock);
 
 	return ret;
@@ -420,7 +430,9 @@ int dns_dispatcher_unregister(struct dns_socket_dispatcher *ctx)
 	/* Drop any pairing that referenced this dispatcher so that a
 	 * surviving dispatcher does not delegate to an unregistered context.
 	 * Also clear our own pair so a later re-register does not inherit a
-	 * stale partner.
+	 * stale partner. A dispatch that read the pointer before this runs
+	 * this context's callback under this context's lock, which the
+	 * barrier below waits for.
 	 */
 	SYS_SLIST_FOR_EACH_CONTAINER(&sockets, entry, node) {
 		if (entry->pair == ctx) {
@@ -448,8 +460,12 @@ out:
 	 * recv_data() looks the context up and takes ctx->lock under the
 	 * global lock, so now that dispatch_table[sock] is cleared, no new
 	 * dispatch can pick this ctx up, and any dispatch that already did
-	 * holds ctx->lock. Wait for it here so the caller can safely
-	 * reuse/reinit ctx once we return.
+	 * holds ctx->lock, as does a dispatch delegated here through a pair
+	 * pointer. Wait for it here so the caller can safely reuse/reinit
+	 * ctx once we return. This runs with the global lock released: the
+	 * dispatch may re-enter the dispatcher before it returns (an
+	 * application result callback closing the resolver, or a CNAME
+	 * re-query re-randomizing its source port) and then needs that lock.
 	 */
 	k_mutex_lock(&ctx->lock, K_FOREVER);
 	k_mutex_unlock(&ctx->lock);
