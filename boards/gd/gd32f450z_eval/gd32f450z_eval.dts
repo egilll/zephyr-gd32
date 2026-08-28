@@ -98,6 +98,10 @@
 	status = "okay";
 };
 
+&gpiof {
+	status = "okay";
+};
+
 &gpiog {
 	status = "okay";
 };
@@ -106,6 +110,12 @@
 	status = "okay";
 	current-speed = <115200>;
 	pinctrl-0 = <&usart0_default>;
+	pinctrl-names = "default";
+};
+
+&adc2 {
+	status = "okay";
+	pinctrl-0 = <&adc2_default>;
 	pinctrl-names = "default";
 };
 
