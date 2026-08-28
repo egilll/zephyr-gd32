@@ -111,9 +111,15 @@ static int mcux_sim_get_subsys_rate(const struct device *dev,
 	#define NXP_KINETIS_SIM_CLKOUT_DIVIDER \
 		DT_PROP(NXP_KINETIS_SIM_NODE, clkout_divider)
 #endif
+#if DT_NODE_HAS_PROP(NXP_KINETIS_SIM_NODE, sdhc_source)
+	#define NXP_KINETIS_SIM_SDHC_SOURCE DT_PROP(NXP_KINETIS_SIM_NODE, sdhc_source)
+#endif
 
 static int mcux_sim_init(const struct device *dev)
 {
+#ifdef NXP_KINETIS_SIM_SDHC_SOURCE
+	CLOCK_SetSdhc0Clock(NXP_KINETIS_SIM_SDHC_SOURCE);
+#endif
 #ifdef NXP_KINETIS_SIM_CLKOUT_DIVIDER
 	SIM->CHIPCTL = (SIM->CHIPCTL & ~SIM_CHIPCTL_CLKOUTDIV_MASK)
 		| SIM_CHIPCTL_CLKOUTDIV(NXP_KINETIS_SIM_CLKOUT_DIVIDER);
