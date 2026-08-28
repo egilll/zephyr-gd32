@@ -9,6 +9,44 @@
 #include <zephyr/dt-bindings/usb/audio.h>
 
 / {
+	uac1_headphones: usb_audio1 {
+		compatible = "zephyr,uac1";
+		status = "okay";
+		full-speed;
+
+		uac1_input_terminal: input_terminal {
+			compatible = "zephyr,uac1-input-terminal";
+			terminal-type = <USB_TERMINAL_STREAMING>;
+			channels = <2>;
+			channel-config = <0x0003>;
+		};
+
+		uac1_feature_unit: feature_unit {
+			compatible = "zephyr,uac1-feature-unit";
+			data-source = <&uac1_input_terminal>;
+			controls = <0x0003>;
+			channel-controls = <0x0002 0x0001>;
+			volume-min = <(-90 * 256)>;
+			volume-max = <0>;
+			volume-res = <(1 * 256)>;
+		};
+
+		uac1_output_terminal: output_terminal {
+			compatible = "zephyr,uac1-output-terminal";
+			terminal-type = <OUTPUT_TERMINAL_HEADPHONES>;
+			data-source = <&uac1_feature_unit>;
+		};
+
+		uac1_out_interface: out_interface {
+			compatible = "zephyr,uac1-audio-streaming";
+			linked-terminal = <&uac1_input_terminal>;
+			sync-type = "adaptive";
+			sampling-frequencies = <48000>;
+			subslot-size = <2>;
+			bit-resolution = <16>;
+		};
+	};
+
 	uac2_headphones: usb_audio2 {
 		compatible = "zephyr,uac2";
 		status = "okay";
