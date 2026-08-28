@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config ETH_GD32_DWC_ETHER_1000
+	bool "GD32 Ethernet MAC driver"
+	depends on DT_HAS_GD_GD32_ETHERNET_ENABLED
+	depends on SOC_SERIES_GD32F4XX
+	select ETH_DWC_ETHER_1000_CORE
+	select PINCTRL
+	select HWINFO
+	select CRC
+	select RESET
+	default y
+	help
+	  Use Zephyr's native Synopsys DesignWare Ethernet MAC 10/100/1G
+	  Universal v3.x core with GD32-specific clock, reset, pinctrl and
+	  RMII/MII platform integration.
