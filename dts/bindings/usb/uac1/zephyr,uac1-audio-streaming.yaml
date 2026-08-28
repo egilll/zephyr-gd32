@@ -1,0 +1,76 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Audio Class 1 Audio Streaming interface
+
+compatible: "zephyr,uac1-audio-streaming"
+
+properties:
+  linked-terminal:
+    type: phandle
+    required: true
+    description: |
+      Input or Output Terminal to which this interface is connected.
+
+  external-interface:
+    type: boolean
+    description: |
+      Enable if audio stream is not transmitted over USB (external interface).
+
+  implicit-feedback:
+    type: boolean
+    description: |
+      Enable implicit feedback on an IN audio data endpoint. For OUT endpoints
+      this removes the explicit feedback endpoint requirement.
+
+  sync-type:
+    type: string
+    required: true
+    description: |
+      Synchronization type for the isochronous audio data endpoint.
+
+      Note: Adaptive synchronization for USB ISO IN (AudioStreaming linked to an
+      Output Terminal) is unsupported and rejected by the Zephyr UAC1 driver.
+    enum:
+      - "asynchronous"
+      - "adaptive"
+      - "synchronous"
+
+  sampling-frequencies:
+    type: array
+    required: true
+    description: |
+      Discrete sampling frequencies supported by this stream, in Hz.
+
+  subslot-size:
+    type: int
+    required: true
+    description: Number of bytes occupied by one audio subslot (1..4).
+
+  bit-resolution:
+    type: int
+    required: true
+    description: Number of effectively used bits in audio subslot.
+
+  polling-period-us:
+    type: int
+    description: |
+      Data endpoint polling period in microseconds.
+
+      USB Audio Class 1 requires 1ms polling. For High-Speed devices this still
+      means 1ms (bInterval = 4).
+
+  feedback-period-us:
+    type: int
+    description: |
+      Explicit feedback endpoint polling period in microseconds.
+
+      USB Audio Class 1 requires 1ms polling. For High-Speed devices this still
+      means 1ms (bInterval = 4).
+
+  feedback-refresh:
+    type: int
+    description: |
+      bRefresh value for the explicit feedback endpoint. Indicates the rate at
+      which a new feedback value is available: 2^bRefresh milliseconds.
+    default: 1

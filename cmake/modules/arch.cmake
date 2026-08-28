@@ -40,8 +40,15 @@ if(NOT ARCH)
 endif()
 
 cmake_path(GET ARCH_V2_${arch_upper}_DIR PARENT_PATH ARCH_DIR)
+if(NOT ARCH_DIR AND EXISTS "${ZEPHYR_BASE}/arch/${ARCH}")
+  set(ARCH_DIR "${ZEPHYR_BASE}/arch")
+endif()
+
 if(NOT ARCH_DIR)
   message(FATAL_ERROR "Could not find ARCH=${ARCH} for BOARD=${BOARD}, \
 please check your installation. ARCH roots searched: \n\
 ${ARCH_ROOT}")
 endif()
+
+set(ARCH "${ARCH}" CACHE INTERNAL "Resolved Zephyr architecture")
+set(ARCH_DIR "${ARCH_DIR}" CACHE INTERNAL "Resolved Zephyr architecture root")

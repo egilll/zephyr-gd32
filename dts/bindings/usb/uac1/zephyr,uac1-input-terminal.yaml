@@ -1,0 +1,20 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Audio Class 1 Input Terminal entity
+
+compatible: "zephyr,uac1-input-terminal"
+
+include: zephyr,uac1-channel-cluster.yaml
+
+properties:
+  terminal-type:
+    type: int
+    required: true
+    description: |
+      Terminal Type constant specified in USB Audio Terminal Types.
+
+  assoc-terminal:
+    type: phandle
+    description: |
+      Associated terminal for bi-directional terminal types.

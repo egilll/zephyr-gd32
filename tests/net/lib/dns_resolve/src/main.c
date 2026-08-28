@@ -85,6 +85,7 @@ static bool auto_response = true;
 
 NET_BUF_POOL_DEFINE(test_dns_qname_pool, 2, CONFIG_DNS_RESOLVER_MAX_QUERY_LEN,
 		    0, NULL);
+NET_BUF_POOL_DEFINE(test_dns_small_qname_pool, 1, 4, 0, NULL);
 NET_BUF_POOL_DEFINE(test_dns_response_pool, 1, TEST_DNS_RESPONSE_LEN, 0, NULL);
 
 #if defined(CONFIG_DNS_RESOLVER_QUERY_ALL_AVAILABLE_SERVERS)
@@ -1700,19 +1701,187 @@ ZTEST(dns_resolve, test_dns_localhost_resolve_ipv6)
 		      0, "not loopback address");
 }
 
+ZTEST(dns_resolve, test_dns_unpack_query_classes)
+{
+	static const struct {
+		uint16_t class_;
+		bool valid;
+	} cases[] = {
+		{DNS_CLASS_IN, true},  {DNS_CLASS_IN | DNS_CLASS_FLUSH, true},
+		{DNS_CLASS_ANY, true}, {DNS_CLASS_ANY | DNS_CLASS_FLUSH, true},
+		{0U, false},           {2U, false},
+		{3U, false},           {254U, false},
+		{256U, false},         {0x7fffU, false},
+	};
+	uint8_t query[] = {
+		0U, 0U, 0U, 0U, 0U, 1U, 0U, 0U, 0U, 0U, 0U, 0U, 1U, 'a', 0U, 0U, DNS_RR_TYPE_A,
+		0U, 0U,
+	};
+
+	for (size_t i = 0U; i < ARRAY_SIZE(cases); ++i) {
+		struct dns_msg_t msg = {
+			.msg = query,
+			.msg_size = sizeof(query),
+			.query_offset = DNS_MSG_HEADER_SIZE,
+		};
+		enum dns_class class_;
+		struct net_buf *result;
+		int ret;
+
+		sys_put_be16(cases[i].class_, &query[sizeof(query) - DNS_QCLASS_LEN]);
+		result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+		zassert_not_null(result, "Failed to allocate query-name buffer");
+
+		ret = dns_unpack_query(&msg, result, NULL, &class_);
+		if (cases[i].valid) {
+			zassert_equal(ret, 1, "Class 0x%04x was rejected", cases[i].class_);
+			zassert_equal(class_, cases[i].class_, "Wrong parsed query class");
+		} else {
+			zassert_equal(ret, -EINVAL, "Class 0x%04x was accepted", cases[i].class_);
+		}
+
+		net_buf_unref(result);
+	}
+}
+
+ZTEST(dns_resolve, test_dns_unpack_query_cname)
+{
+	uint8_t query[] = {
+		0U,
+		0U,
+		0U,
+		0U,
+		0U,
+		1U,
+		0U,
+		0U,
+		0U,
+		0U,
+		0U,
+		0U,
+		1U,
+		'a',
+		0U,
+		0U,
+		DNS_RR_TYPE_CNAME,
+		0U,
+		DNS_CLASS_IN,
+	};
+	struct dns_msg_t msg = {
+		.msg = query,
+		.msg_size = sizeof(query),
+		.query_offset = DNS_MSG_HEADER_SIZE,
+	};
+	enum dns_rr_type type;
+	struct net_buf *result;
+	int ret;
+
+	result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+	zassert_not_null(result, "Failed to allocate query-name buffer");
+
+	ret = dns_unpack_query(&msg, result, &type, NULL);
+	zassert_equal(ret, 1, "CNAME question was rejected");
+	zassert_equal(type, DNS_RR_TYPE_CNAME, "Wrong parsed query type");
+	zassert_mem_equal(result->data, "a", sizeof("a"), "Wrong parsed query name");
+
+	net_buf_unref(result);
+}
+
+ZTEST(dns_resolve, test_dns_pack_qname)
+{
+	static const uint8_t expected[] = {
+		7U, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 5U, 'l', 'o', 'c', 'a', 'l', 0U,
+	};
+	static const char *const invalid_names[] = {
+		"",
+		".local",
+		"foo..local",
+		"foo.local..",
+	};
+	uint8_t output[DNS_NAME_MAX_SIZE];
+	uint8_t unchanged[DNS_NAME_MAX_SIZE];
+	char name[DNS_NAME_MAX_SIZE + 1U];
+	uint16_t len;
+	size_t offset;
+	int ret;
+
+	memset(output, 0xa5, sizeof(output));
+	ret = dns_msg_pack_qname(&len, output, sizeof(expected), "example.local");
+	zassert_ok(ret, "Failed to pack name: %d", ret);
+	zassert_equal(len, sizeof(expected), "Unexpected encoded name length");
+	zassert_mem_equal(output, expected, sizeof(expected), "Unexpected encoded name");
+
+	memset(output, 0xa5, sizeof(output));
+	ret = dns_msg_pack_qname(&len, output, sizeof(expected), "example.local.");
+	zassert_ok(ret, "Failed to pack absolute name: %d", ret);
+	zassert_equal(len, sizeof(expected), "Unexpected absolute name length");
+	zassert_mem_equal(output, expected, sizeof(expected), "Unexpected absolute name");
+
+	ret = dns_msg_pack_qname(&len, output, 1U, ".");
+	zassert_ok(ret, "Failed to pack root name: %d", ret);
+	zassert_equal(len, 1U, "Unexpected root name length");
+	zassert_equal(output[0], 0U, "Unexpected encoded root name");
+
+	memset(output, 0xa5, sizeof(output));
+	memcpy(unchanged, output, sizeof(output));
+	len = UINT16_MAX;
+	ret = dns_msg_pack_qname(&len, output, sizeof(expected) - 1U, "example.local");
+	zassert_equal(ret, -ENOMEM, "Accepted undersized output buffer");
+	zassert_equal(len, UINT16_MAX, "Modified length on failure");
+	zassert_mem_equal(output, unchanged, sizeof(output), "Modified output on failure");
+
+	memset(name, 'a', DNS_LABEL_MAX_SIZE);
+	name[DNS_LABEL_MAX_SIZE] = '\0';
+	ret = dns_msg_pack_qname(&len, output, DNS_LABEL_MAX_SIZE + 2U, name);
+	zassert_ok(ret, "Rejected maximum-size label: %d", ret);
+	zassert_equal(len, DNS_LABEL_MAX_SIZE + 2U, "Unexpected maximum label length");
+
+	name[DNS_LABEL_MAX_SIZE] = 'a';
+	name[DNS_LABEL_MAX_SIZE + 1U] = '\0';
+	ret = dns_msg_pack_qname(&len, output, sizeof(output), name);
+	zassert_equal(ret, -EINVAL, "Accepted oversized label");
+
+	for (size_t i = 0U; i < ARRAY_SIZE(invalid_names); i++) {
+		ret = dns_msg_pack_qname(&len, output, sizeof(output), invalid_names[i]);
+		zassert_equal(ret, -EINVAL, "Accepted invalid name %s", invalid_names[i]);
+	}
+
+	offset = 0U;
+	for (size_t i = 0U; i < 4U; i++) {
+		size_t label_size = i == 3U ? 61U : DNS_LABEL_MAX_SIZE;
+
+		memset(&name[offset], 'a', label_size);
+		offset += label_size;
+		if (i != 3U) {
+			name[offset++] = '.';
+		}
+	}
+	name[offset] = '\0';
+
+	ret = dns_msg_pack_qname(&len, output, sizeof(output), name);
+	zassert_ok(ret, "Rejected maximum-size name: %d", ret);
+	zassert_equal(len, DNS_NAME_MAX_SIZE, "Unexpected maximum name length");
+
+	name[offset++] = 'a';
+	name[offset] = '\0';
+	ret = dns_msg_pack_qname(&len, output, sizeof(output), name);
+	zassert_equal(ret, -EINVAL, "Accepted oversized name");
+}
+
 ZTEST(dns_resolve, test_dns_unpack_name)
 {
+	static const uint8_t exact_record[] = "\003www";
 	/* NULL string terminator serves a role of a final zero-length label */
 	static const uint8_t *test_records[] = {
 		/* example.com */
 		"\007example\003com",
 		/* www.zephyrproject.org */
 		"\003www\015zephyrproject\003org",
-		/* These records should barely fit (fills up the buffer size limit). */
+		/* This record has the maximum 255-byte encoded name length. */
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
-		"\076very_long_record_that_has_a_length_of_62_bytes_xxxxxxxxxxxxxxx",
+		"\075very_long_record_that_has_a_length_of_61_bytes_xxxxxxxxxxxxxx",
 	};
 	static const uint8_t *expected_names[] = {
 		"example.com",
@@ -1720,7 +1889,7 @@ ZTEST(dns_resolve, test_dns_unpack_name)
 		"very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx."
 		"very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx."
 		"very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx."
-		"very_long_record_that_has_a_length_of_62_bytes_xxxxxxxxxxxxxxx",
+		"very_long_record_that_has_a_length_of_61_bytes_xxxxxxxxxxxxxx",
 
 	};
 	struct net_buf *result;
@@ -1746,6 +1915,20 @@ ZTEST(dns_resolve, test_dns_unpack_name)
 
 		net_buf_unref(result);
 	}
+
+	result = net_buf_alloc(&test_dns_small_qname_pool, K_NO_WAIT);
+	zassert_not_null(result, "Failed to allocate exact-size buffer");
+	ret = dns_unpack_name(exact_record, sizeof(exact_record), exact_record, result, NULL);
+	zassert_equal(ret, 3, "Failed to decode into exact-size buffer");
+	zassert_str_equal(result->data, "www", "Decoded wrong exact-size name");
+	net_buf_unref(result);
+
+	result = net_buf_alloc(&test_dns_small_qname_pool, K_NO_WAIT);
+	zassert_not_null(result, "Failed to allocate undersized buffer");
+	net_buf_reserve(result, 1U);
+	ret = dns_unpack_name(exact_record, sizeof(exact_record), exact_record, result, NULL);
+	zassert_equal(ret, -EMSGSIZE, "Decoded into undersized buffer");
+	net_buf_unref(result);
 }
 
 ZTEST(dns_resolve, test_dns_unpack_name_with_pointer)
@@ -1869,6 +2052,52 @@ ZTEST(dns_resolve, test_dns_unpack_name_with_nested_pointer)
 	net_buf_unref(result);
 }
 
+ZTEST(dns_resolve, test_dns_unpack_name_with_forward_pointer)
+{
+	static const uint8_t forward_pointer[] = {0xc0, 0x02, 0x00};
+	static const uint8_t self_pointer[] = {0xc0, 0x00};
+	static const uint8_t label_then_forward_pointer[] = {0x01, 'a', 0xc0, 0x04, 0x00};
+	static const struct {
+		const uint8_t *record;
+		size_t size;
+	} cases[] = {
+		{forward_pointer, sizeof(forward_pointer)},
+		{self_pointer, sizeof(self_pointer)},
+		{label_then_forward_pointer, sizeof(label_then_forward_pointer)},
+	};
+
+	for (size_t i = 0U; i < ARRAY_SIZE(cases); i++) {
+		struct net_buf *result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+		int ret;
+
+		zassert_not_null(result, "Failed to allocate buffer");
+		net_buf_add_mem(result, "seed", 4U);
+		ret = dns_unpack_name(cases[i].record, cases[i].size, cases[i].record, result,
+				      NULL);
+		zassert_equal(ret, -EMSGSIZE, "Accepted non-backward compression pointer");
+		zassert_equal(result->len, 4U, "Left partial decoded text on failure");
+		zassert_mem_equal(result->data, "seed", 4U, "Changed existing output on failure");
+		net_buf_unref(result);
+	}
+}
+
+ZTEST(dns_resolve, test_dns_unpack_name_invalid_args)
+{
+	static const uint8_t root[] = {0x00};
+	struct net_buf *result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+
+	zassert_not_null(result, "Failed to allocate buffer");
+	zassert_equal(dns_unpack_name(NULL, sizeof(root), root, result, NULL), -EINVAL,
+		      "Accepted NULL message");
+	zassert_equal(dns_unpack_name(root, sizeof(root), NULL, result, NULL), -EINVAL,
+		      "Accepted NULL source");
+	zassert_equal(dns_unpack_name(root, sizeof(root), root, NULL, NULL), -EINVAL,
+		      "Accepted NULL output");
+	zassert_equal(dns_unpack_name(root, 0, root, result, NULL), -EINVAL,
+		      "Accepted empty message");
+	net_buf_unref(result);
+}
+
 ZTEST(dns_resolve, test_dns_unpack_name_overflow)
 {
 	static const uint8_t *test_records[] = {
@@ -1879,13 +2108,13 @@ ZTEST(dns_resolve, test_dns_unpack_name_overflow)
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx",
-		/* 4 records fit (251 bytes), 4 bytes for dot separators, 5th one-byte
-		 * record won't fit.
+		/* A maximum-size name followed by a fifth one-byte label exceeds
+		 * the DNS wire-format limit.
 		 */
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
-		"\076very_long_record_that_has_a_length_of_62_bytes_xxxxxxxxxxxxxxx"
+		"\075very_long_record_that_has_a_length_of_61_bytes_xxxxxxxxxxxxxx"
 		"\001x",
 		/* Single 64 byte record, that's forbidden (max record len is 63). */
 		"\100very_long_record_that_has_a_length_of_64_bytes_that_is_incorrect",

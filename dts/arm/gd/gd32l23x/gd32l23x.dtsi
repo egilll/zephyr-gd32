@@ -126,6 +126,16 @@
 			status = "okay";
 		};
 
+		rtc: rtc@40002800 {
+			compatible = "gd,gd32-rtc";
+			reg = <0x40002800 0x400>;
+			interrupts = <41 0>, <3 0>;
+			interrupt-names = "alarm", "wakeup";
+			clock-source = "irc32k";
+			alarms-count = <2>;
+			status = "disabled";
+		};
+
 		pinctrl: pin-controller@48000000 {
 			compatible = "gd,gd32-pinctrl-af";
 			reg = <0x48000000 0x1400>;

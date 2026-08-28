@@ -245,10 +245,12 @@ static int check_autonegotiation_completion(const struct device *dev)
 	struct phy_mii_dev_data *const data = dev->data;
 
 	uint16_t anar_reg = 0;
+	uint16_t bmcr_reg = 0;
 	uint16_t bmsr_reg = 0;
 	uint16_t anlpar_reg = 0;
 	uint16_t c1kt_reg = 0;
 	uint16_t s1kt_reg = 0;
+	uint16_t phy_sr_reg = 0;
 
 	if (phy_mii_reg_read(dev, MII_BMSR, &bmsr_reg) < 0) {
 		return -EIO;
@@ -256,6 +258,14 @@ static int check_autonegotiation_completion(const struct device *dev)
 
 	if (!IS_BIT_SET(bmsr_reg, MII_BMSR_AUTONEG_COMPLETE_BIT)) {
 		if (sys_timepoint_expired(data->autoneg_timeout)) {
+			if (phy_mii_reg_read(dev, MII_BMCR, &bmcr_reg) < 0) {
+				bmcr_reg = 0U;
+			}
+			if (phy_mii_reg_read(dev, 16U, &phy_sr_reg) < 0) {
+				phy_sr_reg = 0U;
+			}
+			LOG_DBG("PHY (%d) timeout regs: bmcr=0x%04x bmsr=0x%04x sr=0x%04x",
+				cfg->phy_addr, bmcr_reg, bmsr_reg, phy_sr_reg);
 			LOG_DBG("PHY (%d) auto-negotiate timeout", cfg->phy_addr);
 			return -ETIMEDOUT;
 		}
@@ -274,8 +284,14 @@ static int check_autonegotiation_completion(const struct device *dev)
 		}
 	}
 
+	if (phy_mii_reg_read(dev, 16U, &phy_sr_reg) < 0) {
+		phy_sr_reg = 0U;
+	}
+
 	LOG_DBG("PHY (%d) auto-negotiate sequence completed",
 		cfg->phy_addr);
+	LOG_DBG("PHY (%d) resolved regs: bmsr=0x%04x sr=0x%04x",
+		cfg->phy_addr, bmsr_reg, phy_sr_reg);
 
 	/* Read PHY default advertising parameters */
 	if (phy_mii_reg_read(dev, MII_ANAR, &anar_reg) < 0) {

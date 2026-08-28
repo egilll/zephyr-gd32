@@ -1,0 +1,30 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&i2s1 {
+	status = "disabled";
+};
+
+&sdio {
+	status = "disabled";
+};
+
+&spi3 {
+	/* Keep master RX ahead of TX on DMA1 so incoming data is drained first. */
+	dmas = <&dma1 0 4 0x30000 0>, <&dma1 1 4 0x10000 0>;
+	dma-names = "rx", "tx";
+	/* Let the slave SPI IRQ preempt the master side during loopback tests. */
+	interrupts = <84 1>;
+};
+
+&spi4 {
+	interrupts = <85 0>;
+};
+
+&dma1 {
+	/* Lower DMA IRQ priority so the slave SPI can service FIFO events first. */
+	interrupts = <56 1>, <57 1>, <58 1>, <59 1>,
+		     <60 1>, <68 1>, <69 1>, <70 1>;
+};

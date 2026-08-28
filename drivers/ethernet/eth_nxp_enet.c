@@ -666,13 +666,19 @@ static int eth_nxp_enet_init(const struct device *dev)
 		switch (config->mac_addr_source) {
 		case MAC_ADDR_SOURCE_UNIQUE:
 			nxp_enet_unique_mac(data->mac_addr);
+			err = 0;
 			break;
 		case MAC_ADDR_SOURCE_FUSED:
 			nxp_enet_fused_mac(data->mac_addr);
+			err = 0;
 			break;
 		default:
 			break;
 		}
+	}
+	if (err < 0) {
+		LOG_ERR("Failed to load MAC address (%d)", err);
+		return err;
 	}
 
 	err = clock_control_get_rate(config->clock_dev, config->clock_subsys,
@@ -833,7 +839,7 @@ static const struct ethernet_api api_funcs = {
 #define _nxp_enet_dma_desc_section
 #define _nxp_enet_dma_buffer_section
 #define _nxp_enet_driver_buffer_section
-#define driver_cache_maintain	true
+#define driver_cache_maintain	false
 #endif
 
 /* Use ENET_FRAME_MAX_VLANFRAMELEN for VLAN frame size

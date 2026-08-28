@@ -35,6 +35,9 @@ endif()
 # For Zephyr more specifically this breaks (at least)
 #     -fmacro-prefix-map=${ZEPHYR_BASE}=
 
+if(NOT ARCH_DIR AND DEFINED ARCH AND EXISTS "${ZEPHYR_BASE}/arch/${ARCH}")
+  set(ARCH_DIR "${ZEPHYR_BASE}/arch")
+endif()
 
 # In some cases the "final" things are not used at all and "_prebuilt"
 # is the last station. See "logical_target_for_zephyr_elf" below for

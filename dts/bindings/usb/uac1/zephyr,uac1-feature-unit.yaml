@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Audio Class 1 Feature Unit entity
+
+compatible: "zephyr,uac1-feature-unit"
+
+properties:
+  data-source:
+    type: phandle
+    required: true
+    description: Unit or Terminal to which this Feature Unit is connected
+
+  controls:
+    type: int
+    default: 0
+    description: |
+      Bitmap of supported controls for the master channel. Bit positions
+      follow USB Audio Device Class 1.0 specification, Appendix A.12.2:
+      - BIT(0): Mute (D0)
+      - BIT(1): Volume (D1)
+
+  channel-controls:
+    type: array
+    description: |
+      Bitmap of supported controls for each logical channel. The number of
+      elements must match the channel count of the Feature Unit's data source.
+      If omitted, the master channel controls are also advertised for every
+      logical channel.
+
+  volume-min:
+    type: int
+    description: |
+      Minimum volume, in 1/256 dB units (signed 16-bit).
+
+  volume-max:
+    type: int
+    description: |
+      Maximum volume, in 1/256 dB units (signed 16-bit).
+
+  volume-res:
+    type: int
+    description: |
+      Volume resolution (step), in 1/256 dB units (signed 16-bit).

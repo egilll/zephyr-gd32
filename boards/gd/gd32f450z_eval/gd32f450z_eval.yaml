@@ -11,13 +11,20 @@ toolchain:
   - zephyr
   - gnuarmemb
 supported:
+  - adc
   - counter
   - dac
+  - dma
   - gpio
   - i2c
+  - i2s
+  - netif:eth
   - pwm
+  - rtc
+  - sdhc
   - spi
   - uart
+  - usb_device
+  - usbd
   - watchdog
-  - dma
 vendor: gd

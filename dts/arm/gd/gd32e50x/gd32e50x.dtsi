@@ -412,6 +412,19 @@
 			status = "disabled";
 		};
 
+		usbhs: usb@50000000 {
+			compatible = "gd,gd32-usbhs", "snps,dwc2";
+			reg = <0x50000000 0x40000>;
+			interrupts = <67 0>;
+			clocks = <&cctl GD32_CLOCK_USBHS>, <&cctl GD32_CLOCK_ULPI>;
+			num-in-eps = <6>;
+			num-out-eps = <6>;
+			ghwcfg1 = <0x00000000>;
+			ghwcfg2 = <0x00001590>;
+			ghwcfg4 = <0x16000000>;
+			status = "disabled";
+		};
+
 		dma0: dma@40020000 {
 			compatible = "gd,gd32-dma";
 			reg = <0x40020000 0x400>;

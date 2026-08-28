@@ -24,16 +24,27 @@ extern "C" {
 #endif
 
 /**
+ * @brief Multicast DNS responder
+ * @defgroup mdns_responder Multicast DNS responder
+ * @ingroup networking
+ * @{
+ */
+
+/**
  * @brief Register continuous memory of @ref dns_sd_rec records.
  *
  * mDNS responder will start with iteration over mDNS records registered using
  * @ref DNS_SD_REGISTER_SERVICE (if any) and then go over external records.
  *
  * @param records A pointer to an array of mDNS records. It is stored internally
- *                without copying the content so it must be kept valid. It can
- *                be set to NULL, e.g. before freeing the memory block.
- * @param count The number of elements
- * @return 0 for OK; -EINVAL for invalid parameters.
+ *                without copying the content so it must be kept valid. Pass
+ *                NULL together with a zero @p count before freeing the array.
+ *                A non-empty update is announced when runtime announcements
+ *                are enabled and the responder is already running. Under the
+ *                same conditions, previously installed records are withdrawn
+ *                before this function returns.
+ * @param count The number of elements, or zero when clearing @p records.
+ * @return 0 for OK; -EINVAL if exactly one of @p records and @p count is zero.
  */
 int mdns_responder_set_ext_records(const struct dns_sd_rec *records, size_t count);
 
@@ -89,6 +100,8 @@ static inline int mdns_responder_disable_iface(struct net_if *iface)
 }
 
 #endif /* CONFIG_MDNS_RESPONDER_RUNTIME_IFACE_CONTROL || __DOXYGEN__ */
+
+/** @} */
 
 #ifdef __cplusplus
 }

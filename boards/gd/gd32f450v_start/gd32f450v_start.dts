@@ -16,7 +16,7 @@
 	chosen {
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
-		zephyr,dtcm = &tcmsram0;
+		zephyr,dtcm = &tcmsram;
 		zephyr,console = &usart0;
 		zephyr,shell-uart = &usart0;
 	};
@@ -54,6 +54,21 @@
 	};
 };
 
+zephyr_udc0: &usbfs {
+	pinctrl-0 = <&usbfs_default>;
+	pinctrl-names = "default";
+	clocks = <&cctl GD32_CLOCK_USBFS>,
+		 <&cctl GD32_CLOCK_IRC48M>,
+		 <&cctl GD32_CLOCK_CK48MSEL_IRC48M>;
+	status = "okay";
+};
+
+&usbhs {
+	pinctrl-0 = <&usbhs_ulpi_default>;
+	pinctrl-names = "default";
+	status = "disabled";
+};
+
 &gpioa {
 	status = "okay";
 };
@@ -67,6 +82,12 @@
 	current-speed = <115200>;
 	pinctrl-0 = <&usart0_default>;
 	pinctrl-names = "default";
+	dmas = <&dma1 2 4 0 0>, <&dma1 7 4 0 0>;
+	dma-names = "rx", "tx";
+};
+
+&dma1 {
+	status = "okay";
 };
 
 &timer2 {

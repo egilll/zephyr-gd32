@@ -13,57 +13,72 @@
 
 #include "dns_internal.h"
 
-static inline uint16_t dns_strlen(const char *str)
-{
-	if (str == NULL) {
-		return 0;
-	}
-	return (uint16_t)strlen(str);
-}
-
 int dns_msg_pack_qname(uint16_t *len, uint8_t *buf, uint16_t size,
 		       const char *domain_name)
 {
-	uint16_t dn_size;
-	uint16_t lb_start;
-	uint16_t lb_index;
-	uint16_t lb_size;
-	uint16_t i;
+	size_t domain_size;
+	size_t name_size;
+	size_t label_size = 0U;
+	uint16_t label_start = 0U;
+	uint16_t offset = 1U;
 
-	lb_start = 0U;
-	lb_index = 1U;
-	lb_size = 0U;
-
-	dn_size = dns_strlen(domain_name);
-	if (dn_size == 0U) {
+	if (len == NULL || buf == NULL || domain_name == NULL) {
 		return -EINVAL;
 	}
 
-	/* traverse the domain name str, including the null-terminator :) */
-	for (i = 0U; i < dn_size + 1; i++) {
-		if (lb_index >= size) {
+	domain_size = strlen(domain_name);
+	name_size = domain_size;
+	if (domain_size == 1U && domain_name[0] == '.') {
+		if (size < 1U) {
 			return -ENOMEM;
 		}
 
-		switch (domain_name[i]) {
-		default:
-			buf[lb_index] = domain_name[i];
-			lb_size += 1U;
-			break;
-		case '.':
-			buf[lb_start] = lb_size;
-			lb_size = 0U;
-			lb_start = lb_index;
-			break;
-		case '\0':
-			buf[lb_start] = lb_size;
-			buf[lb_index] = 0U;
-			break;
-		}
-		lb_index += 1U;
+		buf[0] = 0U;
+		*len = 1U;
+		return 0;
 	}
 
-	*len = lb_index;
+	/* A trailing dot represents the terminating root label. */
+	if (name_size > 0U && domain_name[name_size - 1U] == '.') {
+		name_size--;
+	}
+
+	if (name_size == 0U || name_size + DNS_LABEL_LEN_SIZE + 1U > DNS_NAME_MAX_SIZE) {
+		return -EINVAL;
+	}
+
+	/* Validate the whole name before modifying the destination buffer. */
+	for (size_t i = 0U; i <= name_size; i++) {
+		if (i == name_size || domain_name[i] == '.') {
+			if (label_size < DNS_LABEL_MIN_SIZE || label_size > DNS_LABEL_MAX_SIZE) {
+				return -EINVAL;
+			}
+
+			label_size = 0U;
+		} else {
+			label_size++;
+		}
+	}
+
+	if (name_size + DNS_LABEL_LEN_SIZE + 1U > size) {
+		return -ENOMEM;
+	}
+
+	label_size = 0U;
+	for (size_t i = 0U; i < name_size; i++) {
+		if (domain_name[i] == '.') {
+			buf[label_start] = (uint8_t)label_size;
+			label_size = 0U;
+			label_start = offset++;
+		} else {
+			buf[offset++] = domain_name[i];
+			label_size++;
+		}
+	}
+
+	buf[label_start] = (uint8_t)label_size;
+	buf[offset++] = 0U;
+	*len = offset;
 
 	return 0;
 }
@@ -505,10 +520,17 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 {
 	const uint8_t *end_of_label = NULL;
 	const uint8_t *curr_src = src;
+	size_t wire_size = 1U;
+	uint16_t initial_len;
 	int loop_check = 0, len = -1;
 	int label_len;
 	int val;
 
+	if (msg == NULL || src == NULL || buf == NULL || maxlen <= 0) {
+		return -EINVAL;
+	}
+
+	initial_len = buf->len;
 	if (curr_src < msg || curr_src >= (msg + maxlen)) {
 		return -EMSGSIZE;
 	}
@@ -516,10 +538,11 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 	while ((val = *curr_src++)) {
 		if ((val & NS_CMPRSFLGS) == NS_CMPRSFLGS) {
 			/* Follow pointer */
-			int pos;
+			size_t pointer_offset = curr_src - msg - 1U;
+			size_t pos;
 
 			if (curr_src >= (msg + maxlen)) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			if (len < 0) {
@@ -533,30 +556,37 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 
 			/* Strip compress bits from length calculation */
 			pos = ((val & 0x3f) << 8) | (*curr_src & 0xff);
+			if (pos >= pointer_offset) {
+				goto malformed;
+			}
 
 			curr_src = msg + pos;
 			if (curr_src >= (msg + maxlen)) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			loop_check += 2;
 			if (loop_check >= maxlen) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 		} else {
 			size_t dest_size = net_buf_tailroom(buf);
+			size_t separator_size = buf->len > 0U ? 1U : 0U;
 
-			/* Max label length is 64 bytes (because 2 bits are
-			 * used for pointer)
-			 */
+			/* The top two bits are reserved for compression. */
 			label_len = val;
-			if (label_len > 63) {
-				return -EMSGSIZE;
+			if (label_len > DNS_LABEL_MAX_SIZE) {
+				goto malformed;
 			}
 
-			if ((label_len + 1 >= dest_size) ||
+			wire_size += DNS_LABEL_LEN_SIZE + label_len;
+			if (wire_size > DNS_NAME_MAX_SIZE) {
+				goto malformed;
+			}
+
+			if ((separator_size + label_len + 1U > dest_size) ||
 			    ((curr_src + label_len) >= (msg + maxlen))) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			loop_check += label_len + 1;
@@ -582,6 +612,10 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 	}
 
 	return buf->len;
+
+malformed:
+	buf->len = initial_len;
+	return -EMSGSIZE;
 }
 
 const char *dns_qtype_to_str(enum dns_rr_type qtype)
@@ -599,6 +633,8 @@ const char *dns_qtype_to_str(enum dns_rr_type qtype)
 		return "AAAA";
 	case DNS_RR_TYPE_SRV:
 		return "SRV";
+	case DNS_RR_TYPE_NSEC:
+		return "NSEC";
 	case DNS_RR_TYPE_ANY:
 		return "ANY";
 	default:
@@ -631,18 +667,17 @@ int dns_unpack_query(struct dns_msg_t *dns_msg, struct net_buf *buf,
 	}
 
 	query_type = dns_unpack_query_qtype(end_of_label);
-	if (query_type != DNS_RR_TYPE_A && query_type != DNS_RR_TYPE_AAAA
-		&& query_type != DNS_RR_TYPE_PTR
-		&& query_type != DNS_RR_TYPE_SRV
-		&& query_type != DNS_RR_TYPE_TXT
-		&& query_type != DNS_RR_TYPE_HTTPS
-		&& query_type != DNS_RR_TYPE_ANY
-		&& !handle_private_dns_query_type(query_type)) {
+	if (query_type != DNS_RR_TYPE_A && query_type != DNS_RR_TYPE_CNAME &&
+	    query_type != DNS_RR_TYPE_AAAA && query_type != DNS_RR_TYPE_PTR &&
+	    query_type != DNS_RR_TYPE_SRV && query_type != DNS_RR_TYPE_TXT &&
+	    query_type != DNS_RR_TYPE_NSEC && query_type != DNS_RR_TYPE_HTTPS &&
+	    query_type != DNS_RR_TYPE_ANY && !handle_private_dns_query_type(query_type)) {
 		return -EINVAL;
 	}
 
 	query_class = dns_unpack_query_qclass(end_of_label);
-	if ((query_class & DNS_CLASS_IN) != DNS_CLASS_IN) {
+	if ((query_class & ~DNS_CLASS_FLUSH) != DNS_CLASS_IN &&
+	    (query_class & ~DNS_CLASS_FLUSH) != DNS_CLASS_ANY) {
 		return -EINVAL;
 	}
 

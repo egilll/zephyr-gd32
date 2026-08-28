@@ -33,11 +33,19 @@
 
 #define BM4_WE_SHIFT 24
 #define BM4_RE_SHIFT 25
+#define BM5_WE_SHIFT 26
+#define BM5_RE_SHIFT 27
 
 #if CONFIG_USB_KINETIS || CONFIG_UDC_KINETIS || CONFIG_UHC_NXP_KHCI
 #define BM4_PERMISSIONS ((1 << BM4_RE_SHIFT) | (1 << BM4_WE_SHIFT))
 #else
 #define BM4_PERMISSIONS 0
+#endif
+
+#if CONFIG_SDHC_KINETIS
+#define BM5_PERMISSIONS ((1 << BM5_RE_SHIFT) | (1 << BM5_WE_SHIFT))
+#else
+#define BM5_PERMISSIONS 0
 #endif
 
 /* Read Attribute */
@@ -81,13 +89,14 @@
 #if defined(CONFIG_MPU_ALLOW_FLASH_WRITE)
 #define REGION_RAM_ATTR                                                                            \
 	{((MPU_REGION_SU_RWX) | ((UM_READ | UM_WRITE | UM_EXEC) << BM3_UM_SHIFT) |                 \
-	  (BM4_PERMISSIONS))}
+	  (BM4_PERMISSIONS) | (BM5_PERMISSIONS))}
 
 #define REGION_FLASH_ATTR {(MPU_REGION_SU_RWX)}
 
 #else
 #define REGION_RAM_ATTR                                                                            \
-	{((MPU_REGION_SU_RW) | ((UM_READ | UM_WRITE) << BM3_UM_SHIFT) | (BM4_PERMISSIONS))}
+	{((MPU_REGION_SU_RW) | ((UM_READ | UM_WRITE) << BM3_UM_SHIFT) | (BM4_PERMISSIONS) |      \
+	  (BM5_PERMISSIONS))}
 
 #define REGION_FLASH_ATTR {(MPU_REGION_READ | MPU_REGION_EXEC | MPU_REGION_SU)}
 #endif
@@ -98,11 +107,12 @@
 
 #define REGION_USER_RO_ATTR {(MPU_REGION_READ | MPU_REGION_SU)}
 
-/* ENET (Master 3) and USB (Master 4) devices will not be able
+/* ENET (Master 3), USB (Master 4), and SDHC (Master 5) devices will not be able
 to access RAM when the region is dynamically disabled in NXP MPU.
 DEBUGGER (Master 1) can't be disabled in Region 0. */
 #define REGION_DEBUGGER_AND_DEVICE_ATTR                                                            \
-	{((MPU_REGION_SU) | ((UM_READ | UM_WRITE) << BM3_UM_SHIFT) | (BM4_PERMISSIONS))}
+	{((MPU_REGION_SU) | ((UM_READ | UM_WRITE) << BM3_UM_SHIFT) | (BM4_PERMISSIONS) |      \
+	  (BM5_PERMISSIONS))}
 
 #define REGION_DEBUG_ATTR {MPU_REGION_SU}
 

@@ -1,0 +1,49 @@
+# Copyright (c) 2026, The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: GD32 RTC
+
+compatible: "gd,gd32-rtc"
+
+include:
+  - rtc.yaml
+  - rtc-device.yaml
+
+properties:
+  reg:
+    required: true
+
+  clock-source:
+    type: string
+    enum:
+      - lxtal
+      - irc40k
+      - irc32k
+      - hxtal-div32
+      - hxtal-div-rtcdiv
+    required: true
+    description: RTC clock source selection for the active GD32 RTC family.
+
+  hxtal-div:
+    type: int
+    default: 2
+    description: HXTAL division factor when the selected family uses an RTCDIV clock source.
+
+  lxtal-drive-high:
+    type: boolean
+    description: Enable higher drive strength for the LXTAL oscillator.
+
+  alarms-count:
+    required: true
+
+  interrupts:
+    required: true
+    description: |
+      Interrupts must include the RTC alarm interrupt and may include the RTC wakeup interrupt
+      when the hardware supports wakeup events.
+
+  interrupt-names:
+    required: true
+    description: |
+      Interrupt names must include "alarm" and may also include "wakeup" for families with a
+      wakeup timer.

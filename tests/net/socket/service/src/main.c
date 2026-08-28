@@ -207,6 +207,7 @@ struct reconfig_mock_fd {
 	struct k_sem prepared;
 	struct k_sem closed;
 	struct k_sem wrong_events;
+	atomic_t prepare_error;
 	short expected_events;
 };
 
@@ -216,6 +217,7 @@ static void reconfig_mock_init(struct reconfig_mock_fd *mock)
 	k_sem_init(&mock->prepared, 0, UINT_MAX);
 	k_sem_init(&mock->closed, 0, 1);
 	k_sem_init(&mock->wrong_events, 0, 1);
+	atomic_clear(&mock->prepare_error);
 	mock->expected_events = -1;
 }
 
@@ -237,10 +239,15 @@ static int reconfig_mock_ioctl(void *obj, unsigned int request, va_list args)
 	switch (request) {
 	case ZFD_IOCTL_POLL_PREPARE: {
 		struct k_poll_event *pev_end;
+		int prepare_error;
 
 		pfd = va_arg(args, struct zsock_pollfd *);
 		pev = va_arg(args, struct k_poll_event **);
 		pev_end = va_arg(args, struct k_poll_event *);
+		prepare_error = atomic_set(&mock->prepare_error, 0);
+		if (prepare_error != 0) {
+			return prepare_error;
+		}
 
 		if ((mock->expected_events >= 0) && (pfd->events != mock->expected_events)) {
 			k_sem_give(&mock->wrong_events);
@@ -437,6 +444,37 @@ static void reconfig_witness_handler(struct net_socket_service_event *pev)
 }
 
 NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(reconfig_witness_service, reconfig_witness_handler, 1);
+
+ZTEST(net_socket_service, test_poll_error_recovery)
+{
+	struct zsock_pollfd pollfd = {.events = ZSOCK_POLLIN};
+	static struct reconfig_mock_fd mock;
+	int closed, fd, prepared, ret;
+
+	reconfig_mock_init(&mock);
+	fd = reconfig_mock_alloc(&mock);
+	zassert_true(fd >= 0, "Cannot allocate fd (%d)", fd);
+
+	atomic_set(&mock.prepare_error, -EBADF);
+	pollfd.fd = fd;
+	ret = net_socket_service_register(&reconfig_witness_service, &pollfd, 1, NULL);
+	if (ret != 0) {
+		(void)zvfs_close(fd);
+	}
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+
+	prepared = k_sem_take(&mock.prepared, RECONFIG_TIMEOUT);
+	ret = net_socket_service_close(&reconfig_witness_service);
+	closed = k_sem_take(&mock.closed, RECONFIG_TIMEOUT);
+	if (closed != 0) {
+		(void)net_socket_service_unregister(&reconfig_witness_service);
+		(void)zvfs_close(fd);
+	}
+
+	zassert_ok(prepared, "Service thread did not recover from poll error");
+	zassert_ok(ret, "Cannot close service (%d)", ret);
+	zassert_ok(closed, "Service fd was not closed");
+}
 
 ZTEST(net_socket_service, test_close_from_callback)
 {

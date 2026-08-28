@@ -1,3 +1,4 @@
+// clang-format off
 /*
  * Copyright (c) 2022 BrainCo Inc.
  *
@@ -15,27 +16,21 @@
 #include <zephyr/drivers/reset.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/irq.h>
+#include <zephyr/kernel.h>
 
 #include <gd32_adc.h>
 #include <gd32_rcu.h>
 
 #define ADC_CONTEXT_USES_KERNEL_TIMER
+#define ADC_CONTEXT_ENABLE_ON_COMPLETE
 #include "adc_context.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(adc_gd32, CONFIG_ADC_LOG_LEVEL);
 
-/**
- * @brief gd32 adc irq have some special cases as below:
- *   1. adc number no larger than 3.
- *   2. adc0 and adc1 share the same irq number.
- *   3. For gd32f4xx, adc2 share the same irq number with adc0 and adc1.
- *
- * To cover this cases, gd32_adc driver use node-label 'adc0', 'adc1' and
- * 'adc2' to handle gd32 adc irq config directly.'
- *
- * @note Sorry for the restriction, But new added gd32 adc node-label must be 'adc0',
- * 'adc1' and 'adc2'.
+/*
+ * Some GD32 SoCs share ADC interrupts across instances; use node labels to bind
+ * the shared IRQ handler to the active ADC instance(s).
  */
 #define ADC0_NODE		DT_NODELABEL(adc0)
 #define ADC1_NODE		DT_NODELABEL(adc1)
@@ -55,6 +50,7 @@ LOG_MODULE_REGISTER(adc_gd32, CONFIG_ADC_LOG_LEVEL);
 #undef ADC_CTL1
 #undef ADC_SAMPT0
 #undef ADC_SAMPT1
+#undef ADC_RSQ0
 #undef ADC_RSQ2
 #undef ADC_RDATA
 
@@ -63,6 +59,7 @@ LOG_MODULE_REGISTER(adc_gd32, CONFIG_ADC_LOG_LEVEL);
 #define ADC_CTL1(adc0)		REG32((adc0) + 0x00000008U)
 #define ADC_SAMPT0(adc0)	REG32((adc0) + 0x0000000CU)
 #define ADC_SAMPT1(adc0)	REG32((adc0) + 0x00000010U)
+#define ADC_RSQ0(adc0)		REG32((adc0) + 0x0000002CU)
 #define ADC_RSQ2(adc0)		REG32((adc0) + 0x00000034U)
 #define ADC_RDATA(adc0)		REG32((adc0) + 0x0000004CU)
 #endif
@@ -146,6 +143,9 @@ struct adc_gd32_data {
 	const struct device *dev;
 	uint16_t *buffer;
 	uint16_t *repeat_buffer;
+	uint8_t resolution;
+	uint8_t data_shift;
+	uint32_t syncctl_enable_mask;
 };
 
 static void adc_gd32_isr(const struct device *dev)
@@ -154,7 +154,13 @@ static void adc_gd32_isr(const struct device *dev)
 	const struct adc_gd32_config *cfg = dev->config;
 
 	if (ADC_STAT(cfg->reg) & ADC_STAT_EOC) {
-		*data->buffer++ = ADC_RDATA(cfg->reg);
+		uint16_t sample = (uint16_t)(ADC_RDATA(cfg->reg) & ADC_RDATA_RDATA);
+
+		if (data->data_shift != 0U) {
+			sample >>= data->data_shift;
+		}
+
+		*data->buffer++ = sample;
 
 		/* Disable EOC interrupt. */
 		ADC_CTL0(cfg->reg) &= ~ADC_CTL0_EOCIE;
@@ -173,6 +179,15 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 
 	data->repeat_buffer = data->buffer;
 
+#if defined(ADC_SYNCCTL)
+	if (data->syncctl_enable_mask != 0U) {
+		ADC_SYNCCTL |= data->syncctl_enable_mask;
+	}
+#endif
+
+	/* Ensure stale flags won't stall conversion. */
+	ADC_STAT(cfg->reg) &= ~(ADC_STAT_EOC | ADC_STAT_ROVF);
+
 	/* Enable EOC interrupt */
 	ADC_CTL0(cfg->reg) |= ADC_CTL0_EOCIE;
 
@@ -190,17 +205,81 @@ static void adc_context_update_buffer_pointer(struct adc_context *ctx,
 	}
 }
 
-static inline void adc_gd32_calibration(const struct adc_gd32_config *cfg)
+static void adc_context_on_complete(struct adc_context *ctx, int status)
 {
+	ARG_UNUSED(status);
+
+	struct adc_gd32_data *data = CONTAINER_OF(ctx, struct adc_gd32_data, ctx);
+
+#if defined(ADC_SYNCCTL)
+	if (data->syncctl_enable_mask != 0U) {
+		ADC_SYNCCTL &= ~data->syncctl_enable_mask;
+		data->syncctl_enable_mask = 0U;
+	}
+#endif
+}
+
+static int adc_gd32_wait_mask_clear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout_ms)
+{
+	int64_t deadline = k_uptime_get() + timeout_ms;
+
+	while ((*reg & mask) != 0U) {
+		if (k_uptime_get() > deadline) {
+			return -ETIMEDOUT;
+		}
+		k_usleep(10);
+	}
+
+	return 0;
+}
+
+static int adc_gd32_calibration(const struct adc_gd32_config *cfg)
+{
+	/*
+	 * ADC needs a short stabilization time after being enabled before a
+	 * calibration cycle is started.
+	 */
+	k_usleep(10);
+
 	ADC_CTL1(cfg->reg) |= ADC_CTL1_RSTCLB;
-	/* Wait for calibration registers initialized. */
-	while (ADC_CTL1(cfg->reg) & ADC_CTL1_RSTCLB) {
+	if (adc_gd32_wait_mask_clear(&ADC_CTL1(cfg->reg), ADC_CTL1_RSTCLB, 10U) != 0) {
+		return -ETIMEDOUT;
 	}
 
 	ADC_CTL1(cfg->reg) |= ADC_CTL1_CLB;
-	/* Wait for calibration complete. */
-	while (ADC_CTL1(cfg->reg) & ADC_CTL1_CLB) {
+	if (adc_gd32_wait_mask_clear(&ADC_CTL1(cfg->reg), ADC_CTL1_CLB, 10U) != 0) {
+		return -ETIMEDOUT;
 	}
+
+	return 0;
+}
+
+static int adc_gd32_set_resolution(const struct adc_gd32_config *cfg, uint8_t resolution_id)
+{
+	/* DRES must only be changed when ADCON is reset (see reference manual). */
+	ADC_CTL0(cfg->reg) &= ~ADC_CTL0_EOCIE;
+	ADC_CTL1(cfg->reg) &= ~ADC_CTL1_ADCON;
+
+#if defined(CONFIG_SOC_SERIES_GD32F4XX) || \
+	defined(CONFIG_SOC_SERIES_GD32F3X0) || \
+	defined(CONFIG_SOC_SERIES_GD32L23X)
+	ADC_CTL0(cfg->reg) &= ~ADC_CTL0_DRES;
+	ADC_CTL0(cfg->reg) |= CTL0_DRES(resolution_id);
+#elif defined(CONFIG_SOC_SERIES_GD32F403) || \
+	defined(CONFIG_SOC_SERIES_GD32A50X)
+	ADC_OVSAMPCTL(cfg->reg) &= ~ADC_OVSAMPCTL_DRES;
+	ADC_OVSAMPCTL(cfg->reg) |= OVSAMPCTL_DRES(resolution_id);
+#elif defined(CONFIG_SOC_SERIES_GD32VF103)
+	ADC_OVSCR(cfg->reg) &= ~ADC_OVSCR_DRES;
+	ADC_OVSCR(cfg->reg) |= OVSCR_DRES(resolution_id);
+#else
+	ADC_CTL1(cfg->reg) |= ADC_CTL1_ADCON;
+	return -ENOTSUP;
+#endif
+
+	ADC_CTL1(cfg->reg) |= ADC_CTL1_ADCON;
+
+	return adc_gd32_calibration(cfg);
 }
 
 static int adc_gd32_configure_sampt(const struct adc_gd32_config *cfg,
@@ -220,7 +299,8 @@ static int adc_gd32_configure_sampt(const struct adc_gd32_config *cfg,
 			}
 		}
 
-		if (ADC_ACQ_TIME_VALUE(acq_time) != acq_time_tbl[index]) {
+		if (index == ARRAY_SIZE(acq_time_tbl) ||
+		    ADC_ACQ_TIME_VALUE(acq_time) != acq_time_tbl[index]) {
 			return -ENOTSUP;
 		}
 	}
@@ -248,7 +328,12 @@ static int adc_gd32_channel_setup(const struct device *dev,
 		return -ENOTSUP;
 	}
 
-	if (chan_cfg->reference != ADC_REF_INTERNAL) {
+	/*
+	 * GD32 ADC conversions are referenced to VREF+/VDDA and the reference is not
+	 * selectable in hardware. Keep supporting ADC_REF_INTERNAL for backwards compatibility.
+	 */
+	if (chan_cfg->reference != ADC_REF_INTERNAL &&
+	    chan_cfg->reference != ADC_REF_VDD_1) {
 		LOG_ERR("Reference is not valid");
 		return -ENOTSUP;
 	}
@@ -259,8 +344,17 @@ static int adc_gd32_channel_setup(const struct device *dev,
 	}
 
 	if (chan_cfg->channel_id >= cfg->channels) {
+#if defined(ADC_SYNCCTL) && defined(ADC0)
+		if ((cfg->reg == ADC0) &&
+		    (chan_cfg->channel_id >= 16U) &&
+		    (chan_cfg->channel_id <= 18U)) {
+			/* Internal channels. */
+		} else
+#endif
+		{
 		LOG_ERR("Invalid channel (%u)", chan_cfg->channel_id);
 		return -EINVAL;
+		}
 	}
 
 	return adc_gd32_configure_sampt(cfg, chan_cfg->channel_id,
@@ -274,12 +368,61 @@ static int adc_gd32_start_read(const struct device *dev,
 	const struct adc_gd32_config *cfg = dev->config;
 	uint8_t resolution_id;
 	uint32_t index;
+	int ret;
+	size_t needed_buffer_size = sizeof(uint16_t);
+
+	if (sequence->options != NULL) {
+		needed_buffer_size *= (1U + sequence->options->extra_samplings);
+	}
+
+	if (sequence->buffer_size < needed_buffer_size) {
+		return -ENOMEM;
+	}
+
+	if (sequence->oversampling != 0U) {
+		return -ENOTSUP;
+	}
+
+	if (sequence->channels == 0U) {
+		return 0;
+	}
 
 	index = find_lsb_set(sequence->channels) - 1;
 	if (sequence->channels > BIT(index)) {
 		LOG_ERR("Only single channel supported");
 		return -ENOTSUP;
 	}
+
+	data->syncctl_enable_mask = 0U;
+
+#if defined(ADC_SYNCCTL) && defined(ADC0)
+	/*
+	 * On GD32F4xx ADC0 channels 16/17/18 are internally connected; ADC1/ADC2
+	 * see VSSA on these channels.
+	 */
+	if ((index >= 16U) && (cfg->reg != ADC0)) {
+		return -ENOTSUP;
+	}
+#endif
+
+#if defined(ADC_SYNCCTL_TSVREN)
+	if ((index == 16U) || (index == 17U)) {
+		data->syncctl_enable_mask |= ADC_SYNCCTL_TSVREN;
+	}
+#endif
+
+#if defined(ADC_SYNCCTL_VBATEN)
+	if (index == 18U) {
+		data->syncctl_enable_mask |= ADC_SYNCCTL_VBATEN;
+	}
+#endif
+
+	/* Force a single conversion in the regular group (RL=0 => 1 conversion). */
+	ADC_RSQ0(cfg->reg) &= ~ADC_RSQ0_RL;
+
+	/* Select channel as rank 0 in the regular group. */
+	ADC_RSQ2(cfg->reg) &= ~ADC_RSQX_RSQN;
+	ADC_RSQ2(cfg->reg) |= (uint32_t)index;
 
 	switch (sequence->resolution) {
 	case 12U:
@@ -298,28 +441,22 @@ static int adc_gd32_start_read(const struct device *dev,
 		return -EINVAL;
 	}
 
-#if defined(CONFIG_SOC_SERIES_GD32F4XX) || \
-	defined(CONFIG_SOC_SERIES_GD32F3X0) || \
-	defined(CONFIG_SOC_SERIES_GD32L23X)
-	ADC_CTL0(cfg->reg) &= ~ADC_CTL0_DRES;
-	ADC_CTL0(cfg->reg) |= CTL0_DRES(resolution_id);
-#elif defined(CONFIG_SOC_SERIES_GD32F403) || \
-	defined(CONFIG_SOC_SERIES_GD32A50X)
-	ADC_OVSAMPCTL(cfg->reg) &= ~ADC_OVSAMPCTL_DRES;
-	ADC_OVSAMPCTL(cfg->reg) |= OVSAMPCTL_DRES(resolution_id);
-#elif defined(CONFIG_SOC_SERIES_GD32VF103)
-	ADC_OVSCR(cfg->reg) &= ~ADC_OVSCR_DRES;
-	ADC_OVSCR(cfg->reg) |= OVSCR_DRES(resolution_id);
-#endif
-
-	if (sequence->calibrate) {
-		adc_gd32_calibration(cfg);
+	if (data->resolution != sequence->resolution) {
+		ret = adc_gd32_set_resolution(cfg, resolution_id);
+		if (ret < 0) {
+			return ret;
+		}
+		data->resolution = sequence->resolution;
 	}
 
-	/* Single conversion mode with regular group. */
-	ADC_RSQ2(cfg->reg) &= ~ADC_RSQX_RSQN;
-	ADC_RSQ2(cfg->reg) = index;
+	data->data_shift = 12U - data->resolution;
 
+	if (sequence->calibrate) {
+		ret = adc_gd32_calibration(cfg);
+		if (ret < 0) {
+			return ret;
+		}
+	}
 	data->buffer = sequence->buffer;
 
 	adc_context_start_read(&data->ctx, sequence);
@@ -356,13 +493,11 @@ static int adc_gd32_read_async(const struct device *dev,
 }
 #endif /* CONFIG_ADC_ASYNC */
 
-static DEVICE_API(adc, adc_gd32_driver_api) = {
-	.channel_setup = adc_gd32_channel_setup,
-	.read = adc_gd32_read,
 #ifdef CONFIG_ADC_ASYNC
-	.read_async = adc_gd32_read_async,
-#endif /* CONFIG_ADC_ASYNC */
-};
+#define ADC_GD32_API_ASYNC_FIELD .read_async = adc_gd32_read_async,
+#else
+#define ADC_GD32_API_ASYNC_FIELD
+#endif
 
 static int adc_gd32_init(const struct device *dev)
 {
@@ -407,7 +542,19 @@ static int adc_gd32_init(const struct device *dev)
 	/* Enable ADC */
 	ADC_CTL1(cfg->reg) |= ADC_CTL1_ADCON;
 
-	adc_gd32_calibration(cfg);
+	/* Default to a single regular conversion and right-aligned data. */
+	ADC_RSQ0(cfg->reg) &= ~ADC_RSQ0_RL;
+	ADC_CTL1(cfg->reg) &= ~ADC_CTL1_DAL;
+	ADC_CTL0(cfg->reg) &= ~ADC_CTL0_SM;
+
+	data->resolution = 12U;
+	data->data_shift = 0U;
+	data->syncctl_enable_mask = 0U;
+
+	ret = adc_gd32_calibration(cfg);
+	if (ret < 0) {
+		return ret;
+	}
 
 	cfg->irq_config_func();
 
@@ -488,6 +635,12 @@ static void adc_gd32_global_irq_cfg(void)
 		ADC_CONTEXT_INIT_LOCK(adc_gd32_data_##n, ctx),					\
 		ADC_CONTEXT_INIT_SYNC(adc_gd32_data_##n, ctx),					\
 	};											\
+	static DEVICE_API(adc, adc_gd32_driver_api_##n) = {					\
+		.channel_setup = adc_gd32_channel_setup,						\
+		.read = adc_gd32_read,								\
+		ADC_GD32_API_ASYNC_FIELD							\
+		.ref_internal = DT_INST_PROP(n, vref_mv),						\
+	};											\
 	const static struct adc_gd32_config adc_gd32_config_##n = {				\
 		.reg = DT_INST_REG_ADDR(n),							\
 		.clkid = DT_INST_CLOCKS_CELL(n, id),						\
@@ -502,6 +655,6 @@ static void adc_gd32_global_irq_cfg(void)
 			      adc_gd32_init, NULL,						\
 			      &adc_gd32_data_##n, &adc_gd32_config_##n,				\
 			      POST_KERNEL, CONFIG_ADC_INIT_PRIORITY,				\
-			      &adc_gd32_driver_api);						\
+			      &adc_gd32_driver_api_##n);						\
 
 DT_INST_FOREACH_STATUS_OKAY(ADC_GD32_INIT)

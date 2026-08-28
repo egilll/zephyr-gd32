@@ -19,3 +19,23 @@ properties:
 
   clocks:
     required: true
+
+  dmas:
+    type: phandle-array
+    required: false
+    description: |
+      Optional RX and TX DMA specifiers used by the asynchronous UART API.
+
+      Entries must be ordered as "rx", "tx" and match the gd32 DMA binding,
+      for example: <&dma1 2 4 0 0>, <&dma1 7 4 0 0>.
+
+  dma-names:
+    required: false
+    description: |
+      Required when dmas is present. Use "rx", "tx" to match the DMA entries.
+
+  gd,rx-dma-circular:
+    type: boolean
+    description: Enable circular DMA mode for RX. When set, the UART driver
+      programs RX DMA in circular mode and reports UART_RX_RDY at half and full
+      buffer boundaries.

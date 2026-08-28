@@ -11,9 +11,11 @@ toolchain:
   - zephyr
   - gnuarmemb
 supported:
-  - pwm
-  - gpio
   - counter
   - dma
+  - gpio
+  - pwm
   - spi
+  - usb_device
+  - usbd
 vendor: gd

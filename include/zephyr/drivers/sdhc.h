@@ -280,6 +280,8 @@ __subsystem struct sdhc_driver_api {
 	int (*request)(const struct device *dev,
 		       struct sdhc_command *cmd,
 		       struct sdhc_data *data);
+	/** @driver_ops_optional @copybrief sdhc_data_buf_is_compatible */
+	bool (*data_buf_is_compatible)(const struct device *dev, const void *buf, size_t len);
 	/** @driver_ops_mandatory @copybrief sdhc_set_io */
 	int (*set_io)(const struct device *dev, struct sdhc_io *ios);
 	/** @driver_ops_mandatory @copybrief sdhc_card_present */
@@ -300,6 +302,31 @@ __subsystem struct sdhc_driver_api {
 };
 
 /** @} */
+
+/**
+ * @brief Check whether an SDHC device can use a data buffer directly
+ *
+ * Host controllers that use DMA may restrict the memory ranges, alignment,
+ * or lengths they can access. Callers can use an incompatible buffer through
+ * an internal bounce buffer instead.
+ *
+ * @param dev SDHC device
+ * @param buf Data buffer pointer
+ * @param len Data length in bytes
+ * @retval true Buffer can be used directly
+ * @retval false Caller should use an internal buffer
+ */
+static inline bool sdhc_data_buf_is_compatible(const struct device *dev, const void *buf,
+					       size_t len)
+{
+	const struct sdhc_driver_api *api = DEVICE_API_GET(sdhc, dev);
+
+	if (api->data_buf_is_compatible == NULL) {
+		return true;
+	}
+
+	return api->data_buf_is_compatible(dev, buf, len);
+}
 
 /**
  * @brief reset SDHC controller state

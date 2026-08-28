@@ -1,0 +1,47 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: GigaDevice GD32 Ethernet MAC (ENET)
+
+compatible: "gd,gd32-ethernet"
+
+include:
+  - name: snps,dwmac.yaml
+  - name: pinctrl-device.yaml
+  - name: reset-device.yaml
+  - name: nvmem-consumer.yaml
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clocks:
+    required: true
+
+  clock-names:
+    required: true
+    description: |
+      Clock names, typically "mac", "tx", "rx" and optionally "ptp".
+
+  phy-connection-type:
+    required: true
+
+  phy-handle:
+    required: false
+    description: PHY phandle; if omitted, link is handled externally.
+
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true
+
+  zephyr,mac-address-prefix:
+    type: uint8-array
+    required: false
+    description: |
+      Optional OUI prefix used when the driver needs to generate a MAC address
+      (for example from a device-unique HW ID). This is typically 3 bytes.

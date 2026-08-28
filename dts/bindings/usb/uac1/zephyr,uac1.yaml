@@ -1,0 +1,29 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Audio Class 1 (ADC v1.0) instance
+
+compatible: "zephyr,uac1"
+
+# Child nodes of "zephyr,uac1" are expected to describe AudioControl entities
+# (Terminals and Units) followed by AudioStreaming interface nodes.
+#
+# Entity IDs are derived from the child index (+ 1), so applications should keep
+# entity ordering stable.
+
+properties:
+  full-speed:
+    type: boolean
+    description: |
+      True if this instance is allowed to operate at Full-Speed.
+
+  high-speed:
+    type: boolean
+    description: |
+      True if this instance is allowed to operate at High-Speed.
+
+  interrupt-endpoint:
+    type: boolean
+    description: |
+      Enable to support an optional interrupt IN endpoint on the AudioControl
+      interface to report status changes.

@@ -268,8 +268,8 @@ restart:
 		ret = zsock_poll(ctx.events, count + 1, -1);
 		if (ret < 0) {
 			ret = -errno;
-			NET_ERR("poll failed (%d)", ret);
-			goto out;
+			NET_ERR("poll failed (%d), rebuilding socket service", ret);
+			goto restart;
 		}
 
 		if (ret == 0) {

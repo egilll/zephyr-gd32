@@ -16,3 +16,14 @@ properties:
 
   pinctrl-0:
     required: true
+
+  dmas:
+    type: phandle-array
+    required: false
+    description: |
+      Optional RX and TX DMA specifiers used by the asynchronous UART API.
+
+  dma-names:
+    required: false
+    description: |
+      Required when dmas is present. Use "rx", "tx" to match the DMA entries.

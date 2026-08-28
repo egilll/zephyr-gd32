@@ -152,6 +152,35 @@ ZTEST(posix_fs_dir_test, test_fs_readdir_threadsafe)
 	zassert_true(test_lsdir(TEST_DIR, true) == TC_PASS);
 }
 
+ZTEST(posix_fs_dir_test, test_fs_readdir_long_name)
+{
+	static const char long_name[] = "12345678901234567890.txt";
+	char path[sizeof(TEST_DIR) + sizeof(long_name)];
+	struct dirent *entry;
+	DIR *dirp;
+	int fd;
+
+	if (strlen(long_name) < sizeof(entry->d_name)) {
+		ztest_test_skip();
+	}
+	zassert_ok(mkdir(TEST_DIR, S_IRWXG), "failed to create test directory");
+	snprintk(path, sizeof(path), "%s/%s", TEST_DIR, long_name);
+
+	fd = open(path, O_CREAT | O_RDWR, 0770);
+	zassert_true(fd >= 0, "failed to create long file name: %d", errno);
+	zassert_ok(close(fd), "failed to close long-name file");
+
+	dirp = opendir(TEST_DIR);
+	zassert_not_null(dirp, "failed to open test directory");
+	entry = readdir(dirp);
+	zassert_not_null(entry, "failed to read long-name entry");
+	zassert_equal(strlen(entry->d_name), sizeof(entry->d_name) - 1);
+	zassert_mem_equal(entry->d_name, long_name, sizeof(entry->d_name) - 1);
+
+	zassert_ok(closedir(dirp), "failed to close test directory");
+	zassert_ok(unlink(path), "failed to remove long-name file");
+}
+
 /**
  * @brief Test for POSIX rmdir API
  *

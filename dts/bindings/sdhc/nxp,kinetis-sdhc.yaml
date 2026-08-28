@@ -1,0 +1,46 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: NXP Kinetis SDHC controller
+
+compatible: "nxp,kinetis-sdhc"
+
+include: [sdhc.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clocks:
+    required: true
+
+  bus-width:
+    type: int
+    default: 4
+    enum:
+      - 1
+      - 4
+      - 8
+    description: |
+      Maximum bus width supported by the board wiring.
+
+  cd-gpios:
+    type: phandle-array
+    required: false
+    description: Optional external card-detect GPIO
+
+  pwr-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO controlling power to the external SD card slot. When
+      present, the driver uses it to honor SDHC power mode transitions.
+
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true

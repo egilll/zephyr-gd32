@@ -1,0 +1,47 @@
+# Copyright (c) 2026, Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config SDHC_GD32
+	bool "GD32 SDIO SDHC driver"
+	default y
+	depends on DT_HAS_GD_GD32_SDHC_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	select USE_GD32_SDIO
+	select USE_GD32_DMA
+	select DMA
+	select MEM_ATTR
+	select PINCTRL
+	help
+	  Enables the GD32 SDIO-based SDHC driver (DMA-only data transfers).
+
+if SDHC_GD32
+
+config SDHC_BUFFER_ALIGNMENT
+	default 4
+
+config SD_BUFFER_SIZE
+	int
+	default 512
+
+config SDHC_GD32_VERBOSE_DATA_ERRORS
+	bool "Verbose LOG_ERR + hw-state dump on data-path failures"
+	default n
+	help
+	  Enable rich LOG_ERR + dump_hw_state diagnostics in
+	  gd32_sdhc_wait_data_done when an SDIO/DMA transfer fails.
+	  The function still returns -ETIMEDOUT / -EIO / -ENODEV to the
+	  caller in either case; this only controls in-driver logging.
+
+	  Off by default because each LOG_ERR site (7-8 args) inflates
+	  cbprintf scratch into the inlined gd32_sdhc_request frame and
+	  pushes the SDHC tail above 700 B on the caller's stack. Turn
+	  on only when diagnosing data-path failures.
+
+config SDHC_GD32_TEST
+	bool "GD32 SDHC test fault injection"
+	depends on ZTEST
+	help
+	  Enables test-only fault injection used by the GD32 SDHC hardware
+	  regression application. This option adds no production state or code.
+
+endif # SDHC_GD32

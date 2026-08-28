@@ -20,8 +20,35 @@ properties:
   clocks:
     required: true
 
+  scl-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO used for I2C bus recovery. When provided together with
+      sda-gpios, the driver can toggle SCL to recover a wedged bus.
+
+  sda-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO used for I2C bus recovery. When provided together with
+      scl-gpios, the driver can monitor SDA while toggling SCL.
+
   pinctrl-0:
     required: true
 
   pinctrl-names:
     required: true
+
+  dmas:
+    type: phandle-array
+    required: false
+    description: |
+      Optional RX and TX DMA specifiers used for controller mode transfers.
+
+      Entries must be ordered as "rx", "tx" and match the gd32 DMA binding.
+
+  dma-names:
+    required: false
+    description: |
+      Required when dmas is present. Use "rx", "tx" to match the DMA entries.

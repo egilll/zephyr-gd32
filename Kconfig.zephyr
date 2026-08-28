@@ -532,9 +532,10 @@ config LTO
 	bool "Link Time Optimization"
 	depends on !(GEN_ISR_TABLES || GEN_IRQ_VECTOR_TABLE) || ISR_TABLES_LOCAL_DECLARATION
 	depends on !NATIVE_LIBRARY
-	depends on !CODE_DATA_RELOCATION
 	help
-	  This option enables Link Time Optimization.
+	  This option enables Link Time Optimization. Translation units selected
+	  for code and data relocation are compiled without LTO so their input
+	  sections remain available to the relocation linker script.
 
 config LTO_SINGLE_THREADED
 	bool "Single-threaded LTO"

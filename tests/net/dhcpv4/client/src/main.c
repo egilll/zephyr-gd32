@@ -313,25 +313,46 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define DISCOVER		1
 #define REQUEST			3
 #define OPTION_DNS_SERVER	6
+#define OPTION_SUBNET_MASK	1
+#define OPTION_ROUTER		3
+#define OPTION_NTP_SERVER	42
 #define OPTION_REQ_IPADDR	50
+#define OPTION_LEASE_TIME	51
+#define OPTION_OVERLOAD		52
 #define OPTION_SERVER_ID	54
 #define OPTION_REQ_LIST		55
+#define OPTION_RENEWAL		58
+#define OPTION_REBINDING	59
+#define OPTION_CLIENT_ID	61
 #define OPTION_DOMAIN		15
 #define OPTION_POP3		70
+#define OPTION_MAX_MSG_SIZE	57
 #define OPTION_VENDOR_STRING	1
 #define OPTION_VENDOR_BYTE	2
 #define OPTION_VENDOR_EMPTY	3
 #define OPTION_INVALID		254
 
 #define MAX_REQ_OPTIONS 16
+#define DHCP_BOOT_HEADER_SIZE 44
+
+enum dhcp_reply_mode {
+	DHCP_REPLY_STANDARD,
+	DHCP_REPLY_OVERLOADED,
+	DHCP_REPLY_EMPTY_ADDRESS_OPTIONS,
+};
 
 struct dhcp_client_msg {
 	uint32_t xid;
+	uint16_t secs;
 	uint8_t type;
 	bool has_requested_ip;
 	bool has_server_id;
+	bool has_max_msg_size;
+	uint16_t max_msg_size;
 	uint8_t req_options[MAX_REQ_OPTIONS];
 	uint8_t req_options_cnt;
+	uint8_t client_id[NET_LINK_ADDR_MAX_LENGTH + 1];
+	uint8_t client_id_len;
 };
 
 static uint32_t offer_xid;
@@ -342,6 +363,9 @@ static uint32_t request_xid;
 static int discovers_to_drop;
 static int discovers_seen;
 static uint32_t discover_xids[4];
+static uint16_t discover_secs[4];
+static bool request_secs_mismatch;
+static bool max_msg_size_invalid;
 static bool strict_dhcp_server;
 static bool discover_req_included_dns;
 static bool init_reboot_req_included_dns;
@@ -349,6 +373,9 @@ static bool init_reboot_request_seen;
 static bool reject_init_reboot;
 static bool drop_init_reboot;
 static uint8_t init_reboot_request_count;
+static enum dhcp_reply_mode reply_mode;
+static bool discover_client_id_valid;
+static bool request_client_id_valid;
 
 #define EVT_ADDR_ADD        BIT(0)
 #define EVT_ADDR_DEL        BIT(1)
@@ -382,6 +409,9 @@ static void dhcp_test_reset_iface(struct net_if *iface)
 	discovers_to_drop = 0;
 	discovers_seen = 0;
 	memset(discover_xids, 0, sizeof(discover_xids));
+	memset(discover_secs, 0, sizeof(discover_secs));
+	request_secs_mismatch = false;
+	max_msg_size_invalid = false;
 	strict_dhcp_server = false;
 	discover_req_included_dns = false;
 	init_reboot_req_included_dns = false;
@@ -389,6 +419,17 @@ static void dhcp_test_reset_iface(struct net_if *iface)
 	reject_init_reboot = false;
 	drop_init_reboot = false;
 	init_reboot_request_count = 0U;
+	reply_mode = DHCP_REPLY_STANDARD;
+	discover_client_id_valid = false;
+	request_client_id_valid = false;
+}
+
+static bool dhcp_client_id_is_valid(struct net_if *iface, const struct dhcp_client_msg *msg)
+{
+	const struct net_linkaddr *lladdr = net_if_get_link_addr(iface);
+
+	return msg->client_id_len == lladdr->len + 1U && msg->client_id[0] == 1U &&
+	       memcmp(&msg->client_id[1], lladdr->addr, lladdr->len) == 0;
 }
 
 static void dhcpv4_tests_before(void *fixture)
@@ -527,6 +568,114 @@ fail:
 	return NULL;
 }
 
+static bool write_empty_address_option(struct net_pkt *pkt, uint8_t type,
+				       const uint8_t *data, uint8_t len)
+{
+	return net_pkt_write_u8(pkt, type) == 0 && net_pkt_write_u8(pkt, len) == 0 &&
+	       (len == 0U || net_pkt_write(pkt, data, len) == 0);
+}
+
+static bool write_overload_option(struct net_pkt *pkt, uint8_t type, const uint8_t *data,
+				  uint8_t len)
+{
+	return net_pkt_write_u8(pkt, type) == 0 && net_pkt_write_u8(pkt, len) == 0 &&
+	       (len == 0U || net_pkt_write(pkt, data, len) == 0);
+}
+
+static struct net_pkt *prepare_dhcp_overloaded_reply(struct net_if *iface, uint32_t xid,
+					     const unsigned char *template, uint8_t msg_type)
+{
+	static const uint8_t subnet_mask[] = {255, 255, 255, 0};
+	static const uint8_t renewal_time[] = {0x00, 0x00, 0x54, 0x60};
+	static const uint8_t rebinding_time[] = {0x00, 0x00, 0x93, 0xa8};
+	static const uint8_t lease_time[] = {0x00, 0x00, 0xa8, 0xc0};
+	static const uint8_t server_id[] = {10, 184, 9, 1};
+	static const uint8_t dns_servers[] = {10, 248, 2, 1, 163, 33, 253, 68, 10, 184, 9, 1};
+	uint8_t overload = BIT(0) | BIT(1);
+	uint8_t sname[64] = {OPTION_POP3, 4, 198, 51, 100, 16, 255};
+	uint8_t file[128] = {OPTION_ROUTER, 4, 10, 237, 72, 1, 255};
+	struct net_pkt *pkt;
+
+	pkt = net_pkt_alloc_with_buffer(iface, MAX(sizeof(offer), sizeof(ack)), NET_AF_INET,
+					NET_IPPROTO_UDP, K_FOREVER);
+	if (pkt == NULL) {
+		return NULL;
+	}
+
+	net_pkt_set_ipv4_ttl(pkt, 0xFF);
+	if (net_ipv4_create(pkt, &server_addr, &client_addr) ||
+	    net_udp_create(pkt, net_htons(SERVER_PORT), net_htons(CLIENT_PORT)) ||
+	    net_pkt_write(pkt, template, 4) || net_pkt_write_be32(pkt, xid) ||
+	    net_pkt_write(pkt, template + 8, DHCP_BOOT_HEADER_SIZE - 8) ||
+	    net_pkt_write(pkt, sname, sizeof(sname)) || net_pkt_write(pkt, file, sizeof(file)) ||
+	    net_pkt_write(pkt, "\x63\x82\x53\x63", 4) ||
+	    !write_overload_option(pkt, MSG_TYPE, &msg_type, 1) ||
+	    !write_overload_option(pkt, OPTION_RENEWAL, renewal_time, sizeof(renewal_time)) ||
+	    !write_overload_option(pkt, OPTION_REBINDING, rebinding_time,
+				   sizeof(rebinding_time)) ||
+	    !write_overload_option(pkt, OPTION_LEASE_TIME, lease_time, sizeof(lease_time)) ||
+	    !write_overload_option(pkt, OPTION_SERVER_ID, server_id, sizeof(server_id)) ||
+	    !write_overload_option(pkt, OPTION_SUBNET_MASK, subnet_mask, sizeof(subnet_mask)) ||
+	    !write_overload_option(pkt, OPTION_DNS_SERVER, dns_servers, sizeof(dns_servers)) ||
+	    !write_overload_option(pkt, OPTION_OVERLOAD, &overload, 1) ||
+	    net_pkt_write_u8(pkt, 255)) {
+		net_pkt_unref(pkt);
+		return NULL;
+	}
+
+	net_pkt_cursor_init(pkt);
+	net_ipv4_finalize(pkt, NET_IPPROTO_UDP);
+
+	return pkt;
+}
+
+static struct net_pkt *prepare_dhcp_empty_router_reply(struct net_if *iface, uint32_t xid,
+					       const unsigned char *template, uint8_t msg_type)
+{
+	static const uint8_t subnet_mask[] = {255, 255, 255, 0};
+	static const uint8_t renewal_time[] = {0x00, 0x00, 0x54, 0x60};
+	static const uint8_t rebinding_time[] = {0x00, 0x00, 0x93, 0xa8};
+	static const uint8_t lease_time[] = {0x00, 0x00, 0xa8, 0xc0};
+	static const uint8_t server_id[] = {10, 184, 9, 1};
+	static const uint8_t dns_servers[] = {10, 248, 2, 1, 163, 33, 253, 68, 10, 184, 9, 1};
+	struct net_pkt *pkt;
+
+	pkt = net_pkt_alloc_with_buffer(iface, MAX(sizeof(offer), sizeof(ack)), NET_AF_INET,
+					NET_IPPROTO_UDP, K_FOREVER);
+	if (pkt == NULL) {
+		return NULL;
+	}
+
+	net_pkt_set_ipv4_ttl(pkt, 0xFF);
+	if (net_ipv4_create(pkt, &server_addr, &client_addr) ||
+	    net_udp_create(pkt, net_htons(SERVER_PORT), net_htons(CLIENT_PORT)) ||
+	    net_pkt_write(pkt, template, 4) || net_pkt_write_be32(pkt, xid) ||
+	    net_pkt_write(pkt, template + 8, DHCP_BOOT_HEADER_SIZE - 8) ||
+	    net_pkt_write(pkt, template + DHCP_BOOT_HEADER_SIZE, 64 + 128) ||
+	    net_pkt_write(pkt, "\x63\x82\x53\x63", 4) ||
+	    !write_empty_address_option(pkt, MSG_TYPE, &msg_type, 1) ||
+	    !write_empty_address_option(pkt, OPTION_RENEWAL, renewal_time, sizeof(renewal_time)) ||
+	    !write_empty_address_option(pkt, OPTION_REBINDING, rebinding_time,
+					sizeof(rebinding_time)) ||
+	    !write_empty_address_option(pkt, OPTION_LEASE_TIME, lease_time, sizeof(lease_time)) ||
+	    !write_empty_address_option(pkt, OPTION_SERVER_ID, server_id, sizeof(server_id)) ||
+	    !write_empty_address_option(pkt, OPTION_SUBNET_MASK, subnet_mask,
+					sizeof(subnet_mask)) ||
+	    !write_empty_address_option(pkt, OPTION_ROUTER, NULL, 0) ||
+	    !write_empty_address_option(pkt, OPTION_DNS_SERVER, dns_servers,
+					sizeof(dns_servers)) ||
+	    !write_empty_address_option(pkt, OPTION_NTP_SERVER, NULL, 0) ||
+	    net_pkt_write_u8(pkt, 255)) {
+		net_pkt_unref(pkt);
+		return NULL;
+	}
+
+	net_pkt_cursor_init(pkt);
+	net_ipv4_finalize(pkt, NET_IPPROTO_UDP);
+
+	return pkt;
+}
+
 static struct net_pkt *prepare_dhcp_nak(struct net_if *iface, uint32_t xid)
 {
 	static const uint8_t cookie[] = { 0x63, 0x82, 0x53, 0x63 };
@@ -597,8 +746,11 @@ static int parse_dhcp_client_message(struct net_pkt *pkt, struct dhcp_client_msg
 	if (net_pkt_read_be32(pkt, &msg->xid)) {
 		return -EINVAL;
 	}
+	if (net_pkt_read_be16(pkt, &msg->secs)) {
+		return -EINVAL;
+	}
 
-	if (net_pkt_skip(pkt, 36 + 64 + 128 + 4)) {
+	if (net_pkt_skip(pkt, 34 + 64 + 128 + 4)) {
 		return -EINVAL;
 	}
 
@@ -655,6 +807,25 @@ static int parse_dhcp_client_message(struct net_pkt *pkt, struct dhcp_client_msg
 			continue;
 		}
 
+		if (opt == OPTION_CLIENT_ID) {
+			msg->client_id_len = MIN(len, sizeof(msg->client_id));
+			if (net_pkt_read(pkt, msg->client_id, msg->client_id_len) ||
+			    net_pkt_skip(pkt, len - msg->client_id_len)) {
+				return -EINVAL;
+			}
+			continue;
+		}
+
+		if (opt == OPTION_MAX_MSG_SIZE) {
+			if (len != sizeof(msg->max_msg_size) ||
+			    net_pkt_read_be16(pkt, &msg->max_msg_size)) {
+				return -EINVAL;
+			}
+
+			msg->has_max_msg_size = true;
+			continue;
+		}
+
 		if (opt == OPTION_REQ_IPADDR && len == 4U) {
 			msg->has_requested_ip = true;
 		} else if (opt == OPTION_SERVER_ID && len == 4U) {
@@ -690,7 +861,18 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 		return -EINVAL;
 	}
 
+	if ((msg.type == DISCOVER || msg.type == REQUEST) &&
+	    (!msg.has_max_msg_size ||
+	     msg.max_msg_size !=
+		     MAX(net_if_get_mtu(net_pkt_iface(pkt)) > NET_IPV4UDPH_LEN
+			     ? net_if_get_mtu(net_pkt_iface(pkt)) - NET_IPV4UDPH_LEN
+			     : 0U,
+			 576U))) {
+		max_msg_size_invalid = true;
+	}
+
 	if (msg.type == DISCOVER) {
+		discover_client_id_valid = dhcp_client_id_is_valid(net_pkt_iface(pkt), &msg);
 		if (strict_dhcp_server) {
 			discover_req_included_dns =
 				dhcp_msg_req_list_contains(&msg, OPTION_DNS_SERVER);
@@ -698,6 +880,7 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 
 		if (discovers_seen < ARRAY_SIZE(discover_xids)) {
 			discover_xids[discovers_seen] = msg.xid;
+			discover_secs[discovers_seen] = msg.secs;
 		}
 		discovers_seen++;
 
@@ -709,7 +892,15 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 		}
 
 		/* Reply with DHCPv4 offer message */
-		rpkt = prepare_dhcp_offer(net_pkt_iface(pkt), msg.xid);
+		if (reply_mode == DHCP_REPLY_OVERLOADED) {
+			rpkt = prepare_dhcp_overloaded_reply(net_pkt_iface(pkt), msg.xid, offer,
+						     NET_DHCPV4_MSG_TYPE_OFFER);
+		} else if (reply_mode == DHCP_REPLY_EMPTY_ADDRESS_OPTIONS) {
+			rpkt = prepare_dhcp_empty_router_reply(net_pkt_iface(pkt), msg.xid, offer,
+						       NET_DHCPV4_MSG_TYPE_OFFER);
+		} else {
+			rpkt = prepare_dhcp_offer(net_pkt_iface(pkt), msg.xid);
+		}
 		if (!rpkt) {
 			return -EINVAL;
 		}
@@ -718,8 +909,14 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 		bool include_dns;
 		bool nak_reply;
 
+		request_client_id_valid = dhcp_client_id_is_valid(net_pkt_iface(pkt), &msg);
+
 		dns_requested = dhcp_msg_req_list_contains(&msg, OPTION_DNS_SERVER);
 		is_init_reboot = msg.has_requested_ip && !msg.has_server_id;
+		if (!is_init_reboot && msg.has_server_id && discovers_seen > 0 &&
+		    msg.secs != discover_secs[MIN(discovers_seen, ARRAY_SIZE(discover_secs)) - 1]) {
+			request_secs_mismatch = true;
+		}
 		init_reboot_request_seen |= is_init_reboot;
 		if (is_init_reboot) {
 			init_reboot_request_count++;
@@ -745,6 +942,12 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 
 		if (nak_reply) {
 			rpkt = prepare_dhcp_nak(net_pkt_iface(pkt), msg.xid);
+		} else if (reply_mode == DHCP_REPLY_OVERLOADED) {
+			rpkt = prepare_dhcp_overloaded_reply(net_pkt_iface(pkt), msg.xid, ack,
+						     NET_DHCPV4_MSG_TYPE_ACK);
+		} else if (reply_mode == DHCP_REPLY_EMPTY_ADDRESS_OPTIONS) {
+			rpkt = prepare_dhcp_empty_router_reply(net_pkt_iface(pkt), msg.xid, ack,
+						       NET_DHCPV4_MSG_TYPE_ACK);
 		} else {
 			rpkt = prepare_dhcp_ack(net_pkt_iface(pkt), msg.xid, include_dns);
 		}
@@ -1070,6 +1273,10 @@ ZTEST(dhcpv4_tests, test_dhcp)
 				      "Offer/Request xid mismatch, "
 				      "Offer 0x%08x, Request 0x%08x",
 				      offer_xid, request_xid);
+			zassert_false(request_secs_mismatch,
+				      "Request did not retain its discover's secs value");
+			zassert_false(max_msg_size_invalid,
+				      "Discover or request had an invalid maximum message size");
 		} else {
 			/* An init-reboot was done */
 			evt = k_event_wait(&events, EVT_DHCP_OFFER | EVT_DHCP_ACK, false,
@@ -1093,6 +1300,89 @@ ZTEST(dhcpv4_tests, test_dhcp)
 			      EVT_DNS_SERVER3_DEL,
 			      "Missing DHCP stop or deleted address");
 	}
+}
+
+ZTEST(dhcpv4_tests, test_overloaded_reply_options)
+{
+	const struct net_in_addr expected_gw = {{{10, 237, 72, 1}}};
+	struct net_if *iface;
+	uint32_t evt;
+
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+	reply_mode = DHCP_REPLY_OVERLOADED;
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Missing DHCP bound");
+	evt = k_event_wait_all(&events, EVT_DHCP_OFFER | EVT_DHCP_ACK, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_OFFER | EVT_DHCP_ACK, "Missing offer or ACK");
+	zassert_equal(net_if_ipv4_get_gw(iface).s_addr, expected_gw.s_addr,
+		      "Gateway from overloaded file field not applied");
+
+	net_dhcpv4_stop(iface);
+}
+
+ZTEST(dhcpv4_tests, test_empty_router_option)
+{
+	const struct net_in_addr any = NET_INADDR_ANY_INIT;
+	struct net_if *iface;
+	uint32_t evt;
+
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+	net_if_ipv4_set_gw(iface, &any);
+	reply_mode = DHCP_REPLY_EMPTY_ADDRESS_OPTIONS;
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Empty router option discarded the lease");
+	zassert_equal(net_if_ipv4_get_gw(iface).s_addr, any.s_addr,
+		      "Empty router option installed a gateway");
+
+	net_dhcpv4_stop(iface);
+}
+
+ZTEST(dhcpv4_tests, test_empty_ntp_server_option)
+{
+#ifdef CONFIG_NET_DHCPV4_OPTION_NTP_SERVER
+	const struct net_in_addr previous_ntp = {{{192, 0, 2, 123}}};
+	struct net_if *iface;
+	uint32_t evt;
+
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+	iface->config.dhcpv4.ntp_addr = previous_ntp;
+	reply_mode = DHCP_REPLY_EMPTY_ADDRESS_OPTIONS;
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Empty NTP option discarded the lease");
+	zassert_equal(iface->config.dhcpv4.ntp_addr.s_addr, previous_ntp.s_addr,
+		      "Empty NTP option replaced the saved server");
+
+	net_dhcpv4_stop(iface);
+#else
+	ztest_test_skip();
+#endif
+}
+
+ZTEST(dhcpv4_tests, test_client_identifier)
+{
+	struct net_if *iface;
+	uint32_t evt;
+
+	Z_TEST_SKIP_IFNDEF(CONFIG_NET_DHCPV4_CLIENT_IDENTIFIER);
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Missing DHCP bound");
+	zassert_true(discover_client_id_valid, "DISCOVER client identifier is invalid");
+	zassert_true(request_client_id_valid, "REQUEST client identifier is invalid");
+
+	net_dhcpv4_stop(iface);
 }
 
 ZTEST(dhcpv4_tests, test_init_reboot_hint)
@@ -1311,12 +1601,16 @@ ZTEST(dhcpv4_tests, test_discover_retransmission_keeps_xid)
 		     discovers_seen);
 
 	zassert_not_equal(discover_xids[0], 0U, "Transaction identifier is zero");
+	zassert_equal(discover_secs[0], 0U, "Initial discover secs is not zero");
 
 	for (int i = 1; i < MIN(discovers_seen, ARRAY_SIZE(discover_xids)); i++) {
 		zassert_equal(discover_xids[i], discover_xids[0],
 			      "Discover %d carries xid 0x%08x, the first carried "
 			      "0x%08x; a retransmission is the same transaction",
 			      i, discover_xids[i], discover_xids[0]);
+		zassert_true(discover_secs[i] > discover_secs[i - 1],
+			     "Discover %d secs did not advance (%u after %u)", i,
+			     discover_secs[i], discover_secs[i - 1]);
 	}
 }
 

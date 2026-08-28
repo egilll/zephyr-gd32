@@ -1,0 +1,104 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&pinctrl {
+	spi3_default_alt: spi3_default_alt {
+		group1 {
+			pinmux = <GD32_PINMUX_AF('E', 2, AF5)>,
+				 <GD32_PINMUX_AF('E', 5, AF5)>,
+				 <GD32_PINMUX_AF('E', 6, AF5)>;
+			slew-rate = "max-speed-50mhz";
+		};
+	};
+
+	spi4_default_alt: spi4_default_alt {
+		group1 {
+			pinmux = <GD32_PINMUX_AF('F', 6, AF5)>,
+				 <GD32_PINMUX_AF('F', 7, AF5)>,
+				 <GD32_PINMUX_AF('F', 8, AF5)>,
+				 <GD32_PINMUX_AF('F', 9, AF5)>;
+			slew-rate = "max-speed-50mhz";
+		};
+	};
+};
+
+&dac {
+	status = "disabled";
+};
+
+&usbfs {
+	status = "disabled";
+};
+
+&usbhs {
+	status = "disabled";
+};
+
+&gpioe {
+	status = "okay";
+};
+
+&gpiof {
+	status = "okay";
+};
+
+&usart0 {
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+};
+
+&i2c0 {
+	status = "disabled";
+};
+
+&i2s1 {
+	status = "disabled";
+};
+
+&mdio {
+	status = "disabled";
+};
+
+&enet {
+	status = "disabled";
+};
+
+&sdio {
+	status = "disabled";
+};
+
+&timer1 {
+	status = "disabled";
+};
+
+&timer4 {
+	status = "okay";
+	prescaler = <199>;
+};
+
+&spi5 {
+	status = "disabled";
+};
+
+&spi3 {
+	status = "okay";
+	pinctrl-0 = <&spi3_default_alt>;
+	pinctrl-names = "default";
+	cs-gpios = <&gpioe 4 GPIO_ACTIVE_LOW>;
+
+	dut_spi_dt: test-spi-dev@0 {
+		compatible = "vnd,spi-device";
+		reg = <0>;
+		spi-max-frequency = <100000>;
+		spi-cs-setup-delay-ns = <50000>;
+		spi-cs-hold-delay-ns = <50000>;
+	};
+};
+
+dut_spis: &spi4 {
+	status = "okay";
+	pinctrl-0 = <&spi4_default_alt>;
+	pinctrl-names = "default";
+};

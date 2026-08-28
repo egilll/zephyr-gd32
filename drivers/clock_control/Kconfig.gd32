@@ -2,8 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config CLOCK_CONTROL_GD32
-	bool "GD32 clock control"
+    bool "GD32 clock control"
+    default y
+    depends on DT_HAS_GD_GD32_CCTL_ENABLED
+    help
+      Enable driver for Gigadevice Reset Clock Unit (RCU).
+
+config CLOCK_GD32_CKOUT
+	bool
 	default y
-	depends on DT_HAS_GD_GD32_CCTL_ENABLED
+	depends on DT_HAS_GD_GD32_CKOUT_ENABLED
+	select PINCTRL
 	help
-	  Enable driver for Gigadevice Reset Clock Unit (RCU).
+	  Enable configuration of the GD32 microcontroller clock outputs.

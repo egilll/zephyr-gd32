@@ -11,6 +11,9 @@ This application will wait mDNS queries for a pre-defined hostname and
 respond to them. The default hostname is **zephyr** and it is set in the
 :file:`prj.conf` file.
 
+See :ref:`mdns_responder_interface` for the responder's supported record and
+query types, configuration, and current protocol limitations.
+
 Requirements
 ************
 

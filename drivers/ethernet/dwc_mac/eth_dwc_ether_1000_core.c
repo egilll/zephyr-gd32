@@ -305,18 +305,22 @@ static void dwmac_receive(const struct device *dev)
 
 		sys_cache_data_invd_range(frag->data, frag->size);
 
-		bytes_so_far = RX_LEN_FROM_RDES0(des0);
+		if ((des0 & RDES0_LS) != 0U) {
+			bytes_so_far = RX_LEN_FROM_RDES0(des0);
+			if (bytes_so_far < p->rx_bytes) {
+				eth_stats_update_errors_rx(p->iface);
+				net_pkt_unref(p->rx_pkt);
+				p->rx_pkt = NULL;
+				net_pkt_frag_unref(frag);
+				continue;
+			}
 
-		if (bytes_so_far < p->rx_bytes) {
-			eth_stats_update_errors_rx(p->iface);
-			net_pkt_unref(p->rx_pkt);
-			p->rx_pkt = NULL;
-			net_pkt_frag_unref(frag);
-			continue;
+			frag->len = bytes_so_far - p->rx_bytes;
+			p->rx_bytes = bytes_so_far;
+		} else {
+			frag->len = frag->size;
+			p->rx_bytes += frag->len;
 		}
-
-		frag->len = bytes_so_far - p->rx_bytes;
-		p->rx_bytes = bytes_so_far;
 		net_pkt_frag_add(p->rx_pkt, frag);
 
 		if ((des0 & RDES0_LS) != 0U) {
@@ -350,7 +354,7 @@ static void dwmac_rx_refill_desc(const struct device *dev, struct net_buf *frag)
 {
 	struct dwmac_priv *p = dev->data;
 	struct dwmac_dma_desc *d;
-	unsigned int d_idx;
+	unsigned int d_idx, next_d_idx;
 
 	d_idx = p->rx_desc_head;
 	p->rx_frags[d_idx] = frag;
@@ -360,10 +364,10 @@ static void dwmac_rx_refill_desc(const struct device *dev, struct net_buf *frag)
 
 	d->des1 = FIELD_PREP(RDES1_RBS1, frag->size);
 
-	if (d_idx == NB_RX_DESCS - 1) {
-		d->des1 |= RDES1_RER;
-	}
+	next_d_idx = (d_idx + 1U) % NB_RX_DESCS;
+	d->des1 |= RDES1_RCH;
 	d->des2 = phys_lo32(frag->data);
+	d->des3 = RXDESC_PHYS_L(next_d_idx);
 
 	barrier_dmem_fence_full();
 
@@ -517,6 +521,11 @@ static void dwmac_iface_init(struct net_if *iface)
 	k_sem_init(&p->free_tx_descs, NB_TX_DESCS - 1, NB_TX_DESCS - 1);
 	k_sem_init(&p->free_rx_descs, NB_RX_DESCS - 1, NB_RX_DESCS - 1);
 	k_fifo_init(&p->tx_queue);
+
+	for (unsigned int i = 0; i < NB_RX_DESCS - 1; i++) {
+		(void)k_sem_take(&p->free_rx_descs, K_NO_WAIT);
+		dwmac_rx_refill(dev);
+	}
 
 	net_if_set_link_addr(iface, p->mac_addr, sizeof(p->mac_addr), NET_LINK_ETHERNET);
 	dwmac_set_mac_addr(dev, p->mac_addr);

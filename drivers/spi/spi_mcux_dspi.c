@@ -521,16 +521,7 @@ static void dma_callback(const struct device *dma_dev, void *callback_arg,
 		if (config->is_dma_chn_shared) {
 			data->transfer_len = data->frame_size >> 3;
 		} else {
-			if (data->ctx.tx_len == 0) {
-				data->transfer_len = data->ctx.rx_len;
-			} else if (data->ctx.rx_len == 0) {
-				data->transfer_len = data->ctx.tx_len;
-			} else {
-				data->transfer_len =
-					data->ctx.tx_len > data->ctx.rx_len ?
-						data->ctx.rx_len :
-						data->ctx.tx_len;
-			}
+			data->transfer_len = spi_context_max_continuous_chunk(&data->ctx);
 		}
 		update_tx_dma(dev);
 		update_rx_dma(dev);
@@ -712,9 +703,7 @@ static int transceive(const struct device *dev,
 	if (config->is_dma_chn_shared) {
 		data->transfer_len = data->frame_size >> 3;
 	} else {
-		data->transfer_len = data->ctx.tx_len > data->ctx.rx_len ?
-					     data->ctx.rx_len :
-					     data->ctx.tx_len;
+		data->transfer_len = spi_context_max_continuous_chunk(&data->ctx);
 	}
 	data->tx_transfer_count = 0;
 	data->rx_transfer_count = 0;

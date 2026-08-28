@@ -9,6 +9,24 @@
 #include <zephyr/drivers/i2s.h>
 #include "i2s_api_test.h"
 
+ZTEST_USER(i2s_states, test_i2s_timing)
+{
+	struct i2s_timing timing;
+	int ret;
+
+	ret = i2s_timing_get(dev_i2s_tx, I2S_DIR_TX, &timing);
+	if (ret == -ENOSYS) {
+		return;
+	}
+
+	zassert_ok(ret);
+	zassert_not_equal(timing.frame_rate_num, 0U);
+	zassert_not_equal(timing.frame_rate_den, 0U);
+	zassert_not_equal(timing.timestamp_frequency, 0U);
+	zassert_equal(timing.frame_count, 0U);
+	zassert_equal(timing.timestamp_cycles, 0U);
+}
+
 /** @brief Verify all failure cases in NOT_READY state.
  *
  * - Sending START, DRAIN, STOP, DROP, PREPARE trigger in NOT_READY state

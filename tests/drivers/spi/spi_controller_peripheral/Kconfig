@@ -16,6 +16,19 @@ config TEST_INCORRECT_SCK_STATE
 	help
 	  Setting this option will set SCK to the opposite state than CPOL just before transceive.
 
+config TESTED_SPI_WORD_SIZE
+	int "SPI word size"
+	default 8
+	range 8 16
+	help
+		SPI word size used in the test.
+
+config TESTED_SPI_TI_MODE
+	bool "Use TI frame format"
+	default n
+	help
+		Enable TI frame format for the test.
+
 config PREALLOC_BUFFERS
 	bool "Preallocate buffers"
 	default y

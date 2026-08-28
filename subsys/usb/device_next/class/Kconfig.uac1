@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Ylhyra ehf.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config USBD_AUDIO1_CLASS
+	bool "USB Audio 1 class support"
+	select UDC_ENABLE_SOF
+	help
+	  USB Audio 1 device class support.
+
+if USBD_AUDIO1_CLASS
+
+module = USBD_UAC1
+module-str = usbd uac1
+source "subsys/logging/Kconfig.template.log_config"
+
+endif

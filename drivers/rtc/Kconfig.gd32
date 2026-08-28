@@ -1,0 +1,14 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config RTC_GD32
+	bool "GD32 RTC driver"
+	depends on DT_HAS_GD_GD32_RTC_ENABLED
+	default y
+	select USE_GD32_RTC
+	select USE_GD32_PMU
+	select USE_GD32_RCU
+	select USE_GD32_EXTI if RTC_ALARM || RTC_UPDATE
+	help
+	  Enable the RTC driver for GD32 SoCs. The driver provides timekeeping
+	  and optional alarm support using the on-chip backup domain.
