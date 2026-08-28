@@ -12,6 +12,7 @@ toolchain:
   - gnuarmemb
 supported:
   - dac
+  - netif:eth
   - pwm
   - watchdog
   - counter
