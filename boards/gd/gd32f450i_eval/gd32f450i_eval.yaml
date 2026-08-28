@@ -13,6 +13,8 @@ toolchain:
 supported:
   - dac
   - pwm
+  - usb_device
+  - usbd
   - watchdog
   - counter
   - dma

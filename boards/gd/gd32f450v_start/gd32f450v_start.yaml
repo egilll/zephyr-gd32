@@ -16,4 +16,6 @@ supported:
   - counter
   - dma
   - spi
+  - usb_device
+  - usbd
 vendor: gd

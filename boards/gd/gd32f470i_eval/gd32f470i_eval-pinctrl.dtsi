@@ -39,4 +39,23 @@
 				 <SPI5_IO2_PG10>, <SPI5_IO3_PG11>;
 		};
 	};
+	usbfs_default: usbfs_default {
+		group1 {
+			pinmux = <USBFS_DM_PA11>, <USBFS_DP_PA12>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
+	usbhs_ulpi_default: usbhs_ulpi_default {
+		group1 {
+			pinmux = <USBHS_ULPI_NXT_PC3>, <USBHS_ULPI_DIR_PC2>,
+				 <USBHS_ULPI_STP_PC0>, <USBHS_ULPI_CK_PA5>,
+				 <USBHS_ULPI_D7_PB5>, <USBHS_ULPI_D6_PB13>,
+				 <USBHS_ULPI_D5_PB12>, <USBHS_ULPI_D4_PB11>,
+				 <USBHS_ULPI_D3_PB10>, <USBHS_ULPI_D2_PB1>,
+				 <USBHS_ULPI_D1_PB0>, <USBHS_ULPI_D0_PA3>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
 };

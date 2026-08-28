@@ -82,6 +82,21 @@
 	};
 };
 
+zephyr_udc0: &usbfs {
+	pinctrl-0 = <&usbfs_default>;
+	pinctrl-names = "default";
+	clocks = <&cctl GD32_CLOCK_USBFS>,
+		 <&cctl GD32_CLOCK_IRC48M>,
+		 <&cctl GD32_CLOCK_CK48MSEL_IRC48M>;
+	status = "okay";
+};
+
+&usbhs {
+	pinctrl-0 = <&usbhs_ulpi_default>;
+	pinctrl-names = "default";
+	status = "disabled";
+};
+
 &gpioa {
 	status = "okay";
 };
