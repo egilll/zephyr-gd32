@@ -7,6 +7,7 @@
 #ifndef ZEPHYR_DRIVERS_USB_UDC_DWC2_H
 #define ZEPHYR_DRIVERS_USB_UDC_DWC2_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/usb/udc.h>
@@ -43,6 +44,8 @@ struct dwc2_vendor_quirks {
 	int (*post_hibernation_entry)(const struct device *dev);
 	/* Called before hibernation exit sequence */
 	int (*pre_hibernation_exit)(const struct device *dev);
+	/* INEPNAKEFF remains asserted while an IN endpoint is NAKing */
+	bool inepnakeff_level;
 };
 
 /* Registers that have to be stored before Partial Power Down or Hibernation */
@@ -109,6 +112,7 @@ struct udc_dwc2_data {
 	uint16_t rxfifo_depth;
 	uint16_t max_txfifo_depth[16];
 	uint16_t sof_num;
+	uint32_t sof_cycle;
 	/* Configuration flags */
 	unsigned int dynfifosizing : 1;
 	unsigned int bufferdma : 1;
@@ -146,6 +150,7 @@ struct udc_dwc2_config {
 	void (*irq_disable_func)(const struct device *dev);
 	uint32_t ghwcfg1;
 	uint32_t ghwcfg2;
+	uint32_t ghwcfg3;
 	uint32_t ghwcfg4;
 };
 
@@ -174,6 +179,9 @@ static inline struct usb_dwc2_reg *dwc2_get_base(const struct device *dev)
 #endif
 #if DT_HAS_COMPAT_STATUS_OKAY(syna_sr100_usb)
 #include "udc_dwc2_syna_sr100_usb.h"
+#endif
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbfs) || DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbhs)
+#include "udc_dwc2_gd32.h"
 #endif
 
 #define UDC_DWC2_VENDOR_QUIRK_GET(n)						\
@@ -207,5 +215,16 @@ DWC2_QUIRK_FUNC_DEFINE(caps)
 DWC2_QUIRK_FUNC_DEFINE(is_phy_clk_off)
 DWC2_QUIRK_FUNC_DEFINE(post_hibernation_entry)
 DWC2_QUIRK_FUNC_DEFINE(pre_hibernation_exit)
+
+static inline bool dwc2_quirk_inepnakeff_level(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	const struct dwc2_vendor_quirks *const quirks =
+		COND_CODE_1(IS_EQ(DT_NUM_INST_STATUS_OKAY(snps_dwc2), 1),
+			(UDC_DWC2_VENDOR_QUIRK_GET(0); ARG_UNUSED(config);),
+			(config->quirks;))
+
+	return quirks != NULL && quirks->inepnakeff_level;
+}
 
 #endif /* ZEPHYR_DRIVERS_USB_UDC_DWC2_H */
