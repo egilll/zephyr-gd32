@@ -117,6 +117,16 @@
 			status = "disabled";
 		};
 
+		rtc: rtc@40002800 {
+			compatible = "gd,gd32-rtc";
+			reg = <0x40002800 0x400>;
+			interrupts = <2 0>;
+			interrupt-names = "alarm";
+			clock-source = "irc40k";
+			alarms-count = <1>;
+			status = "disabled";
+		};
+
 		wwdgt: watchdog@40002c00 {
 			compatible = "gd,gd32-wwdgt";
 			reg = <0x40002c00 0x400>;
