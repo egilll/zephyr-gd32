@@ -686,6 +686,64 @@
 			#dma-cells = <4>;
 			status = "disabled";
 		};
+
+		usbhs: usb@40040000 {
+			compatible = "gd,gd32-usbhs", "snps,dwc2";
+			reg = <0x40040000 0x40000>;
+			interrupts = <77 0>;
+			clocks = <&cctl GD32_CLOCK_USBHS>;
+			resets = <&rctl GD32_RESET_USBHS>;
+			num-in-eps = <6>;
+			num-out-eps = <6>;
+			/*
+			 * GD32 reuses DWC2 offsets 0x044..0x050 (GHWCFG1..4)
+			 * as Reserved; reading them returns zero. The UDC
+			 * driver detects that case and falls back to these
+			 * devicetree values. Encoded fields (others 0):
+			 *
+			 *   GHWCFG1: per-EP direction; 0 => all bidirectional
+			 *   GHWCFG2: NUMDEVEPS=5 (6 EPs incl EP0),
+			 *            OTGARCH=internal DMA, HSPHYTYPE=ULPI
+			 *   GHWCFG3: DFIFODEPTH=0x400 (1024 words),
+			 *            XFERSIZEWIDTH=11, PKTSIZEWIDTH=6
+			 *   GHWCFG4: DEDFIFO=1, INEPS=5 (6 IN EPs incl EP0)
+			 *
+			 * See _PLANS/USB_1.md for the full derivation.
+			 */
+			ghwcfg1 = <0x00000000>;
+			ghwcfg2 = <0x00001590>;
+			ghwcfg3 = <0x04000068>;
+			ghwcfg4 = <0x16000000>;
+			status = "disabled";
+		};
+
+		usbfs: usb@50000000 {
+			compatible = "gd,gd32-usbfs", "snps,dwc2";
+			reg = <0x50000000 0x40000>;
+			interrupts = <67 0>;
+			clocks = <&cctl GD32_CLOCK_USBFS>;
+			resets = <&rctl GD32_RESET_USBFS>;
+			num-in-eps = <4>;
+			num-out-eps = <4>;
+			/*
+			 * See USBHS for why GHWCFG is supplied from DT. USBFS
+			 * encodes (others 0):
+			 *
+			 *   GHWCFG1: all EPs bidirectional
+			 *   GHWCFG2: NUMDEVEPS=3 (4 EPs incl EP0),
+			 *            FSPHYTYPE=FS, HSPHYTYPE=NO_HS,
+			 *            DYNFIFOSIZING=1
+			 *   GHWCFG3: DFIFODEPTH=0x140 (320 words)
+			 *   GHWCFG4: DEDFIFO=1, INEPS=3 (4 IN EPs incl EP0),
+			 *            NUMDEVPERIOEPS=3
+			 */
+			ghwcfg1 = <0x00000000>;
+			ghwcfg2 = <0x00080d00>;
+			ghwcfg3 = <0x01400068>;
+			ghwcfg4 = <0x0e000003>;
+			status = "disabled";
+		};
+
 	};
 };
 
