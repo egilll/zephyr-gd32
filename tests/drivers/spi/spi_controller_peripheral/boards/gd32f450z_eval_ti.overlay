@@ -1,0 +1,21 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&pinctrl {
+	spi3_ti_default_alt: spi3_ti_default_alt {
+		group1 {
+			pinmux = <GD32_PINMUX_AF('E', 2, AF5)>,
+				 <GD32_PINMUX_AF('E', 4, AF5)>,
+				 <GD32_PINMUX_AF('E', 5, AF5)>,
+				 <GD32_PINMUX_AF('E', 6, AF5)>;
+			slew-rate = "max-speed-50mhz";
+		};
+	};
+};
+
+&spi3 {
+	/delete-property/ cs-gpios;
+	pinctrl-0 = <&spi3_ti_default_alt>;
+};
