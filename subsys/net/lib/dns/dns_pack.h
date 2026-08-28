@@ -93,6 +93,7 @@ enum dns_rr_type {
 	DNS_RR_TYPE_TXT = 16,			/* TXT   */
 	DNS_RR_TYPE_AAAA = 28,			/* IPv6  */
 	DNS_RR_TYPE_SRV = 33,			/* SRV   */
+	DNS_RR_TYPE_NSEC = 47,                  /* NSEC  */
 	DNS_RR_TYPE_HTTPS = 65,			/* HTTPS */
 	DNS_RR_TYPE_ANY = 0xff,			/* ANY (all records)   */
 	DNS_RR_TYPE_PRIVATE_START = 65280,	/* Private use start */
@@ -113,6 +114,7 @@ enum dns_response_type {
 enum dns_class {
 	DNS_CLASS_INVALID = 0,
 	DNS_CLASS_IN,
+	DNS_CLASS_ANY = 255,
 	DNS_CLASS_FLUSH = BIT(15)
 };
 
@@ -221,7 +223,7 @@ static inline int dns_header_aa(uint8_t *header)
 }
 
 /** It returns the TC field in the DNS msg header	*/
-static inline int dns_header_tc(uint8_t *header)
+static inline int dns_header_tc(const uint8_t *header)
 {
 	return ((*(header + 2)) & 0x02) ? 1 : 0;
 }
@@ -304,27 +306,26 @@ static inline int dns_unpack_query_qclass(const uint8_t *question)
 	return net_ntohs(UNALIGNED_GET((uint16_t *)(question + 2)));
 }
 
-static inline int dns_answer_type(uint16_t dname_size, uint8_t *answer)
+static inline int dns_answer_type(uint16_t dname_size, const uint8_t *answer)
 {
 	/* 4.1.3. Resource record format */
-	return net_ntohs(UNALIGNED_GET((uint16_t *)(answer + dname_size + 0)));
+	return net_ntohs(UNALIGNED_GET((const uint16_t *)(answer + dname_size + 0)));
 }
 
-static inline int dns_answer_class(uint16_t dname_size, uint8_t *answer)
+static inline int dns_answer_class(uint16_t dname_size, const uint8_t *answer)
 {
 	/* 4.1.3. Resource record format */
-	return net_ntohs(UNALIGNED_GET((uint16_t *)(answer + dname_size + 2)));
+	return net_ntohs(UNALIGNED_GET((const uint16_t *)(answer + dname_size + 2)));
 }
 
-static inline int dns_answer_ttl(uint16_t dname_size, uint8_t *answer)
+static inline int dns_answer_ttl(uint16_t dname_size, const uint8_t *answer)
 {
-	return net_ntohl(UNALIGNED_GET((uint32_t *)(answer + dname_size + 4)));
+	return net_ntohl(UNALIGNED_GET((const uint32_t *)(answer + dname_size + 4)));
 }
 
-static inline int dns_answer_rdlength(uint16_t dname_size,
-					     uint8_t *answer)
+static inline int dns_answer_rdlength(uint16_t dname_size, const uint8_t *answer)
 {
-	return net_ntohs(UNALIGNED_GET((uint16_t *)(answer + dname_size + 8)));
+	return net_ntohs(UNALIGNED_GET((const uint16_t *)(answer + dname_size + 8)));
 }
 
 static inline int dns_unpack_srv_priority(const uint8_t *srv)
@@ -478,8 +479,8 @@ static inline int llmnr_unpack_query_header(struct dns_msg_t *msg,
  * @retval 0 on success
  * @retval -ENOMEM if the null label is not found after traversing the buffer
  *         or if QCLASS and QTYPE are not found.
- * @retval -EINVAL if QTYPE is not "A" (IPv4) or "AAAA" (IPv6) or if QCLASS
- *         is not "IN".
+ * @retval -EINVAL if QTYPE is unsupported or QCLASS is neither "IN" nor
+ *         "ANY".
  */
 int dns_unpack_query(struct dns_msg_t *dns_msg, struct net_buf *buf,
 		     enum dns_rr_type *qtype,

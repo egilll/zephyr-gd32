@@ -5,16 +5,22 @@ identifier: gd32f450i_eval
 name: GigaDevice GD32F450I-EVAL
 type: mcu
 arch: arm
-ram: 112
+ram: 256
 flash: 3072
 toolchain:
   - zephyr
   - gnuarmemb
 supported:
-  - dac
-  - pwm
-  - watchdog
   - counter
+  - dac
   - dma
+  - i2s
+  - netif:eth
+  - pwm
+  - rtc
+  - sdhc
   - spi
+  - usb_device
+  - usbd
+  - watchdog
 vendor: gd

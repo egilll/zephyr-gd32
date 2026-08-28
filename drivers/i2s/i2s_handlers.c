@@ -55,6 +55,22 @@ out:
 }
 #include <zephyr/syscalls/i2s_configure_mrsh.c>
 
+static inline int z_vrfy_i2s_timing_get(const struct device *dev, enum i2s_dir dir,
+					struct i2s_timing *timing)
+{
+	struct i2s_timing snapshot;
+	int ret;
+
+	K_OOPS(K_SYSCALL_OBJ(dev, K_OBJ_DRIVER_I2S));
+	ret = z_impl_i2s_timing_get(dev, dir, &snapshot);
+	if (ret == 0) {
+		K_OOPS(k_usermode_to_copy(timing, &snapshot, sizeof(snapshot)));
+	}
+
+	return ret;
+}
+#include <zephyr/syscalls/i2s_timing_get_mrsh.c>
+
 static inline int z_vrfy_i2s_buf_read(const struct device *dev,
 				      void *buf, size_t *size)
 {

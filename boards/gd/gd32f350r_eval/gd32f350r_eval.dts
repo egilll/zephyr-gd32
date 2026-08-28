@@ -22,6 +22,7 @@
 
 	aliases {
 		watchdog0 = &fwdgt;
+		rtc = &rtc;
 	};
 };
 
@@ -41,5 +42,9 @@
 };
 
 &fwdgt {
+	status = "okay";
+};
+
+&rtc {
 	status = "okay";
 };

@@ -251,10 +251,9 @@ NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(v6_svc, dns_dispatcher_svc_handler,
 
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 static void cancel_probes(struct mdns_responder_context *ctx);
-#if defined(CONFIG_NET_DHCPV4)
 static void announce_start(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(announce_timer, announce_start);
-#endif
+static void start_announce(struct net_if *iface);
 static struct k_work_q mdns_work_q;
 static K_KERNEL_STACK_DEFINE(mdns_work_q_stack, CONFIG_MDNS_WORKQ_STACK_SIZE);
 static void do_init_listener(struct k_work *work);
@@ -271,22 +270,34 @@ struct mdns_monitor_iface_addr {
 	struct net_addr addr;
 	bool in_use : 1;
 	bool needs_announce : 1;
+	bool pending_goodbye : 1;
+	bool ready: 1;
 };
 
 static struct mdns_monitor_iface_addr mon_if[
 	MDNS_MAX_IFACE_COUNT *
 	(NET_IF_MAX_IPV4_ADDR + NET_IF_MAX_IPV6_ADDR)];
+
+#define MDNS_TRANSPORT_IPV4 BIT(0)
+#define MDNS_TRANSPORT_IPV6 BIT(1)
+
+/* Address records are sent over every IP transport enabled on an interface,
+ * so retain pending goodbyes until each transport succeeds.
+ */
+static uint8_t goodbye_attempted[MDNS_MAX_IFACE_COUNT];
+static uint8_t goodbye_sent[MDNS_MAX_IFACE_COUNT];
 #endif
 
 static const struct dns_sd_rec *external_records;
 static size_t external_records_count;
+static K_MUTEX_DEFINE(external_records_lock);
 
 #define BUF_ALLOC_TIMEOUT K_MSEC(100)
 
 #ifndef CONFIG_NET_TEST
-static int setup_dst_addr(int sock, net_sa_family_t family,
-			  struct net_sockaddr *src, net_socklen_t src_len,
-			  struct net_sockaddr *dst, net_socklen_t *dst_len);
+static int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
+			  net_socklen_t src_len, bool unicast, struct net_sockaddr *dst,
+			  net_socklen_t *dst_len);
 #endif /* CONFIG_NET_TEST */
 
 #define DNS_RESOLVER_MIN_BUF		2
@@ -342,11 +353,8 @@ static void mdns_iface_event_handler(uint64_t mgmt_event, struct net_if *iface, 
 		return;
 	}
 
-	if (mgmt_event == NET_EVENT_IF_UP && init_listener_done) {
-		do_announce = true;
-		announce_count = 0;
-
-		mark_needs_announce(iface, true);
+	if (mgmt_event == NET_EVENT_IF_UP) {
+		start_announce(iface);
 	}
 }
 
@@ -383,38 +391,40 @@ static bool is_legacy_query(const struct net_sockaddr *src)
 	return false;
 }
 
-int setup_dst_addr(int sock, net_sa_family_t family,
-		   struct net_sockaddr *src, net_socklen_t src_len,
-		   struct net_sockaddr *dst, net_socklen_t *dst_len)
+int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
+		   net_socklen_t src_len, bool unicast, struct net_sockaddr *dst,
+		   net_socklen_t *dst_len)
 {
 	int ret;
 
 	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
-		if (is_legacy_query(src)) {
+		if (unicast && src != NULL) {
 			memcpy(dst, src, src_len);
 			*dst_len = src_len;
 		} else {
 			create_ipv4_addr(net_sin(dst));
 			*dst_len = sizeof(struct net_sockaddr_in);
+		}
 
-			ret = set_ttl_hop_limit(sock, NET_IPPROTO_IP, ZSOCK_IP_MULTICAST_TTL, 255);
-			if (ret < 0) {
-				NET_DBG("Cannot set %s multicast %s (%d)", "IPv4", "TTL", ret);
-			}
+		ret = set_ttl_hop_limit(sock, NET_IPPROTO_IP,
+					unicast ? ZSOCK_IP_TTL : ZSOCK_IP_MULTICAST_TTL, 255);
+		if (ret < 0) {
+			NET_DBG("Cannot set %s %s (%d)", "IPv4", "TTL", ret);
 		}
 	} else if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
-		if (is_legacy_query(src)) {
+		if (unicast && src != NULL) {
 			memcpy(dst, src, src_len);
 			*dst_len = src_len;
 		} else {
 			create_ipv6_addr(net_sin6(dst));
 			*dst_len = sizeof(struct net_sockaddr_in6);
+		}
 
-			ret = set_ttl_hop_limit(sock, NET_IPPROTO_IPV6,
-						ZSOCK_IPV6_MULTICAST_HOPS, 255);
-			if (ret < 0) {
-				NET_DBG("Cannot set %s multicast %s (%d)", "IPv6", "hoplimit", ret);
-			}
+		ret = set_ttl_hop_limit(
+			sock, NET_IPPROTO_IPV6,
+			unicast ? ZSOCK_IPV6_UNICAST_HOPS : ZSOCK_IPV6_MULTICAST_HOPS, 255);
+		if (ret < 0) {
+			NET_DBG("Cannot set %s %s (%d)", "IPv6", "hoplimit", ret);
 		}
 	} else {
 		return -EPFNOSUPPORT;
@@ -439,7 +449,7 @@ static int get_socket(net_sa_family_t family)
  * an identifier nor the question, RFC 6762 18.1. An answer to a legacy unicast
  * query carries both, RFC 6762 6.7.
  */
-static void setup_dns_hdr(uint8_t *buf, uint16_t answers, uint16_t dns_id,
+static void setup_dns_hdr(uint8_t *buf, uint16_t answers, uint16_t additionals, uint16_t dns_id,
 			  uint16_t questions)
 {
 	struct dns_header *hdr = (struct dns_header *)buf;
@@ -455,7 +465,7 @@ static void setup_dns_hdr(uint8_t *buf, uint16_t answers, uint16_t dns_id,
 	UNALIGNED_PUT(net_htons(questions), UNALIGNED_MEMBER_ADDR(hdr, qdcount));
 	UNALIGNED_PUT(net_htons(answers), UNALIGNED_MEMBER_ADDR(hdr, ancount));
 	UNALIGNED_PUT(0, UNALIGNED_MEMBER_ADDR(hdr, nscount));
-	UNALIGNED_PUT(0, UNALIGNED_MEMBER_ADDR(hdr, arcount));
+	UNALIGNED_PUT(net_htons(additionals), UNALIGNED_MEMBER_ADDR(hdr, arcount));
 }
 
 static int init_name_labels(struct net_buf *query)
@@ -495,17 +505,485 @@ static int init_name_labels(struct net_buf *query)
 	return 0;
 }
 
-struct answer_ctx {
-	struct net_buf *query;
-	enum dns_rr_type qtype;
-	int answer_count;
-	uint16_t name_offset;
-	bool legacy;
+struct mdns_answer {
+	const char *owner;
+	const uint8_t *rdata;
+	uint32_t ttl;
+	uint16_t rdlength;
+	uint16_t type;
+	uint16_t class_;
 };
 
-static void add_a_aaaa_answer(struct answer_ctx *ctx, uint32_t ttl,
-			      uint16_t addr_len, const uint8_t *addr,
-			      bool include_name_ptr)
+struct address_rrset_state {
+	uint16_t total;
+	uint16_t known;
+};
+
+static int mdns_unpack_answer(const uint8_t *msg, uint16_t msg_size, uint16_t *offset,
+			      struct net_buf *scratch, struct mdns_answer *answer)
+{
+	const uint8_t *owner_end;
+	uint16_t owner_size;
+	uint16_t rdata_offset;
+	int ret;
+
+	if (*offset >= msg_size) {
+		return -EMSGSIZE;
+	}
+
+	scratch->len = 0U;
+	ret = dns_unpack_name(msg, msg_size, msg + *offset, scratch, &owner_end);
+	if (ret < 0) {
+		return ret;
+	}
+
+	owner_size = owner_end - (msg + *offset);
+	if (owner_size > msg_size - *offset ||
+	    sizeof(struct dns_rr) > msg_size - *offset - owner_size) {
+		return -EMSGSIZE;
+	}
+
+	answer->owner = scratch->data;
+	answer->type = dns_answer_type(owner_size, msg + *offset);
+	answer->class_ = dns_answer_class(owner_size, msg + *offset) & ~DNS_CLASS_FLUSH;
+	answer->ttl = dns_answer_ttl(owner_size, msg + *offset);
+	answer->rdlength = dns_answer_rdlength(owner_size, msg + *offset);
+	rdata_offset = *offset + owner_size + sizeof(struct dns_rr);
+
+	if (answer->rdlength > msg_size - rdata_offset) {
+		return -EMSGSIZE;
+	}
+
+	answer->rdata = msg + rdata_offset;
+	*offset = rdata_offset + answer->rdlength;
+
+	return 0;
+}
+
+struct answer_ctx {
+	struct net_buf *query;
+	struct net_buf *scratch;
+	const uint8_t *query_msg;
+	enum dns_rr_type qtype;
+	int answer_count;
+	int additional_count;
+	int candidate_count;
+	int error;
+	uint16_t name_offset;
+	uint16_t query_size;
+	uint16_t answer_offset;
+	uint16_t known_answer_count;
+	struct address_rrset_state a;
+	struct address_rrset_state aaaa;
+	bool legacy;
+	bool additional;
+};
+
+static bool mdns_host_name_matches(const char *name)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+
+	return strlen(name) == hostname_len + sizeof(".local") - 1U &&
+	       strncasecmp(name, hostname, hostname_len) == 0 &&
+	       strcasecmp(name + hostname_len, ".local") == 0;
+}
+
+static int mdns_reverse_name_addr(const char *name, struct net_addr *addr)
+{
+	static const char ipv4_suffix[] = ".in-addr.arpa";
+	static const char ipv6_suffix[] = ".ip6.arpa";
+	size_t name_len = strlen(name);
+	const char *end;
+	const char *p;
+
+	memset(addr, 0, sizeof(*addr));
+
+	if (name_len > sizeof(ipv4_suffix) - 1U &&
+	    strcasecmp(name + name_len - (sizeof(ipv4_suffix) - 1U), ipv4_suffix) == 0) {
+		end = name + name_len - (sizeof(ipv4_suffix) - 1U);
+		p = name;
+
+		for (size_t i = 0U; i < sizeof(addr->in_addr.s4_addr); ++i) {
+			unsigned int value = 0U;
+			size_t digits = 0U;
+
+			while (p < end && *p != '.') {
+				if (*p < '0' || *p > '9' || ++digits > 3U) {
+					return -EINVAL;
+				}
+
+				value = value * 10U + (*p++ - '0');
+			}
+
+			if (digits == 0U || value > UINT8_MAX ||
+			    (i + 1U < sizeof(addr->in_addr.s4_addr) ? p >= end : p != end)) {
+				return -EINVAL;
+			}
+
+			addr->in_addr.s4_addr[sizeof(addr->in_addr.s4_addr) - 1U - i] = value;
+			if (p < end) {
+				p++;
+			}
+		}
+
+		addr->family = NET_AF_INET;
+		return 0;
+	}
+
+	if (name_len > sizeof(ipv6_suffix) - 1U &&
+	    strcasecmp(name + name_len - (sizeof(ipv6_suffix) - 1U), ipv6_suffix) == 0) {
+		end = name + name_len - (sizeof(ipv6_suffix) - 1U);
+		p = name;
+
+		for (size_t i = 0U; i < 2U * sizeof(addr->in6_addr.s6_addr); ++i) {
+			uint8_t value;
+			size_t nibble = 2U * sizeof(addr->in6_addr.s6_addr) - 1U - i;
+
+			if (p >= end || p + 1U > end || (p + 1U < end && p[1] != '.')) {
+				return -EINVAL;
+			}
+
+			if (*p >= '0' && *p <= '9') {
+				value = *p - '0';
+			} else if (*p >= 'a' && *p <= 'f') {
+				value = *p - 'a' + 10U;
+			} else if (*p >= 'A' && *p <= 'F') {
+				value = *p - 'A' + 10U;
+			} else {
+				return -EINVAL;
+			}
+
+			addr->in6_addr.s6_addr[nibble / 2U] |= value
+							       << (nibble % 2U == 0U ? 4U : 0U);
+			p += p + 1U < end ? 2U : 1U;
+		}
+
+		if (p != end) {
+			return -EINVAL;
+		}
+
+		addr->family = NET_AF_INET6;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int mdns_add_nsec(struct net_buf *query, uint16_t name_offset, uint32_t ttl, bool legacy,
+			 uint32_t existing_types, bool include_name)
+{
+	uint8_t bitmap[4] = {0};
+	size_t bitmap_len = 0U;
+
+	if (existing_types == 0U || (existing_types & ~BIT_MASK(DNS_RR_TYPE_AAAA + 1U)) != 0U) {
+		return -EINVAL;
+	}
+
+	for (enum dns_rr_type type = DNS_RR_TYPE_A; type <= DNS_RR_TYPE_AAAA; ++type) {
+		if ((existing_types & BIT(type)) != 0U) {
+			bitmap[type / 8U] |= BIT(7U - type % 8U);
+			bitmap_len = type / 8U + 1U;
+		}
+	}
+
+	if (net_buf_tailroom(query) < (include_name ? DNS_POINTER_SIZE : 0U) + DNS_QTYPE_LEN +
+					      DNS_QCLASS_LEN + DNS_TTL_LEN + DNS_RDLENGTH_LEN +
+					      DNS_POINTER_SIZE + 2U + bitmap_len) {
+		return -ENOBUFS;
+	}
+
+	if (include_name) {
+		net_buf_add_u8(query, NS_CMPRSFLGS | ((name_offset >> 8) & 0x3f));
+		net_buf_add_u8(query, name_offset & 0xff);
+	}
+
+	net_buf_add_be16(query, DNS_RR_TYPE_NSEC);
+	net_buf_add_be16(query, legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH);
+	net_buf_add_be32(query, ttl);
+	net_buf_add_be16(query, DNS_POINTER_SIZE + 2U + bitmap_len);
+	net_buf_add_u8(query, NS_CMPRSFLGS | ((name_offset >> 8) & 0x3f));
+	net_buf_add_u8(query, name_offset & 0xff);
+	net_buf_add_u8(query, 0U);
+	net_buf_add_u8(query, bitmap_len);
+	net_buf_add_mem(query, bitmap, bitmap_len);
+
+	return 0;
+}
+
+static bool mdns_nsec_matches(uint32_t existing_types, const uint8_t *msg, uint16_t msg_size,
+			      const struct mdns_answer *answer, struct net_buf *scratch)
+{
+	uint8_t expected[2U + sizeof(uint32_t)] = {0};
+	const uint8_t *next_name_end;
+	const uint8_t *rdata_end = answer->rdata + answer->rdlength;
+	size_t bitmap_len = 0U;
+	int ret;
+
+	if (existing_types == 0U || (existing_types & ~BIT_MASK(DNS_RR_TYPE_AAAA + 1U)) != 0U) {
+		return false;
+	}
+
+	for (enum dns_rr_type type = DNS_RR_TYPE_A; type <= DNS_RR_TYPE_AAAA; ++type) {
+		if ((existing_types & BIT(type)) != 0U) {
+			expected[2U + type / 8U] |= BIT(7U - type % 8U);
+			bitmap_len = type / 8U + 1U;
+		}
+	}
+
+	expected[1] = bitmap_len;
+
+	/* RFC 6762 Section 6.1 requires processing the bitmap even when the
+	 * Next Domain Name does not match the owner.
+	 */
+	scratch->len = 0U;
+	ret = dns_unpack_name(msg, msg_size, answer->rdata, scratch, &next_name_end);
+	if (ret < 0 || next_name_end > rdata_end) {
+		return false;
+	}
+
+	return rdata_end - next_name_end == 2U + bitmap_len &&
+	       memcmp(next_name_end, expected, 2U + bitmap_len) == 0;
+}
+
+static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type expected_type,
+				     const uint8_t *msg, uint16_t msg_size, uint16_t answer_offset,
+				     uint16_t answer_count, struct net_buf *scratch)
+{
+	uint16_t offset = answer_offset;
+
+	if (scratch == NULL || dns_header_tc(msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		struct mdns_answer answer;
+		const uint8_t *rdata_end;
+		int ret;
+
+		ret = mdns_unpack_answer(msg, msg_size, &offset, scratch, &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type != expected_type || answer.class_ != DNS_CLASS_IN ||
+		    answer.ttl < MDNS_TTL / 2U || strcasecmp(answer.owner, query_name) != 0) {
+			continue;
+		}
+
+		if (expected_type == DNS_RR_TYPE_NSEC) {
+			if (mdns_nsec_matches(BIT(DNS_RR_TYPE_PTR), msg, msg_size, &answer,
+					      scratch)) {
+				return 1;
+			}
+			continue;
+		}
+
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size, answer.rdata, scratch, &rdata_end);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (rdata_end == answer.rdata + answer.rdlength &&
+		    mdns_host_name_matches(scratch->data)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
+				 enum dns_rr_type qtype, enum dns_class qclass, bool legacy,
+				 uint16_t dns_id, const uint8_t *query_msg, uint16_t query_size,
+				 uint16_t answer_offset, uint16_t answer_count)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+	bool negative = qtype != DNS_RR_TYPE_PTR && qtype != DNS_RR_TYPE_ANY;
+	int ret;
+
+	if (!legacy && answer_count > 0U) {
+		ret = mdns_reverse_answer_known(
+			query->data, negative ? DNS_RR_TYPE_NSEC : DNS_RR_TYPE_PTR, query_msg,
+			query_size, answer_offset, answer_count, scratch);
+		if (ret != 0) {
+			return ret > 0 ? -EALREADY : ret;
+		}
+	}
+
+	ret = init_name_labels(query);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (net_buf_tailroom(query) < (legacy ? DNS_QTYPE_LEN + DNS_QCLASS_LEN : 0U)) {
+		return -ENOBUFS;
+	}
+
+	if (legacy) {
+		net_buf_add_be16(query, qtype);
+		net_buf_add_be16(query, qclass & ~DNS_CLASS_FLUSH);
+	}
+
+	if (negative) {
+		ret = mdns_add_nsec(query, DNS_MSG_HEADER_SIZE, legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
+				    legacy, BIT(DNS_RR_TYPE_PTR), legacy);
+		if (ret < 0) {
+			return ret;
+		}
+
+		setup_dns_hdr(query->data, 1U, 0U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+		return 0;
+	}
+
+	if (hostname_len > DNS_LABEL_MAX_SIZE ||
+	    net_buf_tailroom(query) < (legacy ? DNS_POINTER_SIZE : 0U) + DNS_QTYPE_LEN +
+					      DNS_QCLASS_LEN + DNS_TTL_LEN + DNS_RDLENGTH_LEN +
+					      hostname_len + sizeof(".local") + 1U) {
+		return -ENOBUFS;
+	}
+
+	if (legacy) {
+		net_buf_add_u8(query, NS_CMPRSFLGS);
+		net_buf_add_u8(query, DNS_MSG_HEADER_SIZE);
+	}
+
+	net_buf_add_be16(query, DNS_RR_TYPE_PTR);
+	net_buf_add_be16(query, legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH);
+	net_buf_add_be32(query, legacy ? MDNS_LEGACY_TTL : MDNS_TTL);
+	net_buf_add_be16(query, hostname_len + sizeof(".local") + 1U);
+	net_buf_add_u8(query, hostname_len);
+	net_buf_add_mem(query, hostname, hostname_len);
+	net_buf_add_u8(query, sizeof("local") - 1U);
+	net_buf_add_mem(query, "local", sizeof("local") - 1U);
+	net_buf_add_u8(query, 0U);
+
+	setup_dns_hdr(query->data, 1U, 0U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+
+	return 0;
+}
+
+static int mdns_addr_known(struct answer_ctx *ctx, enum dns_rr_type type, const uint8_t *addr,
+			   uint16_t addr_len)
+{
+	uint16_t offset = ctx->answer_offset;
+
+	if (ctx->scratch == NULL || dns_header_tc(ctx->query_msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < ctx->known_answer_count; ++i) {
+		struct mdns_answer answer;
+		int ret;
+
+		ret = mdns_unpack_answer(ctx->query_msg, ctx->query_size, &offset, ctx->scratch,
+					 &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type == type && answer.class_ == DNS_CLASS_IN &&
+		    answer.ttl >= MDNS_TTL / 2U && answer.rdlength == addr_len &&
+		    mdns_host_name_matches(answer.owner) &&
+		    memcmp(answer.rdata, addr, addr_len) == 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int mdns_host_nsec_known(struct answer_ctx *ctx, uint32_t existing_types)
+{
+	uint16_t offset = ctx->answer_offset;
+
+	if (ctx->scratch == NULL || dns_header_tc(ctx->query_msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < ctx->known_answer_count; ++i) {
+		struct mdns_answer answer;
+		int ret;
+
+		ret = mdns_unpack_answer(ctx->query_msg, ctx->query_size, &offset, ctx->scratch,
+					 &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type == DNS_RR_TYPE_NSEC && answer.class_ == DNS_CLASS_IN &&
+		    answer.ttl >= MDNS_TTL / 2U && mdns_host_name_matches(answer.owner) &&
+		    mdns_nsec_matches(existing_types, ctx->query_msg, ctx->query_size, &answer,
+				      ctx->scratch)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void collect_address_types_cb(struct net_if *iface, struct net_if_addr *ifaddr,
+				     void *user_data)
+{
+	uint32_t *types = user_data;
+
+	ARG_UNUSED(iface);
+
+	if (ifaddr->addr_state == NET_ADDR_PREFERRED || ifaddr->addr_state == NET_ADDR_DEPRECATED) {
+		if (ifaddr->address.family == NET_AF_INET) {
+			*types |= BIT(DNS_RR_TYPE_A);
+		} else if (ifaddr->address.family == NET_AF_INET6) {
+			*types |= BIT(DNS_RR_TYPE_AAAA);
+		}
+	}
+}
+
+static struct address_rrset_state *address_rrset_state(struct answer_ctx *ctx,
+						       enum dns_rr_type type)
+{
+	return type == DNS_RR_TYPE_A ? &ctx->a : &ctx->aaaa;
+}
+
+static void inspect_address_cb(struct net_if *iface, struct net_if_addr *ifaddr, void *user_data)
+{
+	struct answer_ctx *ctx = user_data;
+	struct address_rrset_state *rrset;
+	enum dns_rr_type type;
+	const uint8_t *addr;
+	uint16_t addr_len;
+	int ret;
+
+	ARG_UNUSED(iface);
+
+	if (ctx->error < 0 || (ifaddr->addr_state != NET_ADDR_PREFERRED &&
+			       ifaddr->addr_state != NET_ADDR_DEPRECATED)) {
+		return;
+	}
+
+	if (ifaddr->address.family == NET_AF_INET6) {
+		type = DNS_RR_TYPE_AAAA;
+		addr_len = sizeof(struct net_in6_addr);
+		addr = ifaddr->address.in6_addr.s6_addr;
+	} else {
+		type = DNS_RR_TYPE_A;
+		addr_len = sizeof(struct net_in_addr);
+		addr = ifaddr->address.in_addr.s4_addr;
+	}
+
+	rrset = address_rrset_state(ctx, type);
+	rrset->total++;
+	ret = mdns_addr_known(ctx, type, addr, addr_len);
+	if (ret < 0) {
+		ctx->error = ret;
+	} else if (ret > 0) {
+		rrset->known++;
+	}
+}
+
+static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uint32_t ttl,
+			      uint16_t addr_len, const uint8_t *addr, bool include_name_ptr)
 {
 	uint16_t name_len = 0;
 
@@ -516,6 +994,7 @@ static void add_a_aaaa_answer(struct answer_ctx *ctx, uint32_t ttl,
 	if (net_buf_tailroom(ctx->query) < (DNS_QTYPE_LEN + DNS_QCLASS_LEN +
 					    DNS_TTL_LEN + DNS_RDLENGTH_LEN +
 					    addr_len + name_len)) {
+		ctx->error = -ENOBUFS;
 		return;
 	}
 
@@ -524,7 +1003,7 @@ static void add_a_aaaa_answer(struct answer_ctx *ctx, uint32_t ttl,
 		net_buf_add_u8(ctx->query, ctx->name_offset & 0xff);
 	}
 
-	net_buf_add_be16(ctx->query, ctx->qtype);
+	net_buf_add_be16(ctx->query, type);
 
 	/* The cache flush bit tells a multicast DNS cache to drop what it
 	 * held for this name. It must not be set in an answer to a legacy
@@ -539,16 +1018,26 @@ static void add_a_aaaa_answer(struct answer_ctx *ctx, uint32_t ttl,
 	net_buf_add_be16(ctx->query, addr_len);
 	net_buf_add_mem(ctx->query, addr, addr_len);
 
-	ctx->answer_count++;
+	if (ctx->additional) {
+		ctx->additional_count++;
+	} else {
+		ctx->answer_count++;
+	}
 }
 
 static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 			   void *user_data)
 {
 	struct answer_ctx *ctx = (struct answer_ctx *)user_data;
+	struct address_rrset_state *rrset;
+	enum dns_rr_type type;
 	bool include_name_ptr = true;
 	const uint8_t *addr;
 	uint16_t addr_len;
+
+	if (ctx->error < 0) {
+		return;
+	}
 
 	if (ifaddr->addr_state != NET_ADDR_PREFERRED &&
 	    ifaddr->addr_state != NET_ADDR_DEPRECATED) {
@@ -556,11 +1045,22 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 	}
 
 	if (ifaddr->address.family == NET_AF_INET6) {
+		type = DNS_RR_TYPE_AAAA;
 		addr_len = sizeof(struct net_in6_addr);
 		addr = ifaddr->address.in6_addr.s6_addr;
 	} else {
+		type = DNS_RR_TYPE_A;
 		addr_len = sizeof(struct net_in_addr);
 		addr = ifaddr->address.in_addr.s4_addr;
+	}
+
+	ctx->candidate_count++;
+	rrset = address_rrset_state(ctx, type);
+	/* RFC 6762 Section 10.2 requires every member when any member of a
+	 * unique RRset is sent. Suppress the RRset only when all members are known.
+	 */
+	if (rrset->known == rrset->total) {
+		return;
 	}
 
 	/* First answer contains full DNS name (already encoded). Consecutive
@@ -574,19 +1074,36 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 		include_name_ptr = false;
 	}
 
-	add_a_aaaa_answer(ctx, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
-			  addr_len, addr, include_name_ptr);
+	add_a_aaaa_answer(ctx, type, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL, addr_len, addr,
+			  include_name_ptr);
 }
 
-static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
-			 struct net_if *iface, bool legacy, uint16_t dns_id)
+static void add_address_nsec(struct answer_ctx *ctx, enum dns_rr_type existing_type)
+{
+	if (mdns_add_nsec(ctx->query, ctx->name_offset, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
+			  ctx->legacy, BIT(existing_type), true) == 0) {
+		ctx->additional_count++;
+	}
+}
+
+static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dns_rr_type qtype,
+			 enum dns_class qclass, struct net_if *iface, bool legacy, uint16_t dns_id,
+			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
+			 uint16_t answer_count)
 {
 	struct answer_ctx ctx = {
 		.query = query,
+		.scratch = scratch,
+		.query_msg = query_msg,
 		.qtype = qtype,
 		.name_offset = DNS_MSG_HEADER_SIZE,
+		.query_size = query_size,
+		.answer_offset = answer_offset,
+		.known_answer_count = answer_count,
 		.legacy = legacy,
 	};
+	uint32_t address_types = 0U;
+	int candidate_count;
 	int ret;
 
 	ret = init_name_labels(query);
@@ -602,49 +1119,115 @@ static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
 		 * bit a querier may have set in it has no meaning coming back.
 		 */
 		net_buf_add_be16(query, qtype);
-		net_buf_add_be16(query, DNS_CLASS_IN);
+		net_buf_add_be16(query, qclass & ~DNS_CLASS_FLUSH);
+	}
+
+	if (IS_ENABLED(CONFIG_NET_IPV4)) {
+		net_if_ipv4_addr_foreach(iface, collect_address_types_cb, &address_types);
+	}
+	if (IS_ENABLED(CONFIG_NET_IPV6)) {
+		net_if_ipv6_addr_foreach(iface, collect_address_types_cb, &address_types);
+	}
+	if (qtype == DNS_RR_TYPE_A || qtype == DNS_RR_TYPE_AAAA || qtype == DNS_RR_TYPE_ANY) {
+		if (IS_ENABLED(CONFIG_NET_IPV4)) {
+			net_if_ipv4_addr_foreach(iface, inspect_address_cb, &ctx);
+		}
+		if (IS_ENABLED(CONFIG_NET_IPV6)) {
+			net_if_ipv6_addr_foreach(iface, inspect_address_cb, &ctx);
+		}
+		if (ctx.error < 0) {
+			return ctx.error;
+		}
 	}
 
 	if ((qtype == DNS_RR_TYPE_A) && IS_ENABLED(CONFIG_NET_IPV4)) {
 		net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
 	} else if ((qtype == DNS_RR_TYPE_AAAA) && IS_ENABLED(CONFIG_NET_IPV6)) {
 		net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
-	} else {
-		return -EINVAL;
+	} else if (qtype == DNS_RR_TYPE_ANY) {
+		if (IS_ENABLED(CONFIG_NET_IPV4)) {
+			net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
+		}
+		if (IS_ENABLED(CONFIG_NET_IPV6)) {
+			net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
+		}
+	}
+
+	if (ctx.error < 0) {
+		return ctx.error;
 	}
 
 	if (ctx.answer_count == 0) {
-		/* No addresses added */
-		return -ENOMEM;
+		if (ctx.candidate_count > 0) {
+			return -EALREADY;
+		}
+
+		if (address_types == 0U) {
+			return -ENOMEM;
+		}
+
+		if (!legacy) {
+			ret = mdns_host_nsec_known(&ctx, address_types);
+			if (ret != 0) {
+				return ret > 0 ? -EALREADY : ret;
+			}
+		}
+
+		ret = mdns_add_nsec(query, ctx.name_offset, legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
+				    legacy, address_types, legacy);
+		if (ret < 0) {
+			return ret;
+		}
+
+		setup_dns_hdr(query->data, 1U, 0U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+		return 0;
+	}
+
+	ctx.additional = true;
+	candidate_count = ctx.candidate_count;
+	if (qtype == DNS_RR_TYPE_A && IS_ENABLED(CONFIG_NET_IPV6)) {
+		net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
+	} else if (qtype == DNS_RR_TYPE_AAAA && IS_ENABLED(CONFIG_NET_IPV4)) {
+		net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
+	}
+
+	if (ctx.error < 0) {
+		return ctx.error;
+	}
+
+	if (qtype != DNS_RR_TYPE_ANY && ctx.candidate_count == candidate_count) {
+		add_address_nsec(&ctx, qtype);
 	}
 
 	/* A multicast answer carries neither an identifier nor the question:
 	 * RFC 6762 18.1 has the identifier zero on transmission and ignored on
 	 * reception, because there is no one querier it belongs to.
 	 */
-	setup_dns_hdr(query->data, ctx.answer_count, legacy ? dns_id : 0U,
+	setup_dns_hdr(query->data, ctx.answer_count, ctx.additional_count, legacy ? dns_id : 0U,
 		      legacy ? 1U : 0U);
 
 	return 0;
 }
 
-static int send_response(int sock,
-			 net_sa_family_t family,
-			 struct net_sockaddr *src_addr,
-			 size_t addrlen,
-			 struct net_buf *query,
-			 enum dns_rr_type qtype,
-			 struct net_if *recv_if,
-			 uint16_t dns_id)
+static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
+			 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
+			 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id,
+			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
+			 uint16_t answer_count)
 {
 	struct net_if *iface;
+	struct net_buf *scratch = NULL;
 	net_socklen_t dst_len;
+	bool legacy;
 	int ret;
+
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
+	legacy = is_legacy_query(src_addr);
 	ret = setup_dst_addr(sock, family, src_addr, addrlen,
-			     (struct net_sockaddr *)&dst, &dst_len);
+			     legacy || (qclass & DNS_CLASS_FLUSH) != 0, (struct net_sockaddr *)&dst,
+			     &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
 		return ret;
@@ -661,14 +1244,24 @@ static int send_response(int sock,
 		iface = net_if_ipv4_select_src_iface(&net_sin(src_addr)->sin_addr);
 	}
 
-	if ((qtype == DNS_RR_TYPE_A && !IS_ENABLED(CONFIG_NET_IPV4)) ||
-	    (qtype == DNS_RR_TYPE_AAAA && !IS_ENABLED(CONFIG_NET_IPV6))) {
+	if (qtype == DNS_RR_TYPE_INVALID) {
 		return -EINVAL;
 	}
 
-	ret = create_answer(query, qtype, iface, is_legacy_query(src_addr), dns_id);
-	if (ret != 0) {
-		return -ENOMEM;
+	if (!legacy && answer_count > 0U) {
+		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
+	}
+
+	ret = create_answer(query, scratch, qtype, qclass, iface, legacy, dns_id, query_msg,
+			    query_size, answer_offset, answer_count);
+	if (scratch != NULL) {
+		net_buf_unref(scratch);
+	}
+	if (ret == -EALREADY) {
+		return 0;
+	}
+	if (ret < 0) {
+		return ret;
 	}
 
 	ret = zsock_sendto(sock, query->data, query->len, 0,
@@ -683,12 +1276,335 @@ static int send_response(int sock,
 	return ret;
 }
 
-static void send_sd_response(int sock,
-			     net_sa_family_t family,
-			     struct net_sockaddr *src_addr,
-			     size_t addrlen,
-			     struct net_buf *result,
-			     struct net_if *recv_if)
+static int send_reverse_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
+				 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
+				 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id,
+				 const uint8_t *query_msg, uint16_t query_size,
+				 uint16_t answer_offset, uint16_t answer_count,
+				 const struct net_addr *addr)
+{
+	struct net_if_addr *ifaddr;
+	struct net_if *iface;
+	struct net_buf *scratch = NULL;
+	net_socklen_t dst_len;
+	bool legacy;
+	int ret;
+#if defined(CONFIG_NET_IPV6)
+	struct net_sockaddr_in6 dst;
+#else
+	struct net_sockaddr_in dst;
+#endif
+
+	if (recv_if != NULL) {
+		iface = recv_if;
+	} else if (family == NET_AF_INET6) {
+		iface = net_if_ipv6_select_src_iface(&net_sin6(src_addr)->sin6_addr);
+	} else {
+		iface = net_if_ipv4_select_src_iface(&net_sin(src_addr)->sin_addr);
+	}
+
+	if (iface == NULL) {
+		return -ENOENT;
+	}
+
+	if (addr->family == NET_AF_INET && IS_ENABLED(CONFIG_NET_IPV4)) {
+		ifaddr = net_if_ipv4_addr_lookup_by_iface(iface, &addr->in_addr);
+	} else if (addr->family == NET_AF_INET6 && IS_ENABLED(CONFIG_NET_IPV6)) {
+		ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, &addr->in6_addr);
+	} else {
+		return -ENOENT;
+	}
+
+	if (ifaddr == NULL || (ifaddr->addr_state != NET_ADDR_PREFERRED &&
+			       ifaddr->addr_state != NET_ADDR_DEPRECATED)) {
+		return -ENOENT;
+	}
+
+	legacy = is_legacy_query(src_addr);
+	ret = setup_dst_addr(sock, family, src_addr, addrlen,
+			     legacy || (qclass & DNS_CLASS_FLUSH) != 0, (struct net_sockaddr *)&dst,
+			     &dst_len);
+	if (ret < 0) {
+		NET_DBG("unable to set up the response address");
+		return ret;
+	}
+
+	if (!legacy && answer_count > 0U) {
+		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
+	}
+
+	ret = create_reverse_answer(query, scratch, qtype, qclass, legacy, dns_id, query_msg,
+				    query_size, answer_offset, answer_count);
+	if (scratch != NULL) {
+		net_buf_unref(scratch);
+	}
+	if (ret == -EALREADY) {
+		return 0;
+	}
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = zsock_sendto(sock, query->data, query->len, 0, (struct net_sockaddr *)&dst, dst_len);
+	if (ret < 0) {
+		ret = -errno;
+		NET_DBG("Cannot send %s reply (%d)", "mDNS", ret);
+	} else {
+		net_stats_update_dns_sent(iface);
+	}
+
+	return ret;
+}
+
+static bool same_dns_sd_service_type(const struct dns_sd_rec *a, const struct dns_sd_rec *b)
+{
+	return dns_sd_rec_is_valid(a) && dns_sd_rec_is_valid(b) &&
+	       strcasecmp(a->service, b->service) == 0 && strcasecmp(a->proto, b->proto) == 0 &&
+	       strcasecmp(a->domain, b->domain) == 0;
+}
+
+static bool dns_sd_service_type_was_sent(const struct dns_sd_rec *record, size_t static_start,
+					 size_t static_count, size_t external_start,
+					 size_t external_count)
+{
+	const struct dns_sd_rec *sent;
+
+	for (size_t i = static_start; i < static_count; ++i) {
+		DNS_SD_GET(i, &sent);
+		if (sent != record && same_dns_sd_service_type(record, sent)) {
+			return true;
+		}
+	}
+
+	for (size_t i = external_start; i < external_count; ++i) {
+		sent = &external_records[i];
+		if (sent != record && same_dns_sd_service_type(record, sent)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool dns_sd_name_matches(const char *name, const struct dns_sd_rec *record,
+				bool include_instance)
+{
+	const struct {
+		const char *value;
+	} labels[] = {
+		{record->instance},
+		{record->service},
+		{record->proto},
+		{record->domain},
+	};
+	size_t first = include_instance ? 0U : 1U;
+	size_t expected_len = ARRAY_SIZE(labels) - first - 1U;
+
+	for (size_t i = first; i < ARRAY_SIZE(labels); ++i) {
+		expected_len += strlen(labels[i].value);
+	}
+
+	if (strlen(name) != expected_len) {
+		return false;
+	}
+
+	for (size_t i = first; i < ARRAY_SIZE(labels); ++i) {
+		size_t label_len = strlen(labels[i].value);
+
+		if (strncasecmp(name, labels[i].value, label_len) != 0) {
+			return false;
+		}
+
+		name += label_len;
+		if (i == ARRAY_SIZE(labels) - 1U) {
+			return *name == '\0';
+		}
+
+		if (*name++ != '.') {
+			return false;
+		}
+	}
+
+	return false;
+}
+
+static bool dns_sd_host_name_matches(const char *name, const struct dns_sd_rec *record)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+	size_t domain_len = strlen(record->domain);
+
+	return strlen(name) == hostname_len + domain_len + 1U &&
+	       strncasecmp(name, hostname, hostname_len) == 0 && name[hostname_len] == '.' &&
+	       strcasecmp(name + hostname_len + 1U, record->domain) == 0;
+}
+
+static bool dns_sd_service_enum_name_matches(const char *name, const struct dns_sd_rec *record)
+{
+	static const char prefix[] = "_services._dns-sd._udp.";
+
+	return strncasecmp(name, prefix, sizeof(prefix) - 1U) == 0 &&
+	       strcasecmp(name + sizeof(prefix) - 1U, record->domain) == 0;
+}
+
+static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type type, uint8_t *msg,
+			      uint16_t msg_size, uint16_t rdata_offset, uint16_t rdlength,
+			      bool service_type_enum, struct net_buf *scratch)
+{
+	const uint8_t *rdata_end;
+	int ret;
+
+	switch (type) {
+	case DNS_RR_TYPE_PTR:
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size, msg + rdata_offset, scratch, &rdata_end);
+		return ret < 0 ? ret
+			       : rdata_end == msg + rdata_offset + rdlength &&
+					 dns_sd_name_matches(scratch->data, record,
+							     !service_type_enum);
+	case DNS_RR_TYPE_TXT:
+		return rdlength == dns_sd_txt_size(record) &&
+		       memcmp(msg + rdata_offset, dns_sd_txt_data(record), rdlength) == 0;
+	case DNS_RR_TYPE_SRV:
+		if (rdlength < sizeof(struct dns_srv_rdata) + 1U) {
+			return false;
+		}
+
+		if (sys_get_be16(msg + rdata_offset) != 0U ||
+		    sys_get_be16(msg + rdata_offset + sizeof(uint16_t)) != 0U ||
+		    sys_get_be16(msg + rdata_offset + 2U * sizeof(uint16_t)) !=
+			    net_ntohs(*record->port)) {
+			return false;
+		}
+
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size,
+				      msg + rdata_offset + sizeof(struct dns_srv_rdata), scratch,
+				      &rdata_end);
+		return ret < 0 ? ret
+			       : rdata_end == msg + rdata_offset + rdlength &&
+					 dns_sd_host_name_matches(scratch->data, record);
+	case DNS_RR_TYPE_NSEC: {
+		static const uint8_t expected_bitmap[] = {0U, 5U, 0U, 0U, 0x80U, 0U, 0x40U};
+
+		rdata_end = msg + rdata_offset + rdlength;
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size, msg + rdata_offset, scratch, &rdata_end);
+		if (ret < 0) {
+			return ret;
+		}
+
+		return rdata_end <= msg + rdata_offset + rdlength &&
+		       msg + rdata_offset + rdlength - rdata_end == sizeof(expected_bitmap) &&
+		       memcmp(rdata_end, expected_bitmap, sizeof(expected_bitmap)) == 0;
+	}
+	default:
+		return false;
+	}
+}
+
+static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type query_type,
+			       uint8_t *msg, uint16_t msg_size, uint16_t answer_offset,
+			       uint16_t answer_count, bool service_type_enum,
+			       struct net_buf *scratch)
+{
+	uint16_t offset = answer_offset;
+	uint32_t minimum_ttl;
+
+	if (dns_header_tc(msg)) {
+		return 0;
+	}
+
+	switch (query_type) {
+	case DNS_RR_TYPE_PTR:
+		minimum_ttl = DNS_SD_PTR_TTL / 2U;
+		break;
+	case DNS_RR_TYPE_SRV:
+		minimum_ttl = DNS_SD_SRV_TTL / 2U;
+		break;
+	case DNS_RR_TYPE_TXT:
+		minimum_ttl = DNS_SD_TXT_TTL / 2U;
+		break;
+	case DNS_RR_TYPE_NSEC:
+		minimum_ttl = DNS_SD_SRV_TTL / 2U;
+		break;
+	default:
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		struct mdns_answer answer;
+		int ret;
+
+		ret = mdns_unpack_answer(msg, msg_size, &offset, scratch, &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type == query_type && answer.class_ == DNS_CLASS_IN &&
+		    answer.ttl >= minimum_ttl &&
+		    (service_type_enum ? dns_sd_service_enum_name_matches(answer.owner, record)
+				       : dns_sd_name_matches(answer.owner, record,
+							     query_type != DNS_RR_TYPE_PTR))) {
+			ret = dns_sd_rdata_known(record, answer.type, msg, msg_size,
+						 answer.rdata - msg, answer.rdlength,
+						 service_type_enum, scratch);
+			if (ret != 0) {
+				return ret;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int dns_sd_suppress_known_answers(const struct dns_sd_rec *record,
+					 struct dns_sd_query *query, uint8_t *msg,
+					 uint16_t msg_size, uint16_t answer_offset,
+					 uint16_t answer_count, bool service_type_enum,
+					 struct net_buf *scratch)
+{
+	int ret;
+
+	query->suppress_srv = false;
+	query->suppress_txt = false;
+
+	if (query->browse) {
+		return dns_sd_answer_known(record, DNS_RR_TYPE_PTR, msg, msg_size, answer_offset,
+					   answer_count, service_type_enum, scratch);
+	}
+	if (query->type != DNS_RR_TYPE_SRV && query->type != DNS_RR_TYPE_TXT &&
+	    query->type != DNS_RR_TYPE_ANY) {
+		return dns_sd_answer_known(record, DNS_RR_TYPE_NSEC, msg, msg_size, answer_offset,
+					   answer_count, false, scratch);
+	}
+
+	if (query->type != DNS_RR_TYPE_ANY) {
+		return dns_sd_answer_known(record, query->type, msg, msg_size, answer_offset,
+					   answer_count, service_type_enum, scratch);
+	}
+	ret = dns_sd_answer_known(record, DNS_RR_TYPE_SRV, msg, msg_size, answer_offset,
+				  answer_count, false, scratch);
+	if (ret < 0) {
+		return ret;
+	}
+	query->suppress_srv = ret > 0;
+
+	ret = dns_sd_answer_known(record, DNS_RR_TYPE_TXT, msg, msg_size, answer_offset,
+				  answer_count, false, scratch);
+	if (ret < 0) {
+		return ret;
+	}
+	query->suppress_txt = ret > 0;
+
+	return query->suppress_srv && query->suppress_txt;
+}
+
+static void send_sd_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
+			     size_t addrlen, struct net_buf *result, struct net_if *recv_if,
+			     enum dns_rr_type qtype, enum dns_class qclass, uint16_t dns_id,
+			     uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
+			     uint16_t answer_count)
 {
 	struct net_if *iface;
 	net_socklen_t dst_len;
@@ -715,7 +1631,15 @@ static void send_sd_response(int sock,
 	};
 	size_t n = ARRAY_SIZE(label);
 	size_t rec_num;
-	size_t ext_rec_num = external_records_count;
+	size_t rec_count;
+	size_t ext_rec_num;
+	size_t ext_rec_count;
+	struct dns_sd_query query = {
+		.type = qtype,
+		.class_ = qclass & ~DNS_CLASS_FLUSH,
+		.id = dns_id,
+		.legacy = is_legacy_query(src_addr),
+	};
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
@@ -731,6 +1655,7 @@ static void send_sd_response(int sock,
 	label[3] = domain_buf;
 
 	ret = setup_dst_addr(sock, family, src_addr, addrlen,
+			     query.legacy || (qclass & DNS_CLASS_FLUSH) != 0,
 			     (struct net_sockaddr *)&dst, &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
@@ -799,7 +1724,19 @@ static void send_sd_response(int sock,
 		service_type_enum = true;
 	}
 
+	if ((service_type_enum || filter.instance == NULL) && qtype != DNS_RR_TYPE_PTR &&
+	    qtype != DNS_RR_TYPE_ANY) {
+		return;
+	}
+
+	query.browse = filter.instance == NULL;
+
+	k_mutex_lock(&external_records_lock, K_FOREVER);
+	ext_rec_num = external_records_count;
+	ext_rec_count = external_records_count;
+
 	DNS_SD_COUNT(&rec_num);
+	rec_count = rec_num;
 
 	while (rec_num > 0 || ext_rec_num > 0) {
 		/*
@@ -816,6 +1753,24 @@ static void send_sd_response(int sock,
 
 		/* Checks validity and then compare */
 		if (dns_sd_rec_match(record, &filter)) {
+			if (service_type_enum &&
+			    dns_sd_service_type_was_sent(record, rec_num, rec_count, ext_rec_num,
+							 ext_rec_count)) {
+				continue;
+			}
+
+			if (!query.legacy && answer_count > 0U) {
+				ret = dns_sd_suppress_known_answers(
+					record, &query, query_msg, query_size, answer_offset,
+					answer_count, service_type_enum, result);
+				if (ret != 0) {
+					if (ret < 0) {
+						NET_DBG("invalid known answer (%d)", ret);
+					}
+					continue;
+				}
+			}
+
 			NET_DBG("matched query: %s.%s.%s.%s port: %u",
 				record->instance, record->service,
 				record->proto, record->domain,
@@ -823,18 +1778,19 @@ static void send_sd_response(int sock,
 
 			/* Construct the response */
 			if (service_type_enum) {
-				ret = dns_sd_handle_service_type_enum(record, addr4, addr6,
-						result->data, net_buf_max_len(result));
+				ret = dns_sd_handle_service_type_enum(record, addr4, addr6, &query,
+								      result->data,
+								      net_buf_max_len(result));
 				if (ret < 0) {
 					NET_DBG("dns_sd_handle_service_type_enum() failed (%d)",
 						ret);
 					continue;
 				}
 			} else {
-				ret = dns_sd_handle_ptr_query(iface, record, addr4, addr6,
-						result->data, net_buf_max_len(result), false);
+				ret = dns_sd_handle_query(iface, record, addr4, addr6, &query,
+							  result->data, net_buf_max_len(result));
 				if (ret < 0) {
-					NET_DBG("dns_sd_handle_ptr_query() failed (%d)", ret);
+					NET_DBG("dns_sd_handle_query() failed (%d)", ret);
 					continue;
 				}
 			}
@@ -852,6 +1808,8 @@ static void send_sd_response(int sock,
 			}
 		}
 	}
+
+	k_mutex_unlock(&external_records_lock);
 }
 
 static int dns_read(int sock,
@@ -868,6 +1826,8 @@ static int dns_read(int sock,
 	struct net_buf *result;
 	struct dns_msg_t dns_msg;
 	uint16_t dns_id = 0U;
+	uint16_t answer_count;
+	uint16_t answer_offset;
 	int data_len;
 	int queries;
 	int ret;
@@ -892,6 +1852,22 @@ static int dns_read(int sock,
 	}
 
 	queries = ret;
+	answer_count = dns_unpack_header_ancount(dns_msg.msg);
+	answer_offset = dns_msg.query_offset;
+
+	if (answer_count > 0U) {
+		struct dns_msg_t scan = dns_msg;
+
+		for (int i = 0; i < queries; ++i) {
+			result->len = 0U;
+			ret = dns_unpack_query(&scan, result, NULL, NULL);
+			if (ret < 0) {
+				goto quit;
+			}
+		}
+
+		answer_offset = scan.query_offset;
+	}
 
 	NET_DBG("Received %d %s from %s:%u", queries,
 		queries > 1 ? "queries" : "query",
@@ -906,6 +1882,7 @@ static int dns_read(int sock,
 	do {
 		enum dns_rr_type qtype;
 		enum dns_class qclass;
+		struct net_addr reverse_addr;
 		uint8_t *lquery;
 
 		(void)memset(result->data, 0, net_buf_tailroom(result));
@@ -916,15 +1893,28 @@ static int dns_read(int sock,
 			goto quit;
 		}
 
-		/* Handle only .local queries */
-		lquery = strrchr(result->data, '.');
-		if (!lquery || memcmp(lquery, (const void *){ ".local" }, 7)) {
+		if ((qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_IN &&
+		    (qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_ANY) {
 			continue;
 		}
 
 		NET_DBG("[%d] query %s/%s label %s (%d bytes)", queries,
 			dns_qtype_to_str(qtype), "IN",
 			result->data, ret);
+
+		if (mdns_reverse_name_addr(result->data, &reverse_addr) == 0) {
+			send_reverse_response(sock, family, src_addr, addrlen, result, qtype,
+					      qclass, recv_if, dns_id, dns_msg.msg,
+					      dns_msg.msg_size, answer_offset, answer_count,
+					      &reverse_addr);
+			continue;
+		}
+
+		/* Handle only .local queries */
+		lquery = strrchr(result->data, '.');
+		if (!lquery || strcasecmp(lquery, ".local") != 0) {
+			continue;
+		}
 
 		/* If the query matches to our hostname, then send reply.
 		 * We skip the first dot, and make sure there is dot after
@@ -936,11 +1926,13 @@ static int dns_read(int sock,
 			NET_DBG("%s %s %s to our hostname %s%s", "mDNS",
 				family == NET_AF_INET ? "IPv4" : "IPv6", "query",
 				hostname, ".local");
-			send_response(sock, family, src_addr, addrlen,
-				      result, qtype, recv_if, dns_id);
-		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD)
-			&& qtype == DNS_RR_TYPE_PTR) {
-			send_sd_response(sock, family, src_addr, addrlen, result, recv_if);
+			send_response(sock, family, src_addr, addrlen, result, qtype, qclass,
+				      recv_if, dns_id, dns_msg.msg, dns_msg.msg_size, answer_offset,
+				      answer_count);
+		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD)) {
+			send_sd_response(sock, family, src_addr, addrlen, result, recv_if, qtype,
+					 qclass, dns_id, dns_msg.msg, dns_msg.msg_size,
+					 answer_offset, answer_count);
 		}
 
 	} while (--queries);
@@ -960,8 +1952,8 @@ quit:
  */
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 
-static int add_address(struct net_if *iface, net_sa_family_t family,
-		       const void *address, size_t addrlen)
+static int add_address(struct net_if *iface, net_sa_family_t family, const void *address,
+		       size_t addrlen, bool ready)
 {
 	size_t expected_len;
 	int first_free;
@@ -999,12 +1991,16 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
 			mon_if[j].in_use = true;
+			mon_if[j].pending_goodbye = false;
+			mon_if[j].ready = ready;
 			return -EALREADY;
 		}
 	}
 
 	if (first_free >= 0) {
 		mon_if[first_free].in_use = true;
+		mon_if[first_free].pending_goodbye = false;
+		mon_if[first_free].ready = ready;
 		mon_if[first_free].iface = iface;
 		mon_if[first_free].addr.family = family;
 
@@ -1021,8 +2017,8 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 	return -ENOENT;
 }
 
-static int del_address(struct net_if *iface, net_sa_family_t family,
-		       const void *address, size_t addrlen)
+static int del_address(struct net_if *iface, net_sa_family_t family, const void *address,
+		       size_t addrlen, bool goodbye)
 {
 	size_t expected_len;
 
@@ -1034,6 +2030,9 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 		expected_len = sizeof(struct net_in_addr);
 	} else {
 		expected_len = sizeof(struct net_in6_addr);
+	}
+	if (addrlen != expected_len) {
+		return -EINVAL;
 	}
 
 	ARRAY_FOR_EACH(mon_if, j) {
@@ -1050,7 +2049,15 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 		}
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
-			mon_if[j].in_use = false;
+			if (goodbye) {
+				mon_if[j].pending_goodbye = true;
+				mon_if[j].needs_announce = true;
+			} else {
+				mon_if[j].in_use = false;
+				mon_if[j].pending_goodbye = false;
+				mon_if[j].needs_announce = false;
+				mon_if[j].ready = false;
+			}
 			return 0;
 		}
 	}
@@ -1235,7 +2242,6 @@ static void probing(struct k_work *work)
 	}
 }
 
-#if defined(CONFIG_NET_DHCPV4)
 /* This is arbitrary delay to let things cool down a bit before announcing
  * the address.
  */
@@ -1266,7 +2272,6 @@ static void start_announce(struct net_if *iface)
 		NET_DBG("Cannot schedule %s announce work (%d)", "mDNS", ret);
 	}
 }
-#endif /* CONFIG_NET_DHCPV4 */
 
 #if defined(CONFIG_NET_IPV4)
 static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *iface, void *info,
@@ -1275,7 +2280,9 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 	uint32_t probe_delay = sys_rand32_get() % 250;
 	int ret;
 
-	if ((mgmt_event != NET_EVENT_IPV4_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV4_ADDR_DEL)) {
+	if ((mgmt_event != NET_EVENT_IPV4_ADDR_ADD) &&
+	    (mgmt_event != NET_EVENT_IPV4_ADDR_DEL) &&
+	    (mgmt_event != NET_EVENT_IPV4_ACD_SUCCEED)) {
 		return;
 	}
 
@@ -1289,9 +2296,19 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 		}
 
 		if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-			ret = add_address(iface, NET_AF_INET, info, info_length);
+			ret = add_address(iface, NET_AF_INET, info, info_length,
+					  !IS_ENABLED(CONFIG_NET_IPV4_ACD));
 			if (ret < 0 && ret != -EALREADY) {
 				NET_DBG("Cannot %s %s address (%d)", "add", "IPv4", ret);
+				return;
+			}
+
+			if (IS_ENABLED(CONFIG_NET_IPV4_ACD)) {
+				return;
+			}
+
+			if (init_listener_done) {
+				start_announce(iface);
 				return;
 			}
 
@@ -1305,8 +2322,33 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					"IPv4", "add", net_if_get_by_iface(iface),
 					&v4_ctx[i]);
 			}
+		} else if (mgmt_event == NET_EVENT_IPV4_ACD_SUCCEED) {
+			ret = add_address(iface, NET_AF_INET, info, info_length, true);
+			if (ret < 0 && ret != -EALREADY) {
+				NET_DBG("Cannot %s %s address (%d)", "validate", "IPv4", ret);
+				return;
+			}
+
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
+			ret = k_work_reschedule_for_queue(&mdns_work_q,
+							  &v4_ctx[i].probe_timer,
+							  K_MSEC(probe_delay));
+			if (ret < 0) {
+				NET_DBG("Cannot schedule %s probe work (%d)", "IPv4", ret);
+			} else {
+				NET_DBG("%s %s probing scheduled for iface %d ctx %p",
+					"IPv4", "ACD", net_if_get_by_iface(iface),
+					&v4_ctx[i]);
+			}
 		} else {
-			ret = del_address(iface, NET_AF_INET, info, info_length);
+			struct net_if_addr *ifaddr = net_if_ipv4_addr_lookup_by_iface(iface, info);
+			bool goodbye = ifaddr == NULL || ifaddr->addr_state != NET_ADDR_TENTATIVE;
+
+			ret = del_address(iface, NET_AF_INET, info, info_length, goodbye);
 			if (ret < 0) {
 				if (ret == -ENOENT) {
 					continue;
@@ -1315,9 +2357,16 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 				NET_DBG("Cannot %s %s address (%d)", "del", "IPv4", ret);
 				return;
 			}
+			if (!goodbye) {
+				return;
+			}
 
 			if (!net_if_is_up(iface)) {
 				continue;
+			}
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
 			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
@@ -1337,7 +2386,8 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 }
 
 NET_MGMT_REGISTER_EVENT_HANDLER(mdns_addr_ipv4_events,
-				NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL,
+				NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL |
+					NET_EVENT_IPV4_ACD_SUCCEED,
 				mdns_addr_ipv4_event_handler, NULL);
 #endif /* defined(CONFIG_NET_IPV4) */
 
@@ -1348,7 +2398,8 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 	uint32_t probe_delay = sys_rand32_get() % 250;
 	int ret;
 
-	if ((mgmt_event != NET_EVENT_IPV6_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV6_ADDR_DEL)) {
+	if ((mgmt_event != NET_EVENT_IPV6_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV6_ADDR_DEL) &&
+	    (mgmt_event != NET_EVENT_IPV6_DAD_SUCCEED)) {
 		return;
 	}
 
@@ -1362,9 +2413,25 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 		}
 
 		if (mgmt_event == NET_EVENT_IPV6_ADDR_ADD) {
-			ret = add_address(iface, NET_AF_INET6, info, info_length);
+			struct net_if_addr *ifaddr;
+			bool ready;
+
+			ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, info);
+			ready = !IS_ENABLED(CONFIG_NET_IPV6_DAD) ||
+				(ifaddr != NULL && ifaddr->addr_state != NET_ADDR_TENTATIVE);
+
+			ret = add_address(iface, NET_AF_INET6, info, info_length, ready);
 			if (ret < 0 && ret != -EALREADY) {
 				NET_DBG("Cannot %s %s address (%d)", "add", "IPv6", ret);
+				return;
+			}
+
+			if (!ready) {
+				return;
+			}
+
+			if (init_listener_done) {
+				start_announce(iface);
 				return;
 			}
 
@@ -1378,8 +2445,31 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					"IPv6", "add", net_if_get_by_iface(iface),
 					&v6_ctx[i]);
 			}
+		} else if (mgmt_event == NET_EVENT_IPV6_DAD_SUCCEED) {
+			ret = add_address(iface, NET_AF_INET6, info, info_length, true);
+			if (ret < 0 && ret != -EALREADY) {
+				NET_DBG("Cannot %s %s address (%d)", "validate", "IPv6", ret);
+				return;
+			}
+
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
+			ret = k_work_reschedule_for_queue(&mdns_work_q, &v6_ctx[i].probe_timer,
+							  K_MSEC(probe_delay));
+			if (ret < 0) {
+				NET_DBG("Cannot schedule %s probe work (%d)", "IPv6", ret);
+			} else {
+				NET_DBG("%s %s probing scheduled for iface %d ctx %p", "IPv6",
+					"DAD", net_if_get_by_iface(iface), &v6_ctx[i]);
+			}
 		} else {
-			ret = del_address(iface, NET_AF_INET6, info, info_length);
+			struct net_if_addr *ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, info);
+			bool goodbye = ifaddr == NULL || ifaddr->addr_state != NET_ADDR_TENTATIVE;
+
+			ret = del_address(iface, NET_AF_INET6, info, info_length, goodbye);
 			if (ret < 0) {
 				if (ret == -ENOENT) {
 					continue;
@@ -1388,9 +2478,16 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 				NET_DBG("Cannot %s %s address (%d)", "del", "IPv6", ret);
 				return;
 			}
+			if (!goodbye) {
+				return;
+			}
 
 			if (!net_if_is_up(iface)) {
 				continue;
+			}
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
 			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
@@ -1410,7 +2507,8 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 }
 
 NET_MGMT_REGISTER_EVENT_HANDLER(mdns_addr_ipv6_events,
-				NET_EVENT_IPV6_ADDR_ADD | NET_EVENT_IPV6_ADDR_DEL,
+				NET_EVENT_IPV6_ADDR_ADD | NET_EVENT_IPV6_ADDR_DEL |
+					NET_EVENT_IPV6_DAD_SUCCEED,
 				mdns_addr_ipv6_event_handler, NULL);
 #endif /* defined(CONFIG_NET_IPV6) */
 
@@ -2135,8 +3233,7 @@ int mdns_responder_disable_iface(struct net_if *iface)
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 
 #define ANNOUNCE_TIMEOUT 1 /* in seconds, RFC 6762 ch 8.3 */
-
-/* ATM we do only .local announcing, SD announcing is TODO */
+#define ANNOUNCE_COUNT   2
 
 static int send_unsolicited_response(struct net_if *iface,
 				     int sock,
@@ -2151,7 +3248,7 @@ static int send_unsolicited_response(struct net_if *iface,
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
-	ret = setup_dst_addr(sock, family, NULL, 0, (struct net_sockaddr *)&dst, &dst_len);
+	ret = setup_dst_addr(sock, family, NULL, 0, false, (struct net_sockaddr *)&dst, &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
 		return ret;
@@ -2183,7 +3280,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		return NULL;
 	}
 
-	setup_dns_hdr(answer->data, 1, 0, 0);
+	setup_dns_hdr(answer->data, 1, 0, 0, 0);
 	net_buf_add(answer, DNS_MSG_HEADER_SIZE);
 
 	answer_count = 0U;
@@ -2192,7 +3289,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		uint16_t type;
 		size_t left;
 
-		if (!addr_list[i].in_use) {
+		if (!addr_list[i].in_use || !addr_list[i].ready) {
 			continue;
 		}
 
@@ -2242,8 +3339,8 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		}
 
 		net_buf_add_be16(answer, type);
-		net_buf_add_be16(answer, DNS_CLASS_IN);
-		net_buf_add_be32(answer, ttl);
+		net_buf_add_be16(answer, DNS_CLASS_IN | DNS_CLASS_FLUSH);
+		net_buf_add_be32(answer, addr_list[i].pending_goodbye ? 0 : ttl);
 
 		if (type == DNS_RR_TYPE_A) {
 			net_buf_add_be16(answer, sizeof(struct net_in_addr));
@@ -2256,6 +3353,11 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		}
 
 		answer_count++;
+	}
+
+	if (answer_count == 0U) {
+		net_buf_unref(answer);
+		return NULL;
 	}
 
 	/* Adjust the answer count in the header */
@@ -2285,6 +3387,44 @@ static bool check_if_needs_announce(struct net_if *iface)
 	return false;
 }
 
+static void clear_pending_goodbyes(struct net_if *iface)
+{
+	ARRAY_FOR_EACH(mon_if, i) {
+		if (mon_if[i].in_use && mon_if[i].iface == iface && mon_if[i].pending_goodbye) {
+			mon_if[i].in_use = false;
+			mon_if[i].pending_goodbye = false;
+			mon_if[i].needs_announce = false;
+			mon_if[i].ready = false;
+		}
+	}
+}
+
+static void mark_goodbye_transport(struct net_if *iface, uint8_t *transports, uint8_t transport)
+{
+	int idx = net_if_get_by_iface(iface) - 1;
+
+	if (idx >= 0 && idx < (int)ARRAY_SIZE(goodbye_attempted)) {
+		transports[idx] |= transport;
+	}
+}
+
+static void clear_sent_goodbyes(void)
+{
+	ARRAY_FOR_EACH(mon_if, i) {
+		int idx;
+
+		if (!mon_if[i].in_use || !mon_if[i].pending_goodbye) {
+			continue;
+		}
+
+		idx = net_if_get_by_iface(mon_if[i].iface) - 1;
+		if (idx >= 0 && idx < (int)ARRAY_SIZE(goodbye_attempted) &&
+		    goodbye_attempted[idx] != 0U && goodbye_attempted[idx] == goodbye_sent[idx]) {
+			clear_pending_goodbyes(mon_if[i].iface);
+		}
+	}
+}
+
 #if defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
 /* RFC 6762 8.3 requires announcing all newly registered records, not just addresses. Sends
  * one extra packet per service via dns_sd_handle_ptr_query() (already used for direct
@@ -2299,7 +3439,7 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 	const struct dns_sd_rec *record;
 	struct net_buf *answer;
 	size_t rec_num;
-	size_t ext_rec_num = external_records_count;
+	size_t ext_rec_num;
 	int ret;
 
 	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
@@ -2314,6 +3454,9 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 	if (answer == NULL) {
 		return;
 	}
+
+	k_mutex_lock(&external_records_lock, K_FOREVER);
+	ext_rec_num = external_records_count;
 
 	DNS_SD_COUNT(&rec_num);
 
@@ -2344,14 +3487,45 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 		}
 	}
 
+	k_mutex_unlock(&external_records_lock);
 	net_buf_unref(answer);
 }
-#endif /* CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD */
 
-static int send_announce(const char *name)
+static void send_dns_sd_goodbyes_on_transport(struct net_if *iface, int sock,
+					      net_sa_family_t family,
+					      const struct dns_sd_rec *records, size_t count)
 {
 	struct net_buf *answer;
 	int ret;
+
+	answer = net_buf_alloc(&mdns_msg_pool, BUF_ALLOC_TIMEOUT);
+	if (answer == NULL) {
+		return;
+	}
+
+	for (size_t i = 0U; i < count; ++i) {
+		ret = dns_sd_handle_goodbye(&records[i], answer->data, net_buf_max_len(answer));
+		if (ret < 0) {
+			continue;
+		}
+
+		answer->len = ret;
+		ret = send_unsolicited_response(iface, sock, family, NULL, 0U, answer);
+		if (ret < 0) {
+			NET_DBG("Cannot send %s DNS-SD goodbye for %s.%s.%s.%s (%d)", "mDNS",
+				records[i].instance, records[i].service, records[i].proto,
+				records[i].domain, ret);
+		}
+	}
+
+	net_buf_unref(answer);
+}
+
+static void send_dns_sd_goodbyes(const struct dns_sd_rec *records, size_t count)
+{
+	if (!init_listener_done || records == NULL || count == 0U) {
+		return;
+	}
 
 #if defined(CONFIG_NET_IPV4)
 	struct net_sockaddr_in dst_addr4;
@@ -2360,13 +3534,63 @@ static int send_announce(const char *name)
 
 	ARRAY_FOR_EACH(v4_ctx, i) {
 		if (v4_ctx[i].sock < 0 || v4_ctx[i].iface == NULL ||
-		    !net_if_is_up(v4_ctx[i].iface)) {
+		    !net_if_is_up(v4_ctx[i].iface) ||
+		    net_ipv4_is_addr_unspecified(
+			    net_if_ipv4_select_src_addr(v4_ctx[i].iface, &dst_addr4.sin_addr))) {
+			continue;
+		}
+
+		send_dns_sd_goodbyes_on_transport(v4_ctx[i].iface, v4_ctx[i].sock, NET_AF_INET,
+						  records, count);
+	}
+#endif /* CONFIG_NET_IPV4 */
+
+#if defined(CONFIG_NET_IPV6)
+	struct net_sockaddr_in6 dst_addr6;
+
+	create_ipv6_addr(&dst_addr6);
+
+	ARRAY_FOR_EACH(v6_ctx, i) {
+		if (v6_ctx[i].sock < 0 || v6_ctx[i].iface == NULL ||
+		    !net_if_is_up(v6_ctx[i].iface) ||
+		    net_ipv6_is_addr_unspecified(
+			    net_if_ipv6_select_src_addr(v6_ctx[i].iface, &dst_addr6.sin6_addr))) {
+			continue;
+		}
+
+		send_dns_sd_goodbyes_on_transport(v6_ctx[i].iface, v6_ctx[i].sock, NET_AF_INET6,
+						  records, count);
+	}
+#endif /* CONFIG_NET_IPV6 */
+}
+#endif /* CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD */
+
+static int send_announce(const char *name)
+{
+	struct net_buf *answer;
+	int ret;
+
+	memset(goodbye_attempted, 0, sizeof(goodbye_attempted));
+	memset(goodbye_sent, 0, sizeof(goodbye_sent));
+
+#if defined(CONFIG_NET_IPV4)
+	struct net_sockaddr_in dst_addr4;
+
+	create_ipv4_addr(&dst_addr4);
+
+	ARRAY_FOR_EACH(v4_ctx, i) {
+		if (v4_ctx[i].sock < 0 || v4_ctx[i].iface == NULL ||
+		    !net_if_is_up(v4_ctx[i].iface) ||
+		    net_ipv4_is_addr_unspecified(
+			    net_if_ipv4_select_src_addr(v4_ctx[i].iface, &dst_addr4.sin_addr))) {
 			continue;
 		}
 
 		if (!check_if_needs_announce(v4_ctx[i].iface)) {
 			continue;
 		}
+
+		mark_goodbye_transport(v4_ctx[i].iface, goodbye_attempted, MDNS_TRANSPORT_IPV4);
 
 		answer = create_unsolicited_mdns_answer(v4_ctx[i].iface,
 							name,
@@ -2391,6 +3615,8 @@ static int send_announce(const char *name)
 			continue;
 		}
 
+		mark_goodbye_transport(v4_ctx[i].iface, goodbye_sent, MDNS_TRANSPORT_IPV4);
+
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v4_ctx[i].iface));
 
@@ -2408,13 +3634,17 @@ static int send_announce(const char *name)
 
 	ARRAY_FOR_EACH(v6_ctx, i) {
 		if (v6_ctx[i].sock < 0 || v6_ctx[i].iface == NULL ||
-		    !net_if_is_up(v6_ctx[i].iface)) {
+		    !net_if_is_up(v6_ctx[i].iface) ||
+		    net_ipv6_is_addr_unspecified(
+			    net_if_ipv6_select_src_addr(v6_ctx[i].iface, &dst_addr6.sin6_addr))) {
 			continue;
 		}
 
 		if (!check_if_needs_announce(v6_ctx[i].iface)) {
 			continue;
 		}
+
+		mark_goodbye_transport(v6_ctx[i].iface, goodbye_attempted, MDNS_TRANSPORT_IPV6);
 
 		answer = create_unsolicited_mdns_answer(v6_ctx[i].iface,
 							name,
@@ -2439,6 +3669,8 @@ static int send_announce(const char *name)
 			continue;
 		}
 
+		mark_goodbye_transport(v6_ctx[i].iface, goodbye_sent, MDNS_TRANSPORT_IPV6);
+
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v6_ctx[i].iface));
 
@@ -2448,6 +3680,8 @@ static int send_announce(const char *name)
 #endif
 	}
 #endif /* defined(CONFIG_NET_IPV6) */
+
+	clear_sent_goodbyes();
 
 	return 0;
 }
@@ -2469,12 +3703,13 @@ static void announce_start(struct k_work *work)
 	do_announce = true;
 	announce_count++;
 
-	/* Do not re-schedule if we were triggered by the DHCP BOUND event */
-	if (COND_CODE_1(CONFIG_NET_DHCPV4, (&announce_timer != dwork), (true))) {
+	if (announce_count < ANNOUNCE_COUNT) {
 		ret = k_work_reschedule_for_queue(&mdns_work_q, dwork, K_SECONDS(ANNOUNCE_TIMEOUT));
 		if (ret < 0) {
 			NET_DBG("Cannot schedule %s work (%d)", "announce", ret);
 		}
+	} else {
+		mark_needs_announce(NULL, false);
 	}
 }
 
@@ -2488,7 +3723,7 @@ static void do_init_listener(struct k_work *work)
 	}
 
 	if (do_announce) {
-		if (announce_count < 1) {
+		if (announce_count < ANNOUNCE_COUNT) {
 			announce_start(work);
 		} else {
 			mark_needs_announce(NULL, false);
@@ -2552,12 +3787,23 @@ static int mdns_responder_init(void)
 
 int mdns_responder_set_ext_records(const struct dns_sd_rec *records, size_t count)
 {
-	if (records == NULL || count == 0) {
+	if ((records == NULL) != (count == 0U)) {
 		return -EINVAL;
 	}
 
+	k_mutex_lock(&external_records_lock, K_FOREVER);
+#if defined(CONFIG_MDNS_RESPONDER_PROBE) && defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
+	send_dns_sd_goodbyes(external_records, external_records_count);
+#endif
 	external_records = records;
 	external_records_count = count;
+	k_mutex_unlock(&external_records_lock);
+
+#if defined(CONFIG_MDNS_RESPONDER_PROBE) && defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
+	if (count > 0U) {
+		start_announce(NULL);
+	}
+#endif
 
 	return 0;
 }

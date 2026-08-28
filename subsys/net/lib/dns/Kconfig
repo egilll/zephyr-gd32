@@ -238,9 +238,11 @@ config MDNS_RESPONDER
 	select NET_SOCKETS_SERVICE
 	depends on NET_HOSTNAME_ENABLE
 	help
-	  This option enables the mDNS responder support for Zephyr.
-	  It will listen well-known address ff02::fb and 224.0.0.251.
-	  Currently this only returns IP address information.
+	  This option enables the mDNS responder support for Zephyr. It listens
+	  on the well-known addresses ff02::fb and 224.0.0.251 and answers
+	  queries for <hostname>.local address and reverse-address records.
+	  DNS Service Discovery records are also served when
+	  CONFIG_MDNS_RESPONDER_DNS_SD is enabled.
 	  You must set CONFIG_NET_HOSTNAME to some meaningful value and
 	  then mDNS will start to respond to <hostname>.local mDNS queries.
 	  See RFC 6762 for more details about mDNS.
@@ -372,6 +374,7 @@ config MDNS_RESPONDER_DNS_SD_SERVICE_TYPE_ENUMERATION
 
 config MDNS_RESPONDER_ANNOUNCE_DNS_SD
 	bool "Include DNS-SD service records in mDNS announcements"
+	default y
 	depends on MDNS_RESPONDER_PROBE
 	help
 	  RFC 6762 Section 8.3 requires the startup announcement to contain
@@ -381,12 +384,9 @@ config MDNS_RESPONDER_ANNOUNCE_DNS_SD
 	  DNS_SD_REGISTER_SERVICE() (and any records set through
 	  mdns_responder_set_ext_records()).
 
-	  Enable this for full RFC 6762 compliance. Leave disabled to keep
-	  announcements limited to address records only (smaller, less
-	  frequent traffic on startup) -- clients that actively query for
-	  services (e.g. avahi-browse) are unaffected either way, since
-	  normal query/response handling already answers DNS-SD queries
-	  regardless of this option.
+	  Disable this only when smaller, less frequent startup traffic is
+	  preferred over complete RFC 6762 announcements. Normal queries still
+	  receive DNS-SD responses when this option is disabled.
 
 endif # MDNS_RESPONDER_DNS_SD
 

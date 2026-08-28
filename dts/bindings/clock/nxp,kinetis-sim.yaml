@@ -21,6 +21,17 @@ properties:
     required: true
     description: er32k selection for clock system
 
+  sdhc-source:
+    type: int
+    enum:
+      - 0
+      - 1
+      - 2
+      - 3
+    description: |
+      SDHC clock source selected in SIM_SOPT2[SDHCSRC]. The values select
+      core/system clock, PLLFLLSEL, OSCERCLK, and SDHC0_CLKIN respectively.
+
   clkout-source:
     type: int
     description: clkout clock source

@@ -23,13 +23,13 @@ properties:
     type: int
     required: true
     description: |
-      Number of configured OUT endpoints including control endpoint.
+      Number of configured IN endpoints including control endpoint.
 
   num-out-eps:
     type: int
     required: true
     description: |
-      Number of configured IN endpoints including control endpoint.
+      Number of configured OUT endpoints including control endpoint.
 
   ghwcfg1:
     type: int
@@ -44,6 +44,17 @@ properties:
     description: |
       Value of the GHWCFG2 register. It is used to determine available endpoint
       types during driver pre-initialization.
+
+  ghwcfg3:
+    type: int
+    description: |
+      Value of the GHWCFG3 register.
+
+      Only a subset of fields is used by the UDC driver (DFIFODEPTH, transfer
+      size width, packet count width). Some integrations do not expose GHWCFG*
+      registers in the register map; the UDC driver detects this case
+      automatically (GHWCFG2 and GHWCFG4 both read as zero) and falls back to
+      the values from devicetree.
 
   ghwcfg4:
     type: int

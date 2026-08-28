@@ -11,6 +11,7 @@ LOG_MODULE_REGISTER(mdns_resp_probe_test);
 #include <stdint.h>
 #include <string.h>
 
+#include <ipv4.h>
 #include <ipv6.h>
 
 #include <zephyr/net/dns_sd.h>
@@ -24,6 +25,7 @@ LOG_MODULE_REGISTER(mdns_resp_probe_test);
 #include <zephyr/ztest.h>
 
 #include "dns_pack.h"
+#include "dns_sd.h"
 
 /* Why this is a separate test suite/directory instead of living in
  * tests/net/lib/mdns_responder/:
@@ -80,6 +82,7 @@ static const uint8_t ipv6_hdr_rest[] = {0x11, 0xff, 0xfe, 0x80, 0x00, 0x00, 0x00
 					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb};
 
 static uint8_t mdns_server_ipv6_addr[] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb};
+static uint8_t mdns_server_ipv4_addr[] = {224, 0, 0, 251};
 
 static struct net_in6_addr ll_addr = {
 	{{0xfe, 0x80, 0x43, 0xb8, 0, 0, 0, 0, 0x9f, 0x74, 0x88, 0x9c, 0x1b, 0x44, 0x72, 0x39}}};
@@ -88,6 +91,7 @@ static struct net_in6_addr sender_ll_addr = {
 	{{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x9f, 0x74, 0x88, 0x9c, 0x1b, 0x44, 0x72, 0x39}}};
 
 static bool test_started;
+static bool capture_ipv4;
 static struct k_sem wait_data;
 static struct net_pkt *response_pkts[8];
 static size_t responses_count;
@@ -122,16 +126,23 @@ static void net_iface_init(struct net_if *iface)
 
 static int sender_iface(const struct device *dev, struct net_pkt *pkt)
 {
-	struct net_ipv6_hdr *hdr;
-
 	if (!pkt->buffer) {
 		return -ENODATA;
 	}
 
 	if (test_started && net_pkt_family(pkt) == NET_AF_INET6) {
-		hdr = NET_IPV6_HDR(pkt);
+		struct net_ipv6_hdr *hdr = NET_IPV6_HDR(pkt);
 
 		if (net_ipv6_addr_cmp_raw(hdr->dst, mdns_server_ipv6_addr) &&
+		    responses_count < ARRAY_SIZE(response_pkts)) {
+			net_pkt_ref(pkt);
+			response_pkts[responses_count++] = pkt;
+			k_sem_give(&wait_data);
+		}
+	} else if (test_started && capture_ipv4 && net_pkt_family(pkt) == NET_AF_INET) {
+		struct net_ipv4_hdr *hdr = NET_IPV4_HDR(pkt);
+
+		if (net_ipv4_addr_cmp_raw(hdr->dst, mdns_server_ipv4_addr) &&
 		    responses_count < ARRAY_SIZE(response_pkts)) {
 			net_pkt_ref(pkt);
 			response_pkts[responses_count++] = pkt;
@@ -196,6 +207,7 @@ static void before(void *d)
 
 	responses_count = 0;
 	test_started = true;
+	capture_ipv4 = false;
 }
 
 static void cleanup(void *d)
@@ -203,6 +215,7 @@ static void cleanup(void *d)
 	ARG_UNUSED(d);
 
 	test_started = false;
+	capture_ipv4 = false;
 
 	for (size_t i = 0; i < responses_count; ++i) {
 		if (response_pkts[i]) {
@@ -321,6 +334,17 @@ static bool responder_answers_query(void)
 	return false;
 }
 
+static bool wait_for_responder(void)
+{
+	for (int i = 0; i < PROBE_MAX_POLLS; ++i) {
+		if (responder_answers_query()) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /* Peeks at a captured packet's first Answer record without any fatal
  * assertions (unlike validate_label()/check_*_resp() elsewhere in this
  * codebase) -- needed here because this test doesn't know in advance which of
@@ -363,14 +387,401 @@ static bool packet_has_ptr_answer(struct net_pkt *pkt, const char *service, cons
 	return true;
 }
 
-/* Regression test for the RFC 6762 8.3 announce-completeness feature:
- * send_announce() used to only ever announce address (A/AAAA) records on
- * startup/re-announce, never a registered DNS-SD service's PTR/SRV/TXT
- * records, even though RFC 6762 8.3 requires announcing *all* of a
- * responder's newly registered records. This registers one external DNS-SD
- * record, drives the responder through a normal (non-racing) bring-up, and
- * checks that at least one of the announce packets sent to the mDNS group
- * is a PTR answer for that service -- not just the address-only announce.
+static bool skip_dns_name(struct net_pkt *pkt)
+{
+	uint8_t label_len;
+
+	while (net_pkt_read_u8(pkt, &label_len) == 0) {
+		if (label_len == 0U) {
+			return true;
+		}
+
+		if ((label_len & 0xc0) == 0xc0) {
+			return net_pkt_skip(pkt, 1U) == 0;
+		}
+
+		if ((label_len & 0xc0) != 0U || label_len > DNS_LABEL_MAX_SIZE ||
+		    net_pkt_skip(pkt, label_len) != 0) {
+			return false;
+		}
+	}
+
+	return false;
+}
+
+static void check_complete_dns_sd_announce(struct net_pkt *pkt)
+{
+	struct dns_header header;
+	uint16_t answer_count;
+	bool found_address = false;
+	bool found_nsec = false;
+	bool found_ptr = false;
+	bool found_srv = false;
+	bool found_txt = false;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "Missing IP/UDP header");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "Missing DNS header");
+	zassert_equal(net_ntohs(header.id), 0U, "Announcement has a transaction ID");
+	zassert_equal(net_ntohs(header.flags), BIT(15) | BIT(10), "Unexpected announcement flags");
+	zassert_equal(net_ntohs(header.qdcount), 0U, "Announcement contains a question");
+	zassert_equal(net_ntohs(header.nscount), 0U, "Announcement contains authority records");
+	zassert_equal(net_ntohs(header.arcount), 0U,
+		      "Announcement placed records in the Additional section");
+
+	answer_count = net_ntohs(header.ancount);
+	zassert_true(answer_count >= 5U, "Incomplete DNS-SD announcement");
+
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		uint32_t expected_ttl;
+		uint32_t ttl;
+		uint16_t class_;
+		uint16_t expected_class;
+		uint16_t rdlength;
+		uint16_t type;
+
+		zassert_true(skip_dns_name(pkt), "Invalid answer owner name");
+		zassert_ok(net_pkt_read_be16(pkt, &type), "Missing answer type");
+		zassert_ok(net_pkt_read_be16(pkt, &class_), "Missing answer class");
+		zassert_ok(net_pkt_read_be32(pkt, &ttl), "Missing answer TTL");
+		zassert_ok(net_pkt_read_be16(pkt, &rdlength), "Missing RDATA length");
+
+		switch (type) {
+		case DNS_RR_TYPE_PTR:
+			expected_class = DNS_CLASS_IN;
+			expected_ttl = DNS_SD_PTR_TTL;
+			found_ptr = true;
+			break;
+		case DNS_RR_TYPE_TXT:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			expected_ttl = DNS_SD_TXT_TTL;
+			found_txt = true;
+			break;
+		case DNS_RR_TYPE_SRV:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			expected_ttl = DNS_SD_SRV_TTL;
+			found_srv = true;
+			break;
+		case DNS_RR_TYPE_A:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			expected_ttl = DNS_SD_A_TTL;
+			found_address = true;
+			break;
+		case DNS_RR_TYPE_AAAA:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			expected_ttl = DNS_SD_AAAA_TTL;
+			found_address = true;
+			break;
+		case DNS_RR_TYPE_NSEC:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			expected_ttl = DNS_SD_A_TTL;
+			found_nsec = true;
+			break;
+		default:
+			zassert_unreachable("Unexpected DNS-SD announcement record type");
+			return;
+		}
+
+		zassert_equal(class_, expected_class, "Unexpected class for type %u", type);
+		zassert_equal(ttl, expected_ttl, "Unexpected TTL for type %u", type);
+		zassert_ok(net_pkt_skip(pkt, rdlength), "Truncated answer RDATA");
+	}
+
+	zassert_true(found_ptr, "Announcement is missing its PTR record");
+	zassert_true(found_srv, "Announcement is missing its SRV record");
+	zassert_true(found_txt, "Announcement is missing its TXT record");
+	zassert_true(found_address, "Announcement is missing its address record");
+	zassert_true(found_nsec, "Announcement is missing its negative address record");
+}
+
+static void check_complete_dns_sd_goodbye(struct net_pkt *pkt)
+{
+	struct dns_header header;
+	bool found_ptr = false;
+	bool found_srv = false;
+	bool found_txt = false;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "Missing IP/UDP header");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "Missing DNS header");
+	zassert_equal(net_ntohs(header.id), 0U, "Goodbye has a transaction ID");
+	zassert_equal(net_ntohs(header.flags), BIT(15) | BIT(10), "Unexpected goodbye flags");
+	zassert_equal(net_ntohs(header.qdcount), 0U, "Goodbye contains a question");
+	zassert_equal(net_ntohs(header.ancount), 3U, "Unexpected goodbye answer count");
+	zassert_equal(net_ntohs(header.nscount), 0U, "Goodbye contains authority records");
+	zassert_equal(net_ntohs(header.arcount), 0U, "Goodbye contains additional records");
+
+	for (uint16_t i = 0U; i < 3U; ++i) {
+		uint32_t ttl;
+		uint16_t class_;
+		uint16_t expected_class;
+		uint16_t rdlength;
+		uint16_t type;
+
+		zassert_true(skip_dns_name(pkt), "Invalid goodbye owner name");
+		zassert_ok(net_pkt_read_be16(pkt, &type), "Missing goodbye type");
+		zassert_ok(net_pkt_read_be16(pkt, &class_), "Missing goodbye class");
+		zassert_ok(net_pkt_read_be32(pkt, &ttl), "Missing goodbye TTL");
+		zassert_ok(net_pkt_read_be16(pkt, &rdlength), "Missing goodbye RDATA length");
+
+		switch (type) {
+		case DNS_RR_TYPE_PTR:
+			expected_class = DNS_CLASS_IN;
+			found_ptr = true;
+			break;
+		case DNS_RR_TYPE_SRV:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			found_srv = true;
+			break;
+		case DNS_RR_TYPE_TXT:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			found_txt = true;
+			break;
+		default:
+			zassert_unreachable("Unexpected goodbye record type");
+			return;
+		}
+
+		zassert_equal(class_, expected_class, "Unexpected goodbye class for type %u", type);
+		zassert_equal(ttl, 0U, "Nonzero goodbye TTL for type %u", type);
+		zassert_ok(net_pkt_skip(pkt, rdlength), "Truncated goodbye RDATA");
+	}
+
+	zassert_true(found_ptr, "Goodbye is missing its PTR record");
+	zassert_true(found_srv, "Goodbye is missing its SRV record");
+	zassert_true(found_txt, "Goodbye is missing its TXT record");
+}
+
+static bool packet_has_address_answer(struct net_pkt *pkt, uint16_t expected_type,
+				      const void *expected_addr, size_t addr_len, uint32_t ttl)
+{
+	struct dns_header header;
+	size_t header_len;
+	uint16_t answer_count;
+
+	if (net_pkt_family(pkt) == NET_AF_INET) {
+		header_len = NET_IPV4UDPH_LEN;
+	} else if (net_pkt_family(pkt) == NET_AF_INET6) {
+		header_len = NET_IPV6UDPH_LEN;
+	} else {
+		return false;
+	}
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+
+	if (net_pkt_skip(pkt, header_len) != 0 || net_pkt_read(pkt, &header, sizeof(header)) != 0 ||
+	    (net_ntohs(header.flags) & BIT(15)) == 0 || net_ntohs(header.qdcount) != 0U) {
+		return false;
+	}
+
+	answer_count = net_ntohs(header.ancount);
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		struct net_in6_addr answer_addr;
+		uint32_t answer_ttl;
+		uint16_t class_;
+		uint16_t type;
+		uint16_t rdlength;
+
+		if (!skip_dns_name(pkt) || net_pkt_read_be16(pkt, &type) != 0 ||
+		    net_pkt_read_be16(pkt, &class_) != 0 ||
+		    net_pkt_read_be32(pkt, &answer_ttl) != 0 ||
+		    net_pkt_read_be16(pkt, &rdlength) != 0) {
+			return false;
+		}
+
+		if (type == expected_type && class_ == (DNS_CLASS_IN | DNS_CLASS_FLUSH) &&
+		    rdlength == addr_len) {
+			if (net_pkt_read(pkt, &answer_addr, addr_len) != 0) {
+				return false;
+			}
+
+			if (answer_ttl == ttl &&
+			    memcmp(&answer_addr, expected_addr, addr_len) == 0) {
+				return true;
+			}
+		} else if (net_pkt_skip(pkt, rdlength) != 0) {
+			return false;
+		}
+	}
+
+	return false;
+}
+
+static bool packet_has_aaaa_answer(struct net_pkt *pkt, const struct net_in6_addr *addr,
+				   uint32_t ttl)
+{
+	return packet_has_address_answer(pkt, DNS_RR_TYPE_AAAA, addr, sizeof(*addr), ttl);
+}
+
+static bool packet_has_a_answer(struct net_pkt *pkt, const struct net_in_addr *addr, uint32_t ttl)
+{
+	return packet_has_address_answer(pkt, DNS_RR_TYPE_A, addr, sizeof(*addr), ttl);
+}
+
+static void clear_responses(void)
+{
+	for (size_t i = 0; i < responses_count; ++i) {
+		if (response_pkts[i] != NULL) {
+			net_pkt_unref(response_pkts[i]);
+			response_pkts[i] = NULL;
+		}
+	}
+
+	responses_count = 0U;
+	while (k_sem_take(&wait_data, K_NO_WAIT) == 0) {
+	}
+}
+
+static bool wait_for_aaaa_answers(const struct net_in6_addr *addr, uint32_t ttl,
+				  size_t expected_count)
+{
+	size_t answer_count = 0U;
+	size_t checked_count = 0U;
+
+	for (int poll = 0; poll < PROBE_MAX_POLLS; ++poll) {
+		for (size_t i = checked_count; i < responses_count; ++i) {
+			if (packet_has_aaaa_answer(response_pkts[i], addr, ttl)) {
+				answer_count++;
+			}
+		}
+		if (answer_count >= expected_count) {
+			return true;
+		}
+
+		checked_count = responses_count;
+		(void)k_sem_take(&wait_data, RESPONSE_TIMEOUT);
+	}
+
+	return false;
+}
+
+static bool wait_for_a_answers(const struct net_in_addr *addr, uint32_t ttl, size_t expected_count)
+{
+	size_t answer_count = 0U;
+	size_t checked_count = 0U;
+
+	for (int poll = 0; poll < PROBE_MAX_POLLS; ++poll) {
+		for (size_t i = checked_count; i < responses_count; ++i) {
+			if (packet_has_a_answer(response_pkts[i], addr, ttl)) {
+				answer_count++;
+			}
+		}
+		if (answer_count >= expected_count) {
+			return true;
+		}
+
+		checked_count = responses_count;
+		(void)k_sem_take(&wait_data, RESPONSE_TIMEOUT);
+	}
+
+	return false;
+}
+
+ZTEST(test_mdns_responder_probe, test_address_change_announce_and_goodbye)
+{
+	static const struct net_in6_addr changed_addr = {
+		{{0xfe, 0x80, 0x43, 0xb8, 0, 0, 0, 0, 0x9f, 0x74, 0x88, 0x9c, 0x1b, 0x44, 0x72,
+		  0x40}}};
+	struct net_if_addr *ifaddr;
+
+	zassert_true(wait_for_responder(), "Responder did not finish startup");
+	k_sleep(RESPONSE_TIMEOUT);
+	clear_responses();
+
+	ifaddr = net_if_ipv6_addr_add(iface1, &changed_addr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "Failed to add changed address");
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+	zassert_true(wait_for_aaaa_answers(&changed_addr, CONFIG_MDNS_RESPONDER_TTL, 2U),
+		     "Added address was not announced twice");
+
+	clear_responses();
+	zassert_true(net_if_ipv6_addr_rm(iface1, &changed_addr),
+		     "Failed to remove changed address");
+	zassert_true(wait_for_aaaa_answers(&changed_addr, 0U, 1U),
+		     "Removed address was not sent with TTL zero");
+
+	/* sender_iface() wakes this thread before zsock_sendto() returns. */
+	k_sleep(RESPONSE_TIMEOUT);
+	clear_responses();
+	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_DEL, iface1, &changed_addr,
+					sizeof(changed_addr));
+	k_sleep(RESPONSE_TIMEOUT);
+	for (size_t i = 0; i < responses_count; ++i) {
+		zassert_false(packet_has_aaaa_answer(response_pkts[i], &changed_addr, 0U),
+			      "Retired address was announced again");
+	}
+}
+
+ZTEST(test_mdns_responder_probe, test_address_goodbye_uses_both_transports)
+{
+	static const struct net_in_addr changed_addr = {{{192, 0, 2, 44}}};
+	struct net_if_addr *ifaddr;
+
+	zassert_true(wait_for_responder(), "Responder did not finish startup");
+	k_sleep(RESPONSE_TIMEOUT);
+	clear_responses();
+
+	ifaddr = net_if_ipv4_addr_add(iface1, &changed_addr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "Failed to add changed IPv4 address");
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+	zassert_true(wait_for_a_answers(&changed_addr, CONFIG_MDNS_RESPONDER_TTL, 2U),
+		     "IPv4 address was not announced over IPv6 twice");
+
+	clear_responses();
+	zassert_true(net_if_ipv4_addr_rm(iface1, &changed_addr),
+		     "Failed to remove changed IPv4 address");
+	zassert_true(wait_for_a_answers(&changed_addr, 0U, 1U),
+		     "IPv4 goodbye was not sent over the IPv6 transport");
+}
+
+ZTEST(test_mdns_responder_probe, test_tentative_ipv6_waits_for_dad)
+{
+	struct net_if_addr *ifaddr;
+
+	zassert_true(wait_for_responder(), "Responder did not finish startup");
+	k_sleep(RESPONSE_TIMEOUT);
+	clear_responses();
+
+	ifaddr = net_if_ipv6_addr_lookup_by_iface(iface1, &ll_addr);
+	zassert_not_null(ifaddr, "Test address is missing");
+	net_if_flag_clear(iface1, NET_IF_IPV6_NO_ND);
+	ifaddr->addr_state = NET_ADDR_TENTATIVE;
+	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_ADD, iface1, &ll_addr, sizeof(ll_addr));
+	/* A different lifecycle event must not expose the address while DAD is pending. */
+	capture_ipv4 = true;
+	net_mgmt_event_notify(NET_EVENT_IF_UP, iface1);
+	k_sleep(RESPONSE_TIMEOUT);
+	for (size_t i = 0; i < responses_count; ++i) {
+		zassert_false(packet_has_aaaa_answer(response_pkts[i], &ll_addr,
+						     CONFIG_MDNS_RESPONDER_TTL),
+			      "Tentative IPv6 address was announced before DAD completed");
+	}
+	capture_ipv4 = false;
+	clear_responses();
+	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_DEL, iface1, &ll_addr, sizeof(ll_addr));
+	k_sleep(RESPONSE_TIMEOUT);
+	for (size_t i = 0; i < responses_count; ++i) {
+		zassert_false(packet_has_aaaa_answer(response_pkts[i], &ll_addr, 0U),
+			      "Failed DAD produced a goodbye for an unannounced address");
+	}
+	clear_responses();
+
+	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_ADD, iface1, &ll_addr, sizeof(ll_addr));
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_DAD_SUCCEED, iface1, &ll_addr,
+					sizeof(ll_addr));
+	zassert_true(wait_for_aaaa_answers(&ll_addr, CONFIG_MDNS_RESPONDER_TTL, 2U),
+		     "Validated IPv6 address was not announced twice after DAD");
+	net_if_flag_set(iface1, NET_IF_IPV6_NO_ND);
+}
+
+/* Regression test for RFC 6762 8.3 announcement completeness and runtime
+ * registration. A newly installed external service must itself schedule both
+ * announcement rounds, with PTR/SRV/TXT records rather than address-only
+ * packets, without relying on an unrelated interface event.
  */
 ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 {
@@ -388,33 +799,47 @@ ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 		.text_size = sizeof(dns_sd_empty_txt),
 		.port = &svc_port,
 	};
-	bool found_dns_sd_announce = false;
+	size_t dns_sd_announce_count = 0U;
+	size_t checked_count = 0U;
+
+	zassert_true(wait_for_responder(), "Responder did not finish startup");
+	clear_responses();
 
 	zassert_ok(mdns_responder_set_ext_records(&record, 1),
 		   "Failed to register the external DNS-SD record");
 
-	/* Poll for the announce instead of sleeping the full worst-case
-	 * probe window: this returns as soon as the DNS-SD PTR answer shows
-	 * up, while still bounding the wait at PROBE_SEQUENCE_TIMEOUT_MS.
+	/* Poll for both required announcement rounds instead of sleeping the
+	 * full worst-case probe window.
 	 */
-	for (int poll = 0; poll < PROBE_MAX_POLLS && !found_dns_sd_announce; poll++) {
+	for (int poll = 0; poll < PROBE_MAX_POLLS && dns_sd_announce_count < 2U; poll++) {
 		k_sleep(RESPONSE_TIMEOUT);
 
-		for (size_t i = 0; i < responses_count; i++) {
+		for (size_t i = checked_count; i < responses_count; i++) {
 			if (packet_has_ptr_answer(response_pkts[i], service, proto, domain)) {
-				found_dns_sd_announce = true;
-				break;
+				check_complete_dns_sd_announce(response_pkts[i]);
+				dns_sd_announce_count++;
 			}
 		}
+
+		checked_count = responses_count;
 	}
 
 	zassert_true(responses_count > 0, "No announce packets were sent at all");
 
-	zassert_true(found_dns_sd_announce,
-		     "None of the %zu announce packets included a PTR answer for the "
-		     "registered DNS-SD service -- RFC 6762 8.3 announce-completeness "
-		     "not honored",
-		     responses_count);
+	zassert_equal(dns_sd_announce_count, 2U, "Expected two DNS-SD announcements, received %zu",
+		      dns_sd_announce_count);
+
+	clear_responses();
+	zassert_ok(mdns_responder_set_ext_records(NULL, 0U), "Failed to clear external records");
+
+	for (size_t i = 0U; i < responses_count; ++i) {
+		if (packet_has_ptr_answer(response_pkts[i], service, proto, domain)) {
+			check_complete_dns_sd_goodbye(response_pkts[i]);
+			return;
+		}
+	}
+
+	zassert_unreachable("Clearing the service did not send a goodbye");
 }
 
 /* Regression test for the "DHCP-bound announce races ahead of the RFC 6762
@@ -450,13 +875,7 @@ ZTEST(test_mdns_responder_probe, test_dhcp_bound_race_does_not_block_listener)
 	 * window: this returns as soon as the responder answers (~probe
 	 * completion), while still bounding the wait at PROBE_SEQUENCE_TIMEOUT.
 	 */
-	for (int i = 0; i < PROBE_MAX_POLLS; i++) {
-		if (responder_answers_query()) {
-			return;
-		}
-	}
-
-	zassert_true(false,
+	zassert_true(wait_for_responder(),
 		     "Responder never became reachable -- DHCP-bound announce blocked "
 		     "init_listener() from ever running");
 }
@@ -503,7 +922,7 @@ ZTEST(test_mdns_responder_probe, test_multi_question_compressed_query_after_prob
 	};
 	int res;
 
-	zassert_true(responder_answers_query(),
+	zassert_true(wait_for_responder(),
 		     "Responder never became reachable via the probe sequence");
 
 	zassert_ok(mdns_responder_set_ext_records(records, ARRAY_SIZE(records)),

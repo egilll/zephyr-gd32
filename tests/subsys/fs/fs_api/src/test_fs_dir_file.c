@@ -106,6 +106,35 @@ ZTEST(fs_api_dir_file, test_fs_file_t_init)
 	zassert_equal(fst.flags, 0, "Expected to be initialized to 0");
 }
 
+ZTEST(fs_api_dir_file, test_default_mount)
+{
+	struct fs_file_t default_file;
+	int ret;
+
+	fs_file_t_init(&default_file);
+	test_fs_mnt_1.flags |= FS_MOUNT_FLAG_DEFAULT;
+
+	ret = fs_open(&default_file, "/default.txt", FS_O_READ);
+	zassert_ok(ret, "default mount did not resolve path");
+	zassert_equal(default_file.mp, &test_fs_mnt_1, "wrong default mount selected");
+	zassert_ok(fs_close(&default_file), "failed to close file");
+
+	ret = fs_open(&default_file, NOOP_MNTP "/explicit.txt", FS_O_READ);
+	zassert_equal(ret, -ENOTSUP, "default mount overrode an explicit mount");
+
+	test_fs_mnt_no_op.flags |= FS_MOUNT_FLAG_DEFAULT;
+	ret = fs_open(&default_file, "/newest-default.txt", FS_O_READ);
+	zassert_equal(ret, -ENOTSUP, "most recently mounted default was not selected");
+	test_fs_mnt_no_op.flags &= ~FS_MOUNT_FLAG_DEFAULT;
+
+	ret = fs_rename("/from.txt", NOOP_MNTP "/to.txt");
+	zassert_equal(ret, -EINVAL, "cross-mount rename was accepted");
+
+	test_fs_mnt_1.flags &= ~FS_MOUNT_FLAG_DEFAULT;
+	ret = fs_open(&default_file, "/default.txt", FS_O_READ);
+	zassert_equal(ret, -ENOENT, "path resolved without a default mount");
+}
+
 /**
  * @brief Test fs_dir_t_init initializer
  */

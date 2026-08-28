@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: GD32 USBHS DWC2 compatible controller
+
+compatible: "gd,gd32-usbhs"
+
+include: ["snps,dwc2.yaml", "pinctrl-device.yaml"]
+
+properties:
+  clocks:
+    required: true
+    description: |
+      Core USBHS clock, followed by optional ULPI PHY clock for high-speed.
+      If using the internal embedded FS PHY, the board may additionally provide
+      clocks needed to provide the required 48 MHz USB clock (e.g. enabling
+      IRC48M and selecting CK48M source).
+
+  resets:
+    type: phandle-array
+    description: |
+      Optional reset line for the USBHS peripheral. Recommended to ensure the
+      controller starts from a clean state, matching vendor initialization.
+
+  vbus-sensing:
+    type: boolean
+    description: |
+      Enable VBUS sensing on the VBUS pin (do not set VBUSIG) when using the
+      internal embedded FS PHY.
+
+      Reference: GD32_29_USBHS.md describes that in device mode VBUS detection
+      is controlled by the VBUSIG bit in USBHS_GCCFG. If this property is not
+      present, the driver will set VBUSIG and treat VBUS as always valid.

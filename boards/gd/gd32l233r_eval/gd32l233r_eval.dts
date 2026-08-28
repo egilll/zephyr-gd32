@@ -64,6 +64,7 @@
 	aliases {
 		led0 = &led2;
 		led1 = &led3;
+		rtc = &rtc;
 	};
 };
 
@@ -98,4 +99,8 @@
 	status = "okay";
 	pinctrl-0 = <&adc0_default>;
 	pinctrl-names = "default";
+};
+
+&rtc {
+	status = "okay";
 };

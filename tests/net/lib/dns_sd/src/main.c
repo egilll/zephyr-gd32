@@ -10,6 +10,7 @@
 #include <zephyr/ztest.h>
 
 #include <zephyr/net/dns_sd.h>
+#include <zephyr/net/hostname.h>
 #include <zephyr/net/net_context.h>
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/socket.h>
@@ -45,10 +46,9 @@ extern int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 			  uint16_t *host_offset);
 extern size_t service_proto_size(const struct dns_sd_rec *ref);
 extern bool rec_is_valid(const struct dns_sd_rec *ref);
-extern int setup_dst_addr(int sock, net_sa_family_t family,
-			  struct net_sockaddr *src, net_socklen_t src_len,
-			  struct net_sockaddr *dst, net_socklen_t *dst_len);
-
+extern int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
+			  net_socklen_t src_len, bool unicast, struct net_sockaddr *dst,
+			  net_socklen_t *dst_len);
 
 /** Text for advertised service */
 static const uint8_t nasxxxxxx_text[] = "\x06" "path=/";
@@ -69,6 +69,177 @@ DNS_SD_REGISTER_TCP_SERVICE(nasxxxxxx, "NASXXXXXX", "_http",
 
 /** Buffer for  DNS queries */
 static uint8_t create_query_buf[BUFSZ];
+
+static int build_expected_srv_record(uint8_t *buf, size_t buf_size, uint16_t instance_offset,
+				     uint16_t domain_offset)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+	size_t offset = 0;
+	uint16_t rdlength;
+
+	rdlength = sizeof(struct dns_srv_rdata) + DNS_LABEL_LEN_SIZE + hostname_len +
+		   DNS_POINTER_SIZE;
+	zassert_true(buf_size >= sizeof(uint16_t) + sizeof(struct dns_rr) + rdlength);
+
+	buf[offset++] = 0xc0 | (instance_offset >> 8);
+	buf[offset++] = instance_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x21;
+	buf[offset++] = 0x80;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x78;
+	buf[offset++] = rdlength >> 8;
+	buf[offset++] = rdlength & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x1f;
+	buf[offset++] = 0x90;
+	buf[offset++] = hostname_len;
+	memcpy(&buf[offset], hostname, hostname_len);
+	offset += hostname_len;
+	buf[offset++] = 0xc0 | (domain_offset >> 8);
+	buf[offset++] = domain_offset & 0xff;
+
+	return offset;
+}
+
+static int build_expected_ptr_response(uint8_t *buf, size_t buf_size, bool announce)
+{
+	static const uint8_t prefix[] = {
+		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04,
+		0x05, 0x5f, 0x68, 0x74, 0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
+		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00,
+		0x11, 0x94, 0x00, 0x0c, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58,
+		0x58, 0x58, 0xc0, 0x0c, 0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00,
+		0x11, 0x94, 0x00, 0x07, 0x06, 0x70, 0x61, 0x74, 0x68, 0x3d, 0x2f,
+	};
+	size_t offset = sizeof(prefix);
+	uint16_t host_offset;
+
+	zassert_true(buf_size >= sizeof(prefix) + 64);
+	memcpy(buf, prefix, sizeof(prefix));
+	if (announce) {
+		buf[7] = 0x05;
+		buf[11] = 0x00;
+	}
+
+	host_offset = offset + 18;
+	offset += build_expected_srv_record(&buf[offset], buf_size - offset, 0x28, 0x17);
+	buf[offset++] = 0xc0 | (host_offset >> 8);
+	buf[offset++] = host_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x80;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x78;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x04;
+	buf[offset++] = 0xb1;
+	buf[offset++] = 0x05;
+	buf[offset++] = 0xf0;
+	buf[offset++] = 0x0d;
+	buf[offset++] = 0xc0 | (host_offset >> 8);
+	buf[offset++] = host_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x2f;
+	buf[offset++] = 0x80;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x78;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x05;
+	buf[offset++] = 0xc0 | (host_offset >> 8);
+	buf[offset++] = host_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x40;
+
+	return offset;
+}
+
+static size_t skip_uncompressed_name(const uint8_t *buf, size_t buf_size, size_t offset)
+{
+	while (true) {
+		uint8_t label_len;
+
+		zassert_true(offset < buf_size, "Truncated DNS name");
+		label_len = buf[offset++];
+		zassert_equal(label_len & 0xc0, 0U, "Unexpected compressed name");
+		if (label_len == 0U) {
+			return offset;
+		}
+
+		zassert_true(label_len <= buf_size - offset, "Truncated DNS label");
+		offset += label_len;
+	}
+}
+
+static size_t skip_name(const uint8_t *buf, size_t buf_size, size_t offset)
+{
+	while (true) {
+		uint8_t label_len;
+
+		zassert_true(offset < buf_size, "Truncated DNS name");
+		label_len = buf[offset++];
+		if ((label_len & 0xc0U) == 0xc0U) {
+			zassert_true(offset < buf_size, "Truncated DNS name pointer");
+			return offset + 1U;
+		}
+
+		zassert_equal(label_len & 0xc0U, 0U, "Invalid DNS label");
+		if (label_len == 0U) {
+			return offset;
+		}
+
+		zassert_true(label_len <= buf_size - offset, "Truncated DNS label");
+		offset += label_len;
+	}
+}
+
+static size_t count_records(const uint8_t *buf, size_t buf_size, enum dns_rr_type type)
+{
+	const struct dns_header *header = (const struct dns_header *)buf;
+	size_t question_count = net_ntohs(header->qdcount);
+	size_t record_count = net_ntohs(header->ancount) + net_ntohs(header->nscount) +
+			      net_ntohs(header->arcount);
+	size_t matches = 0U;
+	size_t offset = sizeof(*header);
+
+	for (size_t i = 0U; i < question_count; ++i) {
+		offset = skip_name(buf, buf_size, offset);
+		zassert_true(DNS_QTYPE_LEN + DNS_QCLASS_LEN <= buf_size - offset,
+			     "Truncated DNS question");
+		offset += DNS_QTYPE_LEN + DNS_QCLASS_LEN;
+	}
+
+	for (size_t i = 0U; i < record_count; ++i) {
+		uint16_t rdlength;
+
+		offset = skip_name(buf, buf_size, offset);
+		zassert_true(sizeof(struct dns_rr) <= buf_size - offset,
+			     "Truncated resource record");
+		matches += sys_get_be16(&buf[offset]) == type;
+		rdlength = sys_get_be16(&buf[offset + 8U]);
+		offset += sizeof(struct dns_rr);
+		zassert_true(rdlength <= buf_size - offset, "Truncated RDATA");
+		offset += rdlength;
+	}
+
+	zassert_equal(offset, buf_size, "Unexpected trailing response data");
+
+	return matches;
+}
 
 /**
  * @brief Create a DNS query
@@ -153,6 +324,7 @@ ZTEST(dns_sd, test_label_is_valid)
 	zassert_equal(false, label_is_valid("-abc", 4), "");
 	zassert_equal(true,  label_is_valid("a-bc", 4), "");
 	zassert_equal(true,  label_is_valid("A-Bc", 4), "");
+	zassert_equal(false, label_is_valid("\xc3\xa1", 2), "");
 }
 
 /** Test for @ref dns_sd_rec_is_valid */
@@ -201,6 +373,10 @@ ZTEST(dns_sd, test_dns_sd_rec_is_valid)
 				CONST_PORT);
 	zassert_equal(false, rec_is_valid(&invalid_instance), "");
 
+	DNS_SD_REGISTER_TCP_SERVICE(utf8_instance, "H\xc3\xa1talari", "_x", "xx", DNS_SD_EMPTY_TXT,
+				    CONST_PORT);
+	zassert_equal(true, rec_is_valid(&utf8_instance), "");
+
 	DNS_SD_REGISTER_TCP_SERVICE(invalid_service_prefix,
 				"x",
 				"xx",
@@ -237,6 +413,57 @@ ZTEST(dns_sd, test_dns_sd_rec_is_valid)
 	zassert_equal(false, rec_is_valid(&invalid_domain), "");
 
 	zassert_equal(true, rec_is_valid(&nasxxxxxx), "");
+}
+
+ZTEST(dns_sd, test_dns_sd_service_name_validation)
+{
+	static const struct {
+		const char *service;
+		bool valid;
+	} cases[] = {
+		{"_http", true},  {"_3d-printer", true}, {"_9abc", true},
+		{"_foo-9", true}, {"_9", false},         {"_-foo", false},
+		{"_foo-", false}, {"_foo--bar", false},  {"_foo.bar", false},
+	};
+	struct dns_sd_rec record = nasxxxxxx;
+
+	for (size_t i = 0U; i < ARRAY_SIZE(cases); ++i) {
+		record.service = cases[i].service;
+		zassert_equal(dns_sd_rec_is_valid(&record), cases[i].valid,
+			      "Unexpected validity for %s", cases[i].service);
+	}
+}
+
+ZTEST(dns_sd, test_dns_sd_txt_is_valid)
+{
+	static const uint8_t valid_txt[] = {
+		3, 'f', 'o', 'o', 5, 'b', 'a', 'r', '=', '1',
+	};
+	static const uint8_t truncated_txt[] = {4, 'f', 'o', 'o'};
+	static const uint8_t empty_txt[] = {0};
+	struct dns_sd_rec record = nasxxxxxx;
+	uint8_t output[BUFSZ] = {0xa5};
+
+	record.text = (const char *)valid_txt;
+	record.text_size = sizeof(valid_txt);
+	zassert_true(rec_is_valid(&record), "valid TXT strings were rejected");
+
+	record.text = (const char *)empty_txt;
+	record.text_size = 0U;
+	zassert_true(rec_is_valid(&record), "canonical empty TXT was rejected");
+	record.text_size = sizeof(empty_txt);
+	zassert_true(rec_is_valid(&record), "encoded empty TXT string was rejected");
+
+	record.text = (const char *)truncated_txt;
+	record.text_size = sizeof(truncated_txt);
+	zassert_false(rec_is_valid(&record), "truncated TXT string was accepted");
+	zassert_equal(add_txt_record(&record, DNS_SD_TXT_TTL, 0U, output, 0U, sizeof(output)),
+		      -EINVAL, "malformed TXT data reached the encoder");
+	zassert_equal(output[0], 0xa5, "malformed TXT data modified the output buffer");
+
+	record.text = (const char *)valid_txt;
+	record.text_size = (size_t)UINT16_MAX + 1U;
+	zassert_false(rec_is_valid(&record), "oversized TXT data was accepted");
 }
 
 /** Test for @ref creqte_query */
@@ -296,6 +523,14 @@ ZTEST(dns_sd, test_add_ptr_record)
 	memmove(actual_buf, actual_buf + offset, actual_int);
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_ptr_record(&nasxxxxxx, ttl, actual_buf, offset, offset + expected_int,
+				     &service_offset, &instance_offset, &domain_offset),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_ptr_record(&nasxxxxxx, ttl, actual_buf, offset, offset + expected_int - 1,
+				     &service_offset, &instance_offset, &domain_offset),
+		      "one-byte-short buffer was accepted");
 
 	/* dns_sd_rec_is_valid failure */
 	DNS_SD_REGISTER_TCP_SERVICE(null_label,
@@ -339,6 +574,9 @@ ZTEST(dns_sd, test_add_txt_record)
 	const uint32_t ttl = DNS_SD_TXT_TTL;
 	const uint32_t offset = 0;
 	const uint16_t instance_offset = 0x28;
+	static const char nonzero_txt[] = {0x5a};
+
+	DNS_SD_REGISTER_TCP_SERVICE(empty_txt, "x", "_x", "local", DNS_SD_EMPTY_TXT, CONST_PORT);
 
 	static uint8_t actual_buf[BUFSZ];
 	static const uint8_t expected_buf[] = {
@@ -346,6 +584,15 @@ ZTEST(dns_sd, test_add_txt_record)
 		0x11, 0x94, 0x00, 0x07, 0x06, 0x70, 0x61, 0x74,
 		0x68, 0x3d, 0x2f
 	};
+	static const uint8_t expected_empty_txt[] = {
+		0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x01, 0x00,
+	};
+	const struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_TXT,
+		.class_ = DNS_CLASS_IN,
+	};
+	struct net_in_addr addr = {{{177, 5, 240, 13}}};
+	struct dns_sd_rec zero_size_txt = empty_txt;
 	int expected_int = sizeof(expected_buf);
 
 	int actual_int = add_txt_record(&nasxxxxxx, ttl,
@@ -358,6 +605,33 @@ ZTEST(dns_sd, test_add_txt_record)
 	zassert_mem_equal(actual_buf, expected_buf, MIN(actual_int,
 							expected_int),
 			  "");
+	zassert_equal(
+		expected_int,
+		add_txt_record(&nasxxxxxx, ttl, instance_offset, actual_buf, offset, expected_int),
+		"exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_txt_record(&nasxxxxxx, ttl, instance_offset, actual_buf, offset,
+				     expected_int - 1),
+		      "one-byte-short buffer was accepted");
+
+	actual_int = add_txt_record(&empty_txt, ttl, instance_offset, actual_buf, offset,
+				    sizeof(actual_buf));
+	zassert_equal(actual_int, sizeof(expected_empty_txt), "");
+	zassert_mem_equal(actual_buf, expected_empty_txt, sizeof(expected_empty_txt), "");
+
+	zero_size_txt.text = nonzero_txt;
+	zero_size_txt.text_size = 0U;
+	actual_int = add_txt_record(&zero_size_txt, ttl, instance_offset, actual_buf, offset,
+				    sizeof(actual_buf));
+	zassert_equal(actual_int, sizeof(expected_empty_txt), "");
+	zassert_mem_equal(actual_buf, expected_empty_txt, sizeof(expected_empty_txt),
+			  "Zero-size TXT used the caller's backing byte");
+
+	actual_int = dns_sd_handle_query(NULL, &zero_size_txt, &addr, NULL, &query, actual_buf,
+					 sizeof(actual_buf));
+	zassert_true(actual_int > 0, "Direct TXT response failed (%d)", actual_int);
+	zassert_equal(actual_buf[actual_int - 1], 0U,
+		      "Direct TXT response used the caller's backing byte");
 
 	/* too big for message compression */
 	zassert_equal(-E2BIG,
@@ -381,14 +655,10 @@ ZTEST(dns_sd, test_add_srv_record)
 
 	uint16_t host_offset = -1;
 	static uint8_t actual_buf[BUFSZ];
-	static const uint8_t expected_buf[] = {
-		0xc0, 0x28, 0x00, 0x21, 0x80, 0x01, 0x00, 0x00,
-		0x00, 0x78, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00,
-		0x1f, 0x90, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58,
-		0x58, 0x58, 0x58, 0x58, 0xc0, 0x17
-	};
+	static uint8_t expected_buf[BUFSZ];
 
-	int expected_int = sizeof(expected_buf);
+	int expected_int = build_expected_srv_record(expected_buf, sizeof(expected_buf),
+					     instance_offset, domain_offset);
 	int actual_int = add_srv_record(&nasxxxxxx, ttl,
 					instance_offset, domain_offset,
 					actual_buf,
@@ -401,6 +671,14 @@ ZTEST(dns_sd, test_add_srv_record)
 
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_srv_record(&nasxxxxxx, ttl, instance_offset, domain_offset, actual_buf,
+				     offset, expected_int, &host_offset),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_srv_record(&nasxxxxxx, ttl, instance_offset, domain_offset, actual_buf,
+				     offset, expected_int - 1, &host_offset),
+		      "one-byte-short buffer was accepted");
 
 	/* offset too big for message compression (instance) */
 	zassert_equal(-E2BIG,
@@ -451,6 +729,14 @@ ZTEST(dns_sd, test_add_a_record)
 
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_a_record(&nasxxxxxx, ttl, host_offset, net_ntohl(addr.s_addr), actual_buf,
+				   offset, expected_int),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_a_record(&nasxxxxxx, ttl, host_offset, net_ntohl(addr.s_addr), actual_buf,
+				   offset, expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	/* test offset too large */
 	zassert_equal(-E2BIG,
@@ -493,6 +779,14 @@ ZTEST(dns_sd, test_add_aaaa_record)
 
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_aaaa_record(&nasxxxxxx, ttl, host_offset, addr, actual_buf, offset,
+				      expected_int),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_aaaa_record(&nasxxxxxx, ttl, host_offset, addr, actual_buf, offset,
+				      expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	/* offset too large for message compression */
 	zassert_equal(-E2BIG,
@@ -512,25 +806,12 @@ ZTEST(dns_sd, test_add_aaaa_record)
 ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 {
 	struct net_in_addr addr = { { { 177, 5, 240, 13 } } };
+	struct net_in6_addr addr6;
 	static uint8_t actual_rsp[512];
-	static uint8_t expected_rsp[] = {
-		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01,
-		0x00, 0x00, 0x00, 0x03, 0x05, 0x5f, 0x68, 0x74,
-		0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
-		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c,
-		0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x0c,
-		0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58,
-		0x58, 0x58, 0xc0, 0x0c, 0xc0, 0x28, 0x00, 0x10,
-		0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x07,
-		0x06, 0x70, 0x61, 0x74, 0x68, 0x3d, 0x2f, 0xc0,
-		0x28, 0x00, 0x21, 0x80, 0x01, 0x00, 0x00, 0x00,
-		0x78, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x1f,
-		0x90, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58,
-		0x58, 0x58, 0x58, 0xc0, 0x17, 0xc0, 0x59, 0x00,
-		0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00,
-		0x04, 0xb1, 0x05, 0xf0, 0x0d,
-	};
-	int expected_int = sizeof(expected_rsp);
+	static uint8_t expected_rsp[512];
+	struct dns_header *header = (struct dns_header *)actual_rsp;
+	int expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), false);
+	int core_size = expected_int - (2U * DNS_POINTER_SIZE + sizeof(struct dns_rr) + 3U);
 	int actual_int = dns_sd_handle_ptr_query(NULL, &nasxxxxxx,
 						 &addr,
 						 NULL,
@@ -546,6 +827,25 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 
 	zassert_mem_equal(actual_rsp, expected_rsp,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
+					      expected_int, false),
+		      "exact-size buffer was rejected");
+	zassert_equal(core_size,
+		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
+					      expected_int - 1, false),
+		      "optional NSEC prevented the core response");
+	zassert_equal(-ENOSPC,
+		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
+					      core_size - 1, false),
+		      "one-byte-short core buffer was accepted");
+
+	net_ipv6_addr_create(&addr6, 0xfe80, 0U, 0U, 0U, 0U, 0U, 0U, 1U);
+	actual_int = dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, &addr6, actual_rsp,
+					     sizeof(actual_rsp), false);
+	zassert_true(actual_int > 0, "Dual-stack response failed (%d)", actual_int);
+	zassert_equal(net_ntohs(header->arcount), 4U,
+		      "Dual-stack response contains negative address information");
 
 	/* show non-advertisement for uninitialized port */
 	nonconst_port = 0;
@@ -556,7 +856,7 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 
 	/* show advertisement for initialized port */
 	nonconst_port = CONST_PORT;
-	expected_int = sizeof(expected_rsp);
+	expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), false);
 	zassert_equal(expected_int, dns_sd_handle_ptr_query(NULL, &nasxxxxxx_ephemeral,
 		&addr, NULL, &actual_rsp[0], sizeof(actual_rsp) -
 		sizeof(struct dns_header), false), "");
@@ -565,6 +865,71 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 		NULL, &invalid_dns_sd_record,
 		&addr, NULL, &actual_rsp[0], sizeof(actual_rsp) -
 		sizeof(struct dns_header), false), "");
+}
+
+ZTEST(dns_sd, test_dns_sd_address_rrsets_are_atomic)
+{
+	Z_TEST_SKIP_IFNDEF(CONFIG_NET_IPV6);
+
+	static uint8_t response[512];
+	struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_SRV,
+		.class_ = DNS_CLASS_IN,
+	};
+	struct net_in6_addr addr1;
+	struct net_in6_addr addr2;
+	struct net_if_addr *ifaddr1;
+	struct net_if_addr *ifaddr2;
+	struct net_if *iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	const size_t compressed_a_size =
+		DNS_POINTER_SIZE + sizeof(struct dns_rr) + sizeof(struct net_in_addr);
+	const size_t host_name_size = DNS_LABEL_LEN_SIZE + strlen(net_hostname_get()) +
+				      DNS_LABEL_LEN_SIZE + strlen(nasxxxxxx.domain) +
+				      DNS_LABEL_LEN_SIZE;
+	const size_t uncompressed_a_size =
+		host_name_size + sizeof(struct dns_rr) + sizeof(struct net_in_addr);
+	int full_len;
+	int response_len;
+
+	zassert_not_null(iface, "Interface not available");
+	net_ipv6_addr_create(&addr1, 0x2001, 0xdb8, 0U, 0U, 0U, 0U, 0U, 1U);
+	net_ipv6_addr_create(&addr2, 0x2001, 0xdb8, 0U, 0U, 0U, 0U, 0U, 2U);
+	ifaddr1 = net_if_ipv6_addr_add(iface, &addr1, NET_ADDR_MANUAL, 0U);
+	ifaddr2 = net_if_ipv6_addr_add(iface, &addr2, NET_ADDR_MANUAL, 0U);
+	zassert_not_null(ifaddr1, "Could not add first IPv6 address");
+	zassert_not_null(ifaddr2, "Could not add second IPv6 address");
+	ifaddr1->addr_state = NET_ADDR_PREFERRED;
+	ifaddr2->addr_state = NET_ADDR_PREFERRED;
+
+	full_len = dns_sd_handle_ptr_query(iface, &nasxxxxxx, NULL, NULL, response,
+					   sizeof(response), false);
+	zassert_true(full_len > (int)compressed_a_size, "Full PTR response failed (%d)", full_len);
+	zassert_true(count_records(response, full_len, DNS_RR_TYPE_AAAA) >= 2U,
+		     "Full PTR response lacks the test AAAA RRset");
+	zassert_equal(count_records(response, full_len, DNS_RR_TYPE_A), 1U,
+		      "Full PTR response has an unexpected A RRset");
+	response_len = dns_sd_handle_ptr_query(iface, &nasxxxxxx, NULL, NULL, response,
+					       full_len - compressed_a_size - 1U, false);
+	zassert_true(response_len > 0, "Tight PTR response failed (%d)", response_len);
+	zassert_equal(count_records(response, response_len, DNS_RR_TYPE_AAAA), 0U,
+		      "PTR response contains a partial AAAA RRset");
+
+	full_len = dns_sd_handle_query(iface, &nasxxxxxx, NULL, NULL, &query, response,
+				       sizeof(response));
+	zassert_true(full_len > (int)uncompressed_a_size, "Full SRV response failed (%d)",
+		     full_len);
+	zassert_true(count_records(response, full_len, DNS_RR_TYPE_AAAA) >= 2U,
+		     "Full SRV response lacks the test AAAA RRset");
+	zassert_equal(count_records(response, full_len, DNS_RR_TYPE_A), 1U,
+		      "Full SRV response has an unexpected A RRset");
+	response_len = dns_sd_handle_query(iface, &nasxxxxxx, NULL, NULL, &query, response,
+					   full_len - uncompressed_a_size - 1U);
+	zassert_true(response_len > 0, "Tight SRV response failed (%d)", response_len);
+	zassert_equal(count_records(response, response_len, DNS_RR_TYPE_AAAA), 0U,
+		      "SRV response contains a partial AAAA RRset");
+
+	zassert_true(net_if_ipv6_addr_rm(iface, &addr1), "Could not remove first IPv6 address");
+	zassert_true(net_if_ipv6_addr_rm(iface, &addr2), "Could not remove second IPv6 address");
 }
 
 /* RFC 6762 Section 8.3: unsolicited announcements must place every record in the
@@ -576,18 +941,8 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query_announce)
 {
 	struct net_in_addr addr = {{{177, 5, 240, 13}}};
 	static uint8_t actual_rsp[512];
-	static uint8_t expected_rsp[] = {
-		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x05,
-		0x5f, 0x68, 0x74, 0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05, 0x6c, 0x6f,
-		0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00,
-		0x0c, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58, 0x58, 0x58, 0xc0, 0x0c,
-		0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x07, 0x06,
-		0x70, 0x61, 0x74, 0x68, 0x3d, 0x2f, 0xc0, 0x28, 0x00, 0x21, 0x80, 0x01, 0x00,
-		0x00, 0x00, 0x78, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x90, 0x09, 0x4e,
-		0x41, 0x53, 0x58, 0x58, 0x58, 0x58, 0x58, 0x58, 0xc0, 0x17, 0xc0, 0x59, 0x00,
-		0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 0xb1, 0x05, 0xf0, 0x0d,
-	};
-	int expected_int = sizeof(expected_rsp);
+	static uint8_t expected_rsp[512];
+	int expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), true);
 	int actual_int =
 		dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, &actual_rsp[0],
 					sizeof(actual_rsp) - sizeof(struct dns_header), true);
@@ -597,6 +952,140 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query_announce)
 	zassert_equal(actual_int, expected_int, "act: %d exp: %d", actual_int, expected_int);
 
 	zassert_mem_equal(actual_rsp, expected_rsp, MIN(actual_int, expected_int), "");
+}
+
+ZTEST(dns_sd, test_dns_sd_handle_goodbye)
+{
+	static const uint16_t expected_types[] = {
+		DNS_RR_TYPE_PTR,
+		DNS_RR_TYPE_SRV,
+		DNS_RR_TYPE_TXT,
+	};
+	static const uint16_t expected_classes[] = {
+		DNS_CLASS_IN,
+		DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		DNS_CLASS_IN | DNS_CLASS_FLUSH,
+	};
+	static uint8_t response[BUFSZ];
+	struct dns_header *header = (struct dns_header *)response;
+	size_t offset = sizeof(*header);
+	int response_len;
+
+	response_len = dns_sd_handle_goodbye(&nasxxxxxx, response, sizeof(response));
+	zassert_true(response_len > 0, "Goodbye encoding failed (%d)", response_len);
+	zassert_equal(net_ntohs(header->flags), BIT(15) | BIT(10), "Unexpected flags");
+	zassert_equal(net_ntohs(header->qdcount), 0U, "Goodbye contains a question");
+	zassert_equal(net_ntohs(header->ancount), ARRAY_SIZE(expected_types),
+		      "Unexpected answer count");
+	zassert_equal(net_ntohs(header->nscount), 0U, "Goodbye contains authority records");
+	zassert_equal(net_ntohs(header->arcount), 0U, "Goodbye contains additional records");
+
+	for (size_t i = 0U; i < ARRAY_SIZE(expected_types); ++i) {
+		uint16_t rdlength;
+
+		offset = skip_uncompressed_name(response, response_len, offset);
+		zassert_true(sizeof(struct dns_rr) <= response_len - offset,
+			     "Truncated resource record");
+		zassert_equal(sys_get_be16(&response[offset]), expected_types[i],
+			      "Unexpected record type");
+		zassert_equal(sys_get_be16(&response[offset + 2U]), expected_classes[i],
+			      "Unexpected record class");
+		zassert_equal(sys_get_be32(&response[offset + 4U]), 0U,
+			      "Goodbye record has a nonzero TTL");
+		rdlength = sys_get_be16(&response[offset + 8U]);
+		offset += sizeof(struct dns_rr);
+		zassert_true(rdlength <= response_len - offset, "Truncated RDATA");
+		offset += rdlength;
+	}
+
+	zassert_equal(offset, response_len, "Goodbye contains unexpected records");
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx, response, response_len), response_len,
+		      "Exact-size buffer was rejected");
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx, response, response_len - 1U), -ENOSPC,
+		      "One-byte-short buffer was accepted");
+	zassert_equal(dns_sd_handle_goodbye(&invalid_dns_sd_record, response, sizeof(response)),
+		      -EINVAL, "Invalid record was accepted");
+	nonconst_port = 0U;
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx_ephemeral, response, sizeof(response)),
+		      -EHOSTDOWN, "Uninitialized service was withdrawn");
+}
+
+static void check_service_instance_nsec(const uint8_t *response, size_t response_len, bool legacy)
+{
+	static const uint8_t expected_bitmap[] = {0U, 0U, 0x80U, 0U, 0x40U};
+	const struct dns_header *header = (const struct dns_header *)response;
+	size_t offset = sizeof(*header);
+	uint16_t value;
+
+	zassert_equal(net_ntohs(header->id), legacy ? 0x1234U : 0U, "Unexpected response ID");
+	zassert_equal(net_ntohs(header->flags), BIT(15) | BIT(10), "Unexpected response flags");
+	zassert_equal(net_ntohs(header->qdcount), legacy ? 1U : 0U, "Unexpected question count");
+	zassert_equal(net_ntohs(header->ancount), 1U, "Unexpected answer count");
+	zassert_equal(net_ntohs(header->arcount), 0U, "Unexpected additional count");
+	offset = skip_uncompressed_name(response, response_len, offset);
+
+	if (legacy) {
+		zassert_equal(sys_get_be16(&response[offset]), DNS_RR_TYPE_A,
+			      "Unexpected repeated question type");
+		offset += DNS_QTYPE_LEN;
+		zassert_equal(sys_get_be16(&response[offset]), DNS_CLASS_IN,
+			      "Unexpected repeated question class");
+		offset += DNS_QCLASS_LEN;
+		zassert_equal(sys_get_be16(&response[offset]),
+			      DNS_SD_PTR_MASK | DNS_MSG_HEADER_SIZE, "Unexpected answer owner");
+		offset += DNS_POINTER_SIZE;
+	}
+
+	zassert_equal(sys_get_be16(&response[offset]), DNS_RR_TYPE_NSEC, "Unexpected answer type");
+	offset += DNS_QTYPE_LEN;
+	zassert_equal(sys_get_be16(&response[offset]),
+		      DNS_CLASS_IN | (legacy ? 0U : DNS_CLASS_FLUSH), "Unexpected answer class");
+	offset += DNS_QCLASS_LEN;
+	zassert_equal(sys_get_be32(&response[offset]), legacy ? DNS_SD_LEGACY_TTL : DNS_SD_SRV_TTL,
+		      "Unexpected answer TTL");
+	offset += DNS_TTL_LEN;
+	zassert_equal(sys_get_be16(&response[offset]),
+		      DNS_POINTER_SIZE + 2U + sizeof(expected_bitmap), "Unexpected NSEC length");
+	offset += DNS_RDLENGTH_LEN;
+	value = sys_get_be16(&response[offset]);
+	zassert_equal(value, DNS_SD_PTR_MASK | DNS_MSG_HEADER_SIZE,
+		      "NSEC next name does not match its owner");
+	offset += DNS_POINTER_SIZE;
+	zassert_equal(response[offset++], 0U, "Unexpected bitmap window");
+	zassert_equal(response[offset++], sizeof(expected_bitmap), "Unexpected bitmap length");
+	zassert_mem_equal(&response[offset], expected_bitmap, sizeof(expected_bitmap),
+			  "Unexpected service type bitmap");
+	offset += sizeof(expected_bitmap);
+	zassert_equal(offset, response_len, "Unexpected trailing response data");
+}
+
+ZTEST(dns_sd, test_dns_sd_handle_query_nsec)
+{
+	struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_A,
+		.class_ = DNS_CLASS_IN,
+	};
+	struct net_in_addr addr = {{{177, 5, 240, 13}}};
+	uint8_t response[BUFSZ];
+	int response_len;
+
+	response_len = dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response,
+					   sizeof(response));
+	zassert_true(response_len > 0, "NSEC response failed (%d)", response_len);
+	check_service_instance_nsec(response, response_len, false);
+	zassert_equal(
+		dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response, response_len),
+		response_len, "Exact-size NSEC response failed");
+	zassert_equal(dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response,
+					  response_len - 1),
+		      -ENOSPC, "One-byte-short NSEC buffer was accepted");
+
+	query.legacy = true;
+	query.id = 0x1234U;
+	response_len = dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response,
+					   sizeof(response));
+	zassert_true(response_len > 0, "Legacy NSEC response failed (%d)", response_len);
+	check_service_instance_nsec(response, response_len, true);
 }
 
 /** Test for @ref dns_sd_handle_ptr_query */
@@ -610,6 +1099,9 @@ ZTEST(dns_sd, test_dns_sd_handle_service_type_enum)
 				CONST_PORT);
 
 	struct net_in_addr addr = { { { 177, 5, 240, 13 } } };
+	static const struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_PTR,
+	};
 	static uint8_t actual_rsp[512];
 	static uint8_t expected_rsp[] = {
 		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
@@ -622,31 +1114,61 @@ ZTEST(dns_sd, test_dns_sd_handle_service_type_enum)
 		0x74, 0x04, 0x5f, 0x74, 0x63, 0x70, 0xc0, 0x23,
 	};
 	int expected_int = sizeof(expected_rsp);
-	int actual_int = dns_sd_handle_service_type_enum(&chromecast,
-						 &addr,
-						 NULL,
-						 &actual_rsp[0],
-						 sizeof(actual_rsp) -
-						 sizeof(struct dns_header));
+	int actual_int =
+		dns_sd_handle_service_type_enum(&chromecast, &addr, NULL, &query, &actual_rsp[0],
+						sizeof(actual_rsp) - sizeof(struct dns_header));
 
 	zassert_true(actual_int > 0, "dns_sd_handle_service_type_enum() failed (%d)", actual_int);
 
 	zassert_equal(actual_int, expected_int, "act: %d exp: %d", actual_int, expected_int);
 
 	zassert_mem_equal(actual_rsp, expected_rsp, MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      dns_sd_handle_service_type_enum(&chromecast, &addr, NULL, &query, actual_rsp,
+						      expected_int),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      dns_sd_handle_service_type_enum(&chromecast, &addr, NULL, &query, actual_rsp,
+						      expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	/* show non-advertisement for uninitialized port */
 	nonconst_port = 0;
 	zassert_equal(-EHOSTDOWN,
-		      dns_sd_handle_service_type_enum(&nasxxxxxx_ephemeral, &addr, NULL,
-				&actual_rsp[0], sizeof(actual_rsp) - sizeof(struct dns_header)),
+		      dns_sd_handle_service_type_enum(
+			      &nasxxxxxx_ephemeral, &addr, NULL, &query, &actual_rsp[0],
+			      sizeof(actual_rsp) - sizeof(struct dns_header)),
 		      "port zero should not "
 		      "produce any DNS-SD query response");
 
 	zassert_equal(-EINVAL,
-		      dns_sd_handle_service_type_enum(&invalid_dns_sd_record, &addr, NULL,
-			  &actual_rsp[0], sizeof(actual_rsp) - sizeof(struct dns_header)),
+		      dns_sd_handle_service_type_enum(
+			      &invalid_dns_sd_record, &addr, NULL, &query, &actual_rsp[0],
+			      sizeof(actual_rsp) - sizeof(struct dns_header)),
 		      "");
+}
+
+ZTEST(dns_sd, test_dns_sd_protocol_is_case_insensitive)
+{
+	static const struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_PTR,
+	};
+	static const char *const protocols[] = {"_TCP", "_UDP"};
+	struct net_in_addr addr = {{{177, 5, 240, 13}}};
+	struct dns_sd_rec record = nasxxxxxx;
+	uint8_t response[512];
+
+	for (size_t i = 0U; i < ARRAY_SIZE(protocols); ++i) {
+		record.proto = protocols[i];
+		zassert_true(dns_sd_rec_is_valid(&record), "%s was rejected as invalid",
+			     protocols[i]);
+		zassert_true(dns_sd_handle_ptr_query(NULL, &record, &addr, NULL, response,
+						     sizeof(response), false) > 0,
+			     "%s was rejected by PTR response handling", protocols[i]);
+		zassert_true(dns_sd_handle_service_type_enum(&record, &addr, NULL, &query, response,
+							     sizeof(response)) > 0,
+			     "%s was rejected by service-type enumeration", protocols[i]);
+	}
 }
 
 /** Test @ref dns_sd_rec_match */
@@ -701,13 +1223,18 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	/* IPv4 case */
 	int v4;
 	struct net_in_addr addr_v4_expect = { { { 224, 0, 0, 251 } } };
+	struct net_sockaddr_in src_v4 = {
+		.sin_family = NET_AF_INET,
+		.sin_port = 12345,
+		.sin_addr = {{{192, 0, 2, 1}}},
+	};
 
 	memset(&dst, 0, sizeof(struct net_sockaddr));
 
 	v4 = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
 	zassert_true(v4 >= 0, "Create IPv4 UDP context failed (%d)", -errno);
 
-	zassert_equal(0, setup_dst_addr(v4, NET_AF_INET, NULL, 0, &dst, &dst_len), "");
+	zassert_equal(0, setup_dst_addr(v4, NET_AF_INET, NULL, 0, false, &dst, &dst_len), "");
 
 	optlen = sizeof(int);
 	(void)zsock_getsockopt(v4, NET_IPPROTO_IP, ZSOCK_IP_MULTICAST_TTL, &ttl, &optlen);
@@ -717,6 +1244,19 @@ ZTEST(dns_sd, test_setup_dst_addr)
 				       &net_sin(&dst)->sin_addr), "");
 	zassert_equal(8, dst_len, "");
 
+	memset(&dst, 0, sizeof(struct net_sockaddr));
+	zassert_equal(0,
+		      setup_dst_addr(v4, NET_AF_INET, (struct net_sockaddr *)&src_v4,
+				     sizeof(src_v4), true, &dst, &dst_len),
+		      "");
+
+	optlen = sizeof(int);
+	(void)zsock_getsockopt(v4, NET_IPPROTO_IP, ZSOCK_IP_TTL, &ttl, &optlen);
+
+	zassert_equal(255, ttl, "Unicast TTL invalid (%d vs %d)", 255, ttl);
+	zassert_mem_equal(&dst, &src_v4, sizeof(src_v4));
+	zassert_equal(sizeof(src_v4), dst_len, "");
+
 	(void)zsock_close(v4);
 
 #if defined(CONFIG_NET_IPV6)
@@ -724,13 +1264,18 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	int v6;
 	struct net_in6_addr addr_v6_expect = { { { 0xff, 0x02, 0, 0, 0, 0, 0, 0,
 						   0, 0, 0, 0, 0, 0, 0, 0xfb } } };
+	struct net_sockaddr_in6 src_v6 = {
+		.sin6_family = NET_AF_INET6,
+		.sin6_port = 12345,
+		.sin6_addr = {{{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}}},
+	};
 
 	memset(&dst, 0, sizeof(struct net_sockaddr));
 
 	v6 = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
 	zassert_true(v6 >= 0, "Create IPv6 UDP context failed (%d)", -errno);
 
-	zassert_equal(0, setup_dst_addr(v6, NET_AF_INET6, NULL, 0, &dst, &dst_len), "");
+	zassert_equal(0, setup_dst_addr(v6, NET_AF_INET6, NULL, 0, false, &dst, &dst_len), "");
 
 	optlen = sizeof(int);
 	(void)zsock_getsockopt(v6, NET_IPPROTO_IPV6, ZSOCK_IPV6_MULTICAST_HOPS, &ttl, &optlen);
@@ -739,6 +1284,19 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	zassert_true(net_ipv6_addr_cmp(&addr_v6_expect,
 				       &net_sin6(&dst)->sin6_addr), "");
 	zassert_equal(24, dst_len, "");
+
+	memset(&dst, 0, sizeof(struct net_sockaddr));
+	zassert_equal(0,
+		      setup_dst_addr(v6, NET_AF_INET6, (struct net_sockaddr *)&src_v6,
+				     sizeof(src_v6), true, &dst, &dst_len),
+		      "");
+
+	optlen = sizeof(int);
+	(void)zsock_getsockopt(v6, NET_IPPROTO_IPV6, ZSOCK_IPV6_UNICAST_HOPS, &ttl, &optlen);
+
+	zassert_equal(255, ttl, "Unicast hop limit invalid (%d vs %d)", 255, ttl);
+	zassert_mem_equal(&dst, &src_v6, sizeof(src_v6));
+	zassert_equal(sizeof(src_v6), dst_len, "");
 
 	(void)zsock_close(v6);
 #endif
@@ -751,7 +1309,7 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	zassert_true(xx >= 0, "Create IPV4 udp socket failed");
 
 	zassert_equal(-EPFNOSUPPORT,
-		      setup_dst_addr(xx, NET_AF_PACKET, NULL, 0, &dst, &dst_len), "");
+		      setup_dst_addr(xx, NET_AF_PACKET, NULL, 0, false, &dst, &dst_len), "");
 }
 
 /** test for @ref dns_sd_is_service_type_enumeration */

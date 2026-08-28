@@ -99,6 +99,13 @@ enum {
  * callback for the file system should set the flag on success.
  */
 #define FS_MOUNT_FLAG_USE_DISK_ACCESS BIT(3)
+/** Flag designates this mount as the fallback for otherwise unmatched paths.
+ *
+ * If multiple mounted file systems have this flag, the most recently mounted
+ * one is used. The full path is passed to the file system as a path relative
+ * to its root.
+ */
+#define FS_MOUNT_FLAG_DEFAULT BIT(4)
 
 /**
  * @brief File system mount info structure
