@@ -1946,6 +1946,72 @@ macro(zephyr_code_relocate_ifdef feature_toggle)
   endif()
 endmacro()
 
+function(_zephyr_code_relocation_prohibit_lto)
+  get_property(file_list GLOBAL PROPERTY ZEPHYR_LTO_RELOCATION_FILES)
+  get_property(library_list GLOBAL PROPERTY ZEPHYR_LTO_RELOCATION_LIBRARIES)
+  zephyr_get_targets(${CMAKE_BINARY_DIR}
+    "EXECUTABLE;MODULE_LIBRARY;OBJECT_LIBRARY;SHARED_LIBRARY;STATIC_LIBRARY"
+    build_targets)
+
+  foreach(file IN LISTS file_list)
+    set(owner_targets)
+    foreach(target IN LISTS build_targets)
+      get_target_property(target_sources ${target} SOURCES)
+      get_target_property(target_source_dir ${target} SOURCE_DIR)
+      foreach(target_source IN LISTS target_sources)
+        string(GENEX_STRIP "${target_source}" target_source_no_genex)
+        if(NOT target_source STREQUAL target_source_no_genex OR
+           target_source_no_genex STREQUAL "")
+          continue()
+        endif()
+
+        if(IS_ABSOLUTE "${target_source_no_genex}")
+          set(target_source_abs "${target_source_no_genex}")
+        else()
+          set(target_source_abs "${target_source_dir}/${target_source_no_genex}")
+        endif()
+        cmake_path(NORMAL_PATH target_source_abs)
+        if(target_source_abs STREQUAL file)
+          list(APPEND owner_targets ${target})
+          break()
+        endif()
+      endforeach()
+    endforeach()
+
+    if(NOT owner_targets)
+      message(FATAL_ERROR
+        "Could not find the target which owns relocated source: ${file}")
+    endif()
+
+    set_property(SOURCE "${file}"
+      TARGET_DIRECTORY ${owner_targets} APPEND PROPERTY COMPILE_OPTIONS
+      $<TARGET_PROPERTY:compiler,prohibit_lto>)
+  endforeach()
+
+  foreach(target IN LISTS library_list)
+    get_target_property(target_sources ${target} SOURCES)
+    get_target_property(target_source_dir ${target} SOURCE_DIR)
+    foreach(target_source IN LISTS target_sources)
+      string(GENEX_STRIP "${target_source}" target_source_no_genex)
+      if(NOT target_source STREQUAL target_source_no_genex)
+        message(FATAL_ERROR
+          "Relocated library ${target} contains a source generator expression; "
+          "LTO cannot be disabled reliably for ${target_source}")
+      endif()
+
+      if(IS_ABSOLUTE "${target_source}")
+        set(target_source_abs "${target_source}")
+      else()
+        set(target_source_abs "${target_source_dir}/${target_source}")
+      endif()
+      cmake_path(NORMAL_PATH target_source_abs)
+      set_property(SOURCE "${target_source_abs}"
+        TARGET_DIRECTORY ${target} APPEND PROPERTY COMPILE_OPTIONS
+        $<TARGET_PROPERTY:compiler,prohibit_lto>)
+    endforeach()
+  endforeach()
+endfunction()
+
 # Helper function for CONFIG_CODE_DATA_RELOCATION
 # This function may either be invoked with a list of files, or a library
 # name to relocate.
@@ -2024,6 +2090,30 @@ function(zephyr_code_relocate)
     else()
       # Generator expression is present in file list. Leave the list untouched.
       set(file_list ${CODE_REL_FILES})
+    endif()
+  endif()
+  if(CONFIG_LTO)
+    if(CODE_REL_LIBRARY)
+      set_property(GLOBAL APPEND PROPERTY ZEPHYR_LTO_RELOCATION_LIBRARIES
+        ${CODE_REL_LIBRARY})
+    elseif(CODE_REL_FILES STREQUAL no_genex)
+      foreach(file IN LISTS file_list)
+        cmake_path(NORMAL_PATH file OUTPUT_VARIABLE normalized_file)
+        set_property(GLOBAL APPEND PROPERTY ZEPHYR_LTO_RELOCATION_FILES
+          "${normalized_file}")
+      endforeach()
+
+    else()
+      message(FATAL_ERROR
+        "zephyr_code_relocate(FILES ...) does not support generator expressions when CONFIG_LTO is enabled; use LIBRARY instead")
+    endif()
+
+    get_property(lto_relocation_deferred GLOBAL
+      PROPERTY ZEPHYR_LTO_RELOCATION_DEFERRED)
+    if(NOT lto_relocation_deferred)
+      set_property(GLOBAL PROPERTY ZEPHYR_LTO_RELOCATION_DEFERRED TRUE)
+      cmake_language(DEFER DIRECTORY "${APPLICATION_SOURCE_DIR}"
+        CALL _zephyr_code_relocation_prohibit_lto)
     endif()
   endif()
   if(NOT CODE_REL_NOCOPY)
