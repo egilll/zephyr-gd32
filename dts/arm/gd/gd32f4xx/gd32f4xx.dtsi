@@ -245,6 +245,31 @@
 			status = "disabled";
 		};
 
+		enet: ethernet@40028000 {
+			compatible = "gd,gd32-ethernet", "snps,dwmac";
+			reg = <0x40028000 0x8000>;
+			interrupts = <61 0>;
+			clocks = <&cctl GD32_CLOCK_ENET>,
+				 <&cctl GD32_CLOCK_ENETTX>,
+				 <&cctl GD32_CLOCK_ENETRX>,
+				 <&cctl GD32_CLOCK_ENETPTP>;
+			clock-names = "mac", "tx", "rx", "ptp";
+			resets = <&rctl GD32_RESET_ENET>,
+				 <&rctl GD32_RESET_ENETTX>,
+				 <&rctl GD32_RESET_ENETRX>,
+				 <&rctl GD32_RESET_ENETPTP>;
+			reset-names = "mac", "tx", "rx", "ptp";
+			phy-connection-type = "rmii";
+			status = "disabled";
+
+			mdio: mdio {
+				compatible = "snps,dwmac-mdio";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "disabled";
+			};
+		};
+
 		spi0: spi@40013000 {
 			compatible = "gd,gd32-spi";
 			reg = <0x40013000 0x400>;
