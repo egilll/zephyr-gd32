@@ -324,6 +324,26 @@ struct i2s_config {
 	int32_t timeout;
 };
 
+/** Effective stream clock and transfer progress information. */
+struct i2s_timing {
+	/** Number of frames transferred at @ref timestamp_cycles. */
+	uint64_t frame_count;
+	/**
+	 * Timestamp in the system hardware cycle-counter domain.
+	 *
+	 * The timestamp is captured as close as practical to the event which
+	 * advances @ref frame_count, such as a DMA completion. It does not
+	 * necessarily identify the clock edge of the last audio frame.
+	 */
+	uint64_t timestamp_cycles;
+	/** Effective frame rate numerator. */
+	uint64_t frame_rate_num;
+	/** Effective frame rate denominator. */
+	uint64_t frame_rate_den;
+	/** Frequency of the timestamp cycle counter, in Hz. */
+	uint32_t timestamp_frequency;
+};
+
 /**
  * @def_driverbackendgroup{I2S,i2s_interface}
  * @ingroup i2s_interface
@@ -362,6 +382,7 @@ __subsystem struct i2s_driver_api {
 	 */
 	int (*trigger)(const struct device *dev, enum i2s_dir dir,
 		       enum i2s_trigger_cmd cmd);
+	int (*timing_get)(const struct device *dev, enum i2s_dir dir, struct i2s_timing *timing);
 };
 
 /** @} */
@@ -411,6 +432,33 @@ static inline const struct i2s_config *i2s_config_get(const struct device *dev,
 						      enum i2s_dir dir)
 {
 	return DEVICE_API_GET(i2s, dev)->config_get(dev, dir);
+}
+
+/**
+ * @brief Get an atomic snapshot of effective stream timing.
+ *
+ * The effective rate may differ from the requested frame clock. Drivers that
+ * derive the clock from integer dividers should return the exact rational rate.
+ * The frame count and timestamp identify the same transfer-completion event.
+ * Before the first transfer completes, both values shall be zero.
+ *
+ * @param dev Pointer to the device structure for the driver instance.
+ * @param dir Stream direction: RX or TX as defined by I2S_DIR_*.
+ * @param timing Pointer to the timing snapshot populated by the driver.
+ *
+ * @retval 0 Success.
+ * @retval -EINVAL Invalid direction or output pointer.
+ * @retval -ENODATA The stream is not configured.
+ * @retval -ENOSYS Timing information is not supported.
+ */
+__syscall int i2s_timing_get(const struct device *dev, enum i2s_dir dir, struct i2s_timing *timing);
+
+static inline int z_impl_i2s_timing_get(const struct device *dev, enum i2s_dir dir,
+					struct i2s_timing *timing)
+{
+	const struct i2s_driver_api *api = (const struct i2s_driver_api *)dev->api;
+
+	return api->timing_get == NULL ? -ENOSYS : api->timing_get(dev, dir, timing);
 }
 
 /**
