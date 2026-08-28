@@ -50,13 +50,13 @@ typedef uint32_t pinctrl_soc_pin_t;
  */
 #define Z_PINCTRL_STATE_PIN_INIT(node_id, prop, idx)			       \
 	(DT_PROP_BY_IDX(node_id, prop, idx) |				       \
-	 ((GD32_PUPD_PULLUP * DT_PROP(node_id, bias_pull_up))		       \
+	 ((GD32_PUPD_PULLUP * DT_PROP_OR(node_id, bias_pull_up, 0))	       \
 	  << GD32_PUPD_POS) |						       \
-	 ((GD32_PUPD_PULLDOWN * DT_PROP(node_id, bias_pull_down))	       \
+	 ((GD32_PUPD_PULLDOWN * DT_PROP_OR(node_id, bias_pull_down, 0))       \
 	  << GD32_PUPD_POS) |						       \
-	 ((GD32_OTYPE_OD * DT_PROP(node_id, drive_open_drain))		       \
+	 ((GD32_OTYPE_OD * DT_PROP_OR(node_id, drive_open_drain, 0))	       \
 	  << GD32_OTYPE_POS) |						       \
-	 (DT_ENUM_IDX(node_id, slew_rate) << GD32_OSPEED_POS)),
+	 (DT_ENUM_IDX_OR(node_id, slew_rate, 0) << GD32_OSPEED_POS)),
 
 /**
  * @brief Utility macro to initialize state pins contained in a given property.
