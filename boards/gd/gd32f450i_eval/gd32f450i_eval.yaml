@@ -12,6 +12,7 @@ toolchain:
   - gnuarmemb
 supported:
   - dac
+  - i2s
   - pwm
   - watchdog
   - counter

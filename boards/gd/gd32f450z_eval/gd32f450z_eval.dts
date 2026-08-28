@@ -147,6 +147,15 @@
 	};
 };
 
+&i2s1 {
+	status = "okay";
+	pinctrl-0 = <&i2s1_default>;
+	pinctrl-names = "default";
+	mck-enabled;
+	dmas = <&dma0 3 0 0 0>, <&dma0 4 0 0 0>;
+	dma-names = "rx", "tx";
+};
+
 &spi5 {
 	status = "okay";
 	pinctrl-0 = <&spi5_default>;
@@ -176,4 +185,3 @@
 &dma0 {
 	status = "okay";
 };
-

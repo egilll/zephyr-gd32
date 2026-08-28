@@ -31,6 +31,13 @@
 		};
 	};
 
+	i2s1_default: i2s1_default {
+		group1 {
+			pinmux = <I2S1_MCK_PA6>, <I2S1_CK_PI1>,
+				 <I2S1_WS_PI0>, <I2S1_SD_PC1>;
+		};
+	};
+
 	spi5_default: spi5_default {
 		group1 {
 			pinmux = <SPI5_SCK_PG13>, <SPI5_MOSI_PG14>,
