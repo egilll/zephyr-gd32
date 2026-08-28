@@ -1,0 +1,9 @@
+# Copyright (c) 2026, Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config RTC_MCUX_RTC
+	bool "MCUX RTC driver"
+	default y
+	depends on DT_HAS_NXP_RTC_ENABLED
+	help
+	  Enable the RTC driver for NXP MCUX RTC peripherals.
