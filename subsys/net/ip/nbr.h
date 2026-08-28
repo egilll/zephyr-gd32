@@ -37,8 +37,10 @@ struct net_nbr_lladdr {
 #define NET_NBR_LLADDR_INIT(_name, _count)	\
 	struct net_nbr_lladdr _name[_count] = { }
 
-/* Alignment needed for various parts of the neighbor definition */
-#define __net_nbr_align __aligned(sizeof(int))
+/* Neighbor-specific payloads contain 64-bit timers and must be naturally aligned. */
+#define NET_NBR_DATA_ALIGNMENT __alignof__(uint64_t)
+#define NET_NBR_DATA_SIZE(size) ROUND_UP(size, NET_NBR_DATA_ALIGNMENT)
+#define __net_nbr_align         __aligned(NET_NBR_DATA_ALIGNMENT)
 
 /* The neighbor node generic data. There can be sub-system specific
  * data at the end of the node.
@@ -75,12 +77,12 @@ struct net_nbr {
 #define NET_NBR_POOL_INIT(_name, _count, _size, _remove)		\
 	struct {							\
 		struct net_nbr nbr;					\
-		uint8_t data[ROUND_UP(_size, 4)] __net_nbr_align;	\
+		uint8_t data[NET_NBR_DATA_SIZE(_size)] __net_nbr_align;	\
 	} _name[_count] = {						\
 		[0 ... (_count - 1)] = { .nbr = {			\
 			.idx = NET_NBR_LLADDR_UNKNOWN,			\
 			.remove = _remove,				\
-			.size = ROUND_UP(_size, 4) } },			\
+			.size = NET_NBR_DATA_SIZE(_size) } },		\
 	}
 
 struct net_nbr_table {
