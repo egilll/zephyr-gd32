@@ -546,6 +546,8 @@ int card_read_blocks(struct sd_card *card, uint8_t *rbuf, uint32_t start_block, 
 	uint32_t rlen;
 	uint32_t sector;
 	uint8_t *buf_offset;
+	bool use_card_buf;
+	size_t total_len;
 
 	if ((start_block + num_blocks) > card->block_count) {
 		return -EINVAL;
@@ -561,16 +563,20 @@ int card_read_blocks(struct sd_card *card, uint8_t *rbuf, uint32_t start_block, 
 	}
 
 	/*
-	 * If the buffer we are provided with is aligned, we can use it
-	 * directly. Otherwise, we need to use the card's internal buffer
-	 * and memcpy the data back out
+	 * Use the caller buffer directly when it meets the host's requirements.
+	 * Otherwise, fall back to the card's internal buffer and copy the data
+	 * out.
 	 */
-	if ((((uintptr_t)rbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) {
+	total_len = (size_t)num_blocks * (size_t)card->block_size;
+	use_card_buf = ((((uintptr_t)rbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) ||
+		       !sdhc_data_buf_is_compatible(card->sdhc, rbuf, total_len);
+
+	if (use_card_buf) {
 		/* lower bits of address are set, not aligned. Use internal buffer */
-		LOG_DBG("Unaligned buffer access to SD card may incur performance penalty");
+		LOG_DBG("Using internal SD buffer for transfer");
 		if (sizeof(card->card_buffer) < card->block_size) {
 			LOG_ERR("Card buffer size needs to be increased for "
-				"unaligned writes to work");
+				"buffered transfers to work");
 			k_mutex_unlock(&card->lock);
 			return -ENOBUFS;
 		}
@@ -713,6 +719,8 @@ int card_write_blocks(struct sd_card *card, const uint8_t *wbuf, uint32_t start_
 	uint32_t wlen;
 	uint32_t sector;
 	const uint8_t *buf_offset;
+	bool use_card_buf;
+	size_t total_len;
 
 	if ((start_block + num_blocks) > card->block_count) {
 		return -EINVAL;
@@ -727,16 +735,20 @@ int card_write_blocks(struct sd_card *card, const uint8_t *wbuf, uint32_t start_
 		return -EBUSY;
 	}
 	/*
-	 * If the buffer we are provided with is aligned, we can use it
-	 * directly. Otherwise, we need to use the card's internal buffer
-	 * and memcpy the data back out
+	 * Use the caller buffer directly when it meets the host's requirements.
+	 * Otherwise, fall back to the card's internal buffer and copy the data
+	 * in.
 	 */
-	if ((((uintptr_t)wbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) {
+	total_len = (size_t)num_blocks * (size_t)card->block_size;
+	use_card_buf = ((((uintptr_t)wbuf) & (CONFIG_SDHC_BUFFER_ALIGNMENT - 1)) != 0) ||
+		       !sdhc_data_buf_is_compatible(card->sdhc, wbuf, total_len);
+
+	if (use_card_buf) {
 		/* lower bits of address are set, not aligned. Use internal buffer */
-		LOG_DBG("Unaligned buffer access to SD card may incur performance penalty");
+		LOG_DBG("Using internal SD buffer for transfer");
 		if (sizeof(card->card_buffer) < card->block_size) {
 			LOG_ERR("Card buffer size needs to be increased for "
-				"unaligned writes to work");
+				"buffered transfers to work");
 			k_mutex_unlock(&card->lock);
 			return -ENOBUFS;
 		}
