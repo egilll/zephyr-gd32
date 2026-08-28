@@ -13,6 +13,7 @@ toolchain:
 supported:
   - dac
   - pwm
+  - sdhc
   - watchdog
   - counter
   - dma

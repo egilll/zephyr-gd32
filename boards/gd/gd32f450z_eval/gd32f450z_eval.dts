@@ -177,3 +177,19 @@
 	status = "okay";
 };
 
+&sdio {
+	status = "okay";
+	bus-width = <4>;
+	pinctrl-0 = <&sdio_default>;
+	pinctrl-1 = <&sdio_slow>;
+	pinctrl-2 = <&sdio_fast>;
+	pinctrl-names = "default", "slow", "fast";
+	/* Use a single DMA channel: DMA1 channel 3, sub-periph slot 4 */
+	dmas = <&dma1 3 4 0 0>;
+
+	mmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+		status = "okay";
+	};
+};

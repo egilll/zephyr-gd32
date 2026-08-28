@@ -45,4 +45,48 @@
 				 <SPI5_IO2_PG10>, <SPI5_IO3_PG11>;
 		};
 	};
+	sdio_slow: sdio_slow {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-2mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-2mhz";
+		};
+	};
+
+	sdio_default: sdio_default {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-25mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-25mhz";
+		};
+	};
+
+	sdio_fast: sdio_fast {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-50mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-50mhz";
+		};
+	};
 };
