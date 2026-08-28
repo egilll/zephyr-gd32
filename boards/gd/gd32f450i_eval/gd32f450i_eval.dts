@@ -78,6 +78,7 @@
 		sw0 = &user_key;
 		pwm-led0 = &pwm_led;
 		eeprom-0 = &eeprom0;
+		rtc = &rtc;
 		watchdog0 = &fwdgt;
 	};
 };
@@ -157,6 +158,11 @@
 
 &dma1 {
 	status = "okay";
+};
+
+&rtc {
+	status = "okay";
+	clock-source = "lxtal";
 };
 
 &spi5 {
