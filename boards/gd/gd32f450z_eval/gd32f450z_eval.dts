@@ -107,6 +107,8 @@
 	current-speed = <115200>;
 	pinctrl-0 = <&usart0_default>;
 	pinctrl-names = "default";
+	dmas = <&dma1 2 4 0 0>, <&dma1 7 4 0 0>;
+	dma-names = "rx", "tx";
 };
 
 &dac {
@@ -130,6 +132,10 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-names = "default";
 
+	/* DMA1 ch0: RX, ch6: TX, sub-peripheral slot 1 */
+	dmas = <&dma1 0 1 0 0>, <&dma1 6 1 0 0>;
+	dma-names = "rx", "tx";
+
 	eeprom0: eeprom@50 {
 		compatible = "atmel,at24";
 		reg = <0x50>;
@@ -146,6 +152,8 @@
 	pinctrl-0 = <&spi5_default>;
 	pinctrl-names = "default";
 	cs-gpios = <&gpiog 9 GPIO_ACTIVE_LOW>;
+	dmas = <&dma1 5 1 0 0>, <&dma1 6 1 0 0>;
+	dma-names = "tx", "rx";
 
 	nor_flash: gd25q16@0 {
 		compatible = "jedec,spi-nor";
@@ -160,3 +168,12 @@
 &fwdgt {
 	status = "okay";
 };
+
+&dma1 {
+	status = "okay";
+};
+
+&dma0 {
+	status = "okay";
+};
+

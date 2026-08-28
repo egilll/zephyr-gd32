@@ -67,6 +67,12 @@
 	current-speed = <115200>;
 	pinctrl-0 = <&usart0_default>;
 	pinctrl-names = "default";
+	dmas = <&dma1 2 4 0 0>, <&dma1 7 4 0 0>;
+	dma-names = "rx", "tx";
+};
+
+&dma1 {
+	status = "okay";
 };
 
 &timer2 {
