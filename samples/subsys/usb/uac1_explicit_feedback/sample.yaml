@@ -1,0 +1,14 @@
+sample:
+  name: USB Audio Class 1 explicit feedback sample
+tests:
+  sample.usb.uac1_explicit_feedback:
+    depends_on:
+      - usb_device
+      - i2s
+    tags:
+      - usb
+      - i2s
+    build_only: true
+    integration_platforms:
+      - gd32f450z_eval
+
