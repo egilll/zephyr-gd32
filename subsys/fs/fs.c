@@ -81,7 +81,7 @@ static const struct fs_file_system_t *fs_type_get(int type)
 static int fs_get_mnt_point(struct fs_mount_t **mnt_pntp,
 			    const char *name, size_t *match_len)
 {
-	struct fs_mount_t *mnt_p = NULL, *itr;
+	struct fs_mount_t *default_mnt = NULL, *mnt_p = NULL, *itr;
 	size_t longest_match = 0;
 	size_t len, name_len = strlen(name);
 	sys_dnode_t *node;
@@ -89,6 +89,10 @@ static int fs_get_mnt_point(struct fs_mount_t **mnt_pntp,
 	k_mutex_lock(&mutex, K_FOREVER);
 	SYS_DLIST_FOR_EACH_NODE(&fs_mnt_list, node) {
 		itr = CONTAINER_OF(node, struct fs_mount_t, node);
+		if ((itr->flags & FS_MOUNT_FLAG_DEFAULT) != 0U) {
+			default_mnt = itr;
+		}
+
 		len = itr->mountp_len;
 
 		/*
@@ -114,6 +118,10 @@ static int fs_get_mnt_point(struct fs_mount_t **mnt_pntp,
 			longest_match = len;
 		}
 	}
+
+	if (mnt_p == NULL) {
+		mnt_p = default_mnt;
+	}
 	k_mutex_unlock(&mutex);
 
 	if (mnt_p == NULL) {
@@ -122,7 +130,7 @@ static int fs_get_mnt_point(struct fs_mount_t **mnt_pntp,
 
 	*mnt_pntp = mnt_p;
 	if (match_len) {
-		*match_len = mnt_p->mountp_len;
+		*match_len = longest_match;
 	}
 
 	return 0;
@@ -403,7 +411,7 @@ int fs_opendir(struct fs_dir_t *zdp, const char *abs_path)
 	if (rc < 0) {
 		zdp->mp = NULL;
 		zdp->dirp = NULL;
-		LOG_ERR("directory open error (%d)", rc);
+		LOG_ERR("directory open error (%d, %s)", rc, abs_path);
 	}
 
 	return rc;
@@ -578,8 +586,7 @@ int fs_unlink(const char *abs_path)
 
 int fs_rename(const char *from, const char *to)
 {
-	struct fs_mount_t *mp;
-	size_t match_len;
+	struct fs_mount_t *mp, *to_mp;
 	int rc = -EINVAL;
 
 	if ((from == NULL) || (from[0] != '/') || (from[1] == '\0') ||
@@ -588,7 +595,12 @@ int fs_rename(const char *from, const char *to)
 		return -EINVAL;
 	}
 
-	rc = fs_get_mnt_point(&mp, from, &match_len);
+	rc = fs_get_mnt_point(&mp, from, NULL);
+	if (rc < 0) {
+		LOG_ERR("mount point not found!!");
+		return rc;
+	}
+	rc = fs_get_mnt_point(&to_mp, to, NULL);
 	if (rc < 0) {
 		LOG_ERR("mount point not found!!");
 		return rc;
@@ -599,7 +611,7 @@ int fs_rename(const char *from, const char *to)
 	}
 
 	/* Make sure both files are mounted on the same path */
-	if (strncmp(from, to, match_len) != 0) {
+	if (mp != to_mp) {
 		LOG_ERR("mount point not same!!");
 		return -EINVAL;
 	}

@@ -28,6 +28,13 @@ properties:
   clocks:
     required: true
 
+  vref-mv:
+    type: int
+    default: 3300
+    description: |
+      Reference voltage in millivolts for conversions that use
+      ADC_REF_INTERNAL. On GD32 this is typically VREF+ / VDDA.
+
   rcu-clock-source:
     type: int
     description: |

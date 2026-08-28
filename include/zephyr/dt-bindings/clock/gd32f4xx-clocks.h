@@ -19,6 +19,7 @@
 #define GD32_AHB3EN_OFFSET       0x38U
 #define GD32_APB1EN_OFFSET       0x40U
 #define GD32_APB2EN_OFFSET       0x44U
+#define GD32_ADDCTL_OFFSET       0xC0U
 #define GD32_ADDAPB1EN_OFFSET    0xE4U
 
 /** @} */
@@ -109,6 +110,10 @@
 /* APB1 additional peripherals */
 #define GD32_CLOCK_CTC        GD32_CLOCK_CONFIG(ADDAPB1EN, 27U)
 #define GD32_CLOCK_IREF       GD32_CLOCK_CONFIG(ADDAPB1EN, 31U)
+
+/* Additional clocks (RCU_ADDCTL) */
+#define GD32_CLOCK_IRC48M            GD32_CLOCK_CONFIG(ADDCTL, 16U)
+#define GD32_CLOCK_CK48MSEL_IRC48M   GD32_CLOCK_CONFIG(ADDCTL, 0U)
 
 /** @} */
 

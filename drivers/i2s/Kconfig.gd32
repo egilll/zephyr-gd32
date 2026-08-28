@@ -1,0 +1,38 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig I2S_GD32
+	bool "GigaDevice GD32 I2S driver"
+	default y
+	depends on DT_HAS_GD_GD32_I2S_ENABLED
+	depends on SOC_SERIES_GD32F4XX
+	select PINCTRL
+	select DMA
+	select CACHE_MANAGEMENT if CPU_HAS_DCACHE
+	select USE_GD32_SPI
+	help
+	  Enable the GD32 I2S driver. Only DMA transfers are supported.
+
+if I2S_GD32
+
+config I2S_GD32_RX_BLOCK_COUNT
+	int "RX queue block count"
+	default 4
+	help
+	  Number of RX blocks that can be queued internally.
+
+config I2S_GD32_TX_BLOCK_COUNT
+	int "TX queue block count"
+	default 8
+	help
+	  Number of TX blocks that can be queued internally.
+
+config I2S_GD32_MAX_CLOCK_ERROR_PPM
+	int "Maximum controller-mode frame clock error in ppm"
+	default 1000
+	range 0 1000000
+	help
+	  Maximum difference between the requested and generated frame clock.
+	  Set to 0 to accept the closest rate supported by the clock tree.
+
+endif # I2S_GD32

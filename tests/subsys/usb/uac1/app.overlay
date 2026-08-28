@@ -1,0 +1,66 @@
+#include <zephyr/dt-bindings/usb/audio.h>
+
+/ {
+	uac1_duplex: usb_audio1 {
+		compatible = "zephyr,uac1";
+		status = "okay";
+		full-speed;
+		high-speed;
+		interrupt-endpoint;
+
+		playback_input: playback_input {
+			compatible = "zephyr,uac1-input-terminal";
+			terminal-type = <USB_TERMINAL_STREAMING>;
+			channels = <2>;
+			channel-config = <0x0003>;
+		};
+
+		playback_feature: playback_feature {
+			compatible = "zephyr,uac1-feature-unit";
+			data-source = <&playback_input>;
+			controls = <0x03>;
+			channel-controls = <0x01 0x02>;
+			volume-min = <(-90 * 256)>;
+			volume-max = <0>;
+			volume-res = <256>;
+		};
+
+		playback_output: playback_output {
+			compatible = "zephyr,uac1-output-terminal";
+			terminal-type = <OUTPUT_TERMINAL_SPEAKER>;
+			data-source = <&playback_feature>;
+		};
+
+		capture_input: capture_input {
+			compatible = "zephyr,uac1-input-terminal";
+			terminal-type = <INPUT_TERMINAL_MICROPHONE>;
+			channels = <2>;
+			channel-config = <0x0003>;
+		};
+
+		capture_output: capture_output {
+			compatible = "zephyr,uac1-output-terminal";
+			terminal-type = <USB_TERMINAL_STREAMING>;
+			data-source = <&capture_input>;
+		};
+
+		playback_stream: playback_stream {
+			compatible = "zephyr,uac1-audio-streaming";
+			linked-terminal = <&playback_input>;
+			sync-type = "asynchronous";
+			feedback-refresh = <0>;
+			sampling-frequencies = <44100 48000>;
+			subslot-size = <2>;
+			bit-resolution = <16>;
+		};
+
+		capture_stream: capture_stream {
+			compatible = "zephyr,uac1-audio-streaming";
+			linked-terminal = <&capture_output>;
+			sync-type = "asynchronous";
+			sampling-frequencies = <48000>;
+			subslot-size = <2>;
+			bit-resolution = <16>;
+		};
+	};
+};

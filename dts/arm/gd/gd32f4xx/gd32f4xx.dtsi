@@ -44,28 +44,25 @@
 	};
 
 	soc {
-		tcmsram0: memory@10000000 {
+		tcmsram: memory@10000000 {
 			compatible = "zephyr,memory-region", "arm,dtcm";
 			reg = <0x10000000 DT_SIZE_K(64)>;
 			zephyr,memory-region = "DTCM";
-			zephyr,memory-attr = <DT_MEM_SW_ALLOC_NON_CACHE>;
+			zephyr,memory-attr = <(DT_MEM_CACHEABLE | DT_MEM_SW_ALLOC_CACHE)>;
 		};
 
 		sram0: memory@20000000 {
 			compatible = "zephyr,memory-region", "mmio-sram";
 			reg = <0x20000000 DT_SIZE_K(128)>;
 			zephyr,memory-region = "SRAM";
-			zephyr,memory-attr = <(DT_MEM_DMA |
-					       DT_MEM_SW_ALLOC_NON_CACHE |
-					       DT_MEM_SW_ALLOC_DMA)>;
+			zephyr,memory-attr = <(DT_MEM_CACHEABLE | DT_MEM_DMA |
+					       DT_MEM_SW_ALLOC_CACHE | DT_MEM_SW_ALLOC_DMA)>;
 		};
 
 		backup_sram: sram@40024000 {
-			compatible = "zephyr,memory-region", "gd,gd32-backup-sram";
+			compatible = "gd,gd32-backup-sram";
 			reg = <0x40024000 0x1000>;
 			clocks = <&cctl GD32_CLOCK_BKPSRAM>;
-			zephyr,memory-region = "BKPSRAM";
-			zephyr,memory-attr = <DT_MEM_NON_VOLATILE>;
 			status = "disabled";
 		};
 
@@ -233,6 +230,31 @@
 			status = "disabled";
 		};
 
+		enet: ethernet@40028000 {
+			compatible = "gd,gd32-ethernet", "snps,dwmac";
+			reg = <0x40028000 0x8000>;
+			interrupts = <61 0>;
+			clocks = <&cctl GD32_CLOCK_ENET>,
+				 <&cctl GD32_CLOCK_ENETTX>,
+				 <&cctl GD32_CLOCK_ENETRX>,
+				 <&cctl GD32_CLOCK_ENETPTP>;
+			clock-names = "mac", "tx", "rx", "ptp";
+			resets = <&rctl GD32_RESET_ENET>,
+				 <&rctl GD32_RESET_ENETTX>,
+				 <&rctl GD32_RESET_ENETRX>,
+				 <&rctl GD32_RESET_ENETPTP>;
+			reset-names = "mac", "tx", "rx", "ptp";
+			phy-connection-type = "rmii";
+			status = "disabled";
+
+			mdio: mdio {
+				compatible = "snps,dwmac-mdio";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "disabled";
+			};
+		};
+
 		spi0: spi@40013000 {
 			compatible = "gd,gd32-spi";
 			reg = <0x40013000 0x400>;
@@ -257,6 +279,39 @@
 
 		spi2: spi@40003c00 {
 			compatible = "gd,gd32-spi";
+			reg = <0x40003c00 0x400>;
+			interrupts = <51 0>;
+			clocks = <&cctl GD32_CLOCK_SPI2>;
+			resets = <&rctl GD32_RESET_SPI2>;
+			status = "disabled";
+			#address-cells = <1>;
+			#size-cells = <0>;
+		};
+
+		i2s0: i2s@40013000 {
+			compatible = "gd,gd32-i2s";
+			reg = <0x40013000 0x400>;
+			interrupts = <35 0>;
+			clocks = <&cctl GD32_CLOCK_SPI0>;
+			resets = <&rctl GD32_RESET_SPI0>;
+			status = "disabled";
+			#address-cells = <1>;
+			#size-cells = <0>;
+		};
+
+		i2s1: i2s@40003800 {
+			compatible = "gd,gd32-i2s";
+			reg = <0x40003800 0x400>;
+			interrupts = <36 0>;
+			clocks = <&cctl GD32_CLOCK_SPI1>;
+			resets = <&rctl GD32_RESET_SPI1>;
+			status = "disabled";
+			#address-cells = <1>;
+			#size-cells = <0>;
+		};
+
+		i2s2: i2s@40003c00 {
+			compatible = "gd,gd32-i2s";
 			reg = <0x40003c00 0x400>;
 			interrupts = <51 0>;
 			clocks = <&cctl GD32_CLOCK_SPI2>;
@@ -321,6 +376,16 @@
 		fwdgt: watchdog@40003000 {
 			compatible = "gd,gd32-fwdgt";
 			reg = <0x40003000 0x400>;
+			status = "disabled";
+		};
+
+		rtc: rtc@40002800 {
+			compatible = "gd,gd32-rtc";
+			reg = <0x40002800 0x400>;
+			interrupts = <41 0>, <3 0>;
+			interrupt-names = "alarm", "wakeup";
+			clock-source = "irc32k";
+			alarms-count = <2>;
 			status = "disabled";
 		};
 
@@ -684,6 +749,77 @@
 			dma-channels = <8>;
 			gd,mem2mem;
 			#dma-cells = <4>;
+			status = "disabled";
+		};
+
+		usbhs: usb@40040000 {
+			compatible = "gd,gd32-usbhs", "snps,dwc2";
+			reg = <0x40040000 0x40000>;
+			interrupts = <77 0>;
+			clocks = <&cctl GD32_CLOCK_USBHS>;
+			resets = <&rctl GD32_RESET_USBHS>;
+			num-in-eps = <6>;
+			num-out-eps = <6>;
+			/*
+			 * GD32 reuses DWC2 offsets 0x044..0x050 (GHWCFG1..4)
+			 * as Reserved; reading them returns zero. The UDC
+			 * driver detects that case and falls back to these
+			 * devicetree values. Encoded fields (others 0):
+			 *
+			 *   GHWCFG1: per-EP direction; 0 => all bidirectional
+			 *   GHWCFG2: NUMDEVEPS=5 (6 EPs incl EP0),
+			 *            OTGARCH=internal DMA, HSPHYTYPE=ULPI
+			 *   GHWCFG3: DFIFODEPTH=0x400 (1024 words),
+			 *            XFERSIZEWIDTH=11, PKTSIZEWIDTH=6
+			 *   GHWCFG4: DEDFIFO=1, INEPS=5 (6 IN EPs incl EP0)
+			 *
+			 * See _PLANS/USB_1.md for the full derivation.
+			 */
+			ghwcfg1 = <0x00000000>;
+			ghwcfg2 = <0x00001590>;
+			ghwcfg3 = <0x04000068>;
+			ghwcfg4 = <0x16000000>;
+			status = "disabled";
+		};
+
+		usbfs: usb@50000000 {
+			compatible = "gd,gd32-usbfs", "snps,dwc2";
+			reg = <0x50000000 0x40000>;
+			interrupts = <67 0>;
+			clocks = <&cctl GD32_CLOCK_USBFS>;
+			resets = <&rctl GD32_RESET_USBFS>;
+			num-in-eps = <4>;
+			num-out-eps = <4>;
+			/*
+			 * See USBHS for why GHWCFG is supplied from DT. USBFS
+			 * encodes (others 0):
+			 *
+			 *   GHWCFG1: all EPs bidirectional
+			 *   GHWCFG2: NUMDEVEPS=3 (4 EPs incl EP0),
+			 *            FSPHYTYPE=FS, HSPHYTYPE=NO_HS,
+			 *            DYNFIFOSIZING=1
+			 *   GHWCFG3: DFIFODEPTH=0x140 (320 words)
+			 *   GHWCFG4: DEDFIFO=1, INEPS=3 (4 IN EPs incl EP0),
+			 *            NUMDEVPERIOEPS=3
+			 */
+			ghwcfg1 = <0x00000000>;
+			ghwcfg2 = <0x00080d00>;
+			ghwcfg3 = <0x01400068>;
+			ghwcfg4 = <0x0e000003>;
+			status = "disabled";
+		};
+
+		sdio: sdio@40012c00 {
+			compatible = "gd,gd32-sdhc";
+			reg = <0x40012c00 0x1000>;
+			interrupts = <49 0>;
+			clocks = <&cctl GD32_CLOCK_SDIO>;
+			resets = <&rctl GD32_RESET_SDIO>;
+			/* Identification and transfer frequencies */
+			min-bus-freq = <400000>;
+			max-bus-freq = <50000000>;
+			/* Time in ms to wait after power toggling */
+			power-delay-ms = <20>;
 			status = "disabled";
 		};
 	};

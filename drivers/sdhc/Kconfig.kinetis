@@ -1,0 +1,38 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+config SDHC_KINETIS
+	bool "NXP Kinetis SDHC driver"
+	default y
+	depends on DT_HAS_NXP_KINETIS_SDHC_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	select PINCTRL
+	help
+	  Enable the NXP Kinetis SDHC host controller driver.
+
+if SDHC_KINETIS
+
+config SDHC_BUFFER_ALIGNMENT
+	default DCACHE_LINE_SIZE if DCACHE
+	default 4
+	help
+	  SDHC buffers should be cache-line aligned when they are placed in a
+	  cacheable region.
+
+config SDHC_KINETIS_TEST
+	bool "NXP Kinetis SDHC test fault injection"
+	depends on ZTEST
+	help
+	  Enables test-only fault injection used by the Kinetis SDHC hardware
+	  regression application. This option adds no production state or code.
+
+config SDHC_KINETIS_ADMA_TABLE_WORDS
+	int "Kinetis SDHC ADMA descriptor table size in words"
+	default 8
+	range 4 128
+	help
+	  Size of the per-controller ADMA2 descriptor table. Each descriptor uses
+	  two words and describes up to 65535 bytes. The default supports transfers
+	  up to 196605 bytes, including the terminating descriptor.
+
+endif # SDHC_KINETIS

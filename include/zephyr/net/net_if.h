@@ -537,6 +537,12 @@ struct net_if_dhcpv4 {
 	/** Timer start */
 	int64_t timer_start;
 
+	/** Start of the current address acquisition or renewal process */
+	int64_t acquisition_start;
+
+	/** Elapsed seconds carried by the latest message in the transaction */
+	uint16_t secs;
+
 	/** Time for INIT, INIT-REBOOT, DISCOVER, REQUESTING, RENEWAL */
 	uint32_t request_time;
 

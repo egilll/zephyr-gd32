@@ -73,6 +73,14 @@ config NET_DHCPV4_VENDOR_CLASS_IDENTIFIER_STRING
 	  The string to include in the DHCPv4 vendor class identifier option
 	  in the DHCPv4 request.
 
+config NET_DHCPV4_CLIENT_IDENTIFIER
+	bool "Send link-layer address as DHCPv4 client identifier"
+	depends on NET_L2_ETHERNET
+	help
+	  Include option 61 in DHCPv4 messages, using the Ethernet hardware
+	  type followed by the interface link-layer address. Some DHCP servers
+	  use this option rather than the BOOTP chaddr field to identify leases.
+
 config NET_DHCPV4_OPTION_NTP_SERVER
 	bool "Use NTP server from DHCPv4 option and save it in the net_if"
 	default y

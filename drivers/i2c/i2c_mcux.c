@@ -83,6 +83,9 @@ static int i2c_mcux_configure(const struct device *dev,
 	case I2C_SPEED_FAST_PLUS:
 		baudrate = MHZ(1);
 		break;
+	case I2C_SPEED_DT:
+		baudrate = config->bitrate ? config->bitrate : KHZ(100);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -538,6 +541,9 @@ static int i2c_mcux_init(const struct device *dev)
 				       i2c_mcux_master_transfer_callback, (void *)dev);
 
 	bitrate_cfg = i2c_map_dt_bitrate(config->bitrate);
+	if (bitrate_cfg == 0U) {
+		bitrate_cfg = I2C_SPEED_SET(I2C_SPEED_DT);
+	}
 
 	error = pinctrl_apply_state(config->pincfg, PINCTRL_STATE_DEFAULT);
 	if (error) {

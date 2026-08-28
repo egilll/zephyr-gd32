@@ -50,6 +50,35 @@ NET_NBR_POOL_INIT(net_test_neighbor_pool, CONFIG_NET_IPV6_MAX_NEIGHBORS,
 NET_NBR_TABLE_INIT(NET_NBR_LOCAL, test_neighbor, net_test_neighbor_pool,
 		   net_neighbor_table_clear);
 
+struct aligned_neighbor_data {
+	int64_t timer;
+};
+
+NET_NBR_POOL_INIT(net_test_aligned_pool, 2, sizeof(struct aligned_neighbor_data), NULL);
+NET_NBR_TABLE_INIT(NET_NBR_LOCAL, test_aligned_neighbor, net_test_aligned_pool, NULL);
+
+ZTEST(neighbor_test_suite, test_neighbor_data_alignment)
+{
+	struct net_nbr *nbrs[ARRAY_SIZE(net_test_aligned_pool)];
+
+	for (size_t i = 0U; i < ARRAY_SIZE(nbrs); i++) {
+		struct aligned_neighbor_data *data;
+
+		nbrs[i] = net_nbr_get(&net_test_aligned_neighbor.table);
+		zassert_not_null(nbrs[i]);
+		zassert_true(IS_ALIGNED(nbrs[i]->data, __alignof__(struct aligned_neighbor_data)),
+			     "neighbor %zu payload %p is not naturally aligned", i, nbrs[i]->data);
+
+		data = (struct aligned_neighbor_data *)nbrs[i]->data;
+		data->timer = INT64_MAX - (int64_t)i;
+		zassert_equal(data->timer, INT64_MAX - (int64_t)i);
+	}
+
+	for (size_t i = 0U; i < ARRAY_SIZE(nbrs); i++) {
+		net_nbr_unref(nbrs[i]);
+	}
+}
+
 
 static struct net_eth_addr hwaddr1 = { { 0x42, 0x11, 0x69, 0xde, 0xfa, 0x01 } };
 static struct net_eth_addr hwaddr2 = { { 0x5f, 0x1c, 0x04, 0xae, 0x99, 0x02 } };

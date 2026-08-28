@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+description: GD32 USBFS DWC2 compatible controller
+
+compatible: "gd,gd32-usbfs"
+
+include: ["snps,dwc2.yaml", "pinctrl-device.yaml"]
+
+properties:
+  clocks:
+    required: true
+    description: |
+      USBFS peripheral clock and any additional clocks needed to provide the
+      required 48 MHz USB clock for the embedded FS PHY (e.g. enabling IRC48M
+      and selecting CK48M source).
+
+  resets:
+    type: phandle-array
+    description: |
+      Optional reset line for the USBFS peripheral. Recommended to ensure the
+      controller starts from a clean state, matching vendor initialization.
+
+  vbus-sensing:
+    type: boolean
+    description: |
+      Enable VBUS sensing on the VBUS pin (do not set VBUSIG).
+
+      Reference: GD32_28_USBFS.md describes that in device mode VBUS detection
+      is controlled by the VBUSIG bit in USBFS_GCCFG. If this property is not
+      present, the driver will set VBUSIG and treat VBUS as always valid.

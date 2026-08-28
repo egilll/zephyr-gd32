@@ -251,10 +251,9 @@ NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(v6_svc, dns_dispatcher_svc_handler,
 
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 static void cancel_probes(struct mdns_responder_context *ctx);
-#if defined(CONFIG_NET_DHCPV4)
 static void announce_start(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(announce_timer, announce_start);
-#endif
+static void start_announce(struct net_if *iface);
 static struct k_work_q mdns_work_q;
 static K_KERNEL_STACK_DEFINE(mdns_work_q_stack, CONFIG_MDNS_WORKQ_STACK_SIZE);
 static void do_init_listener(struct k_work *work);
@@ -271,6 +270,7 @@ struct mdns_monitor_iface_addr {
 	struct net_addr addr;
 	bool in_use : 1;
 	bool needs_announce : 1;
+	bool pending_goodbye : 1;
 };
 
 static struct mdns_monitor_iface_addr mon_if[
@@ -342,11 +342,8 @@ static void mdns_iface_event_handler(uint64_t mgmt_event, struct net_if *iface, 
 		return;
 	}
 
-	if (mgmt_event == NET_EVENT_IF_UP && init_listener_done) {
-		do_announce = true;
-		announce_count = 0;
-
-		mark_needs_announce(iface, true);
+	if (mgmt_event == NET_EVENT_IF_UP) {
+		start_announce(iface);
 	}
 }
 
@@ -999,12 +996,14 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
 			mon_if[j].in_use = true;
+			mon_if[j].pending_goodbye = false;
 			return -EALREADY;
 		}
 	}
 
 	if (first_free >= 0) {
 		mon_if[first_free].in_use = true;
+		mon_if[first_free].pending_goodbye = false;
 		mon_if[first_free].iface = iface;
 		mon_if[first_free].addr.family = family;
 
@@ -1035,6 +1034,9 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 	} else {
 		expected_len = sizeof(struct net_in6_addr);
 	}
+	if (addrlen != expected_len) {
+		return -EINVAL;
+	}
 
 	ARRAY_FOR_EACH(mon_if, j) {
 		if (!mon_if[j].in_use) {
@@ -1050,7 +1052,8 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 		}
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
-			mon_if[j].in_use = false;
+			mon_if[j].pending_goodbye = true;
+			mon_if[j].needs_announce = true;
 			return 0;
 		}
 	}
@@ -1235,7 +1238,6 @@ static void probing(struct k_work *work)
 	}
 }
 
-#if defined(CONFIG_NET_DHCPV4)
 /* This is arbitrary delay to let things cool down a bit before announcing
  * the address.
  */
@@ -1266,7 +1268,6 @@ static void start_announce(struct net_if *iface)
 		NET_DBG("Cannot schedule %s announce work (%d)", "mDNS", ret);
 	}
 }
-#endif /* CONFIG_NET_DHCPV4 */
 
 #if defined(CONFIG_NET_IPV4)
 static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *iface, void *info,
@@ -1275,7 +1276,9 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 	uint32_t probe_delay = sys_rand32_get() % 250;
 	int ret;
 
-	if ((mgmt_event != NET_EVENT_IPV4_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV4_ADDR_DEL)) {
+	if ((mgmt_event != NET_EVENT_IPV4_ADDR_ADD) &&
+	    (mgmt_event != NET_EVENT_IPV4_ADDR_DEL) &&
+	    (mgmt_event != NET_EVENT_IPV4_ACD_SUCCEED)) {
 		return;
 	}
 
@@ -1295,6 +1298,15 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 				return;
 			}
 
+			if (IS_ENABLED(CONFIG_NET_IPV4_ACD)) {
+				return;
+			}
+
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v4_ctx[i].probe_timer,
 							  K_MSEC(probe_delay));
@@ -1303,6 +1315,22 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 			} else {
 				NET_DBG("%s %s probing scheduled for iface %d ctx %p",
 					"IPv4", "add", net_if_get_by_iface(iface),
+					&v4_ctx[i]);
+			}
+		} else if (mgmt_event == NET_EVENT_IPV4_ACD_SUCCEED) {
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
+			ret = k_work_reschedule_for_queue(&mdns_work_q,
+							  &v4_ctx[i].probe_timer,
+							  K_MSEC(probe_delay));
+			if (ret < 0) {
+				NET_DBG("Cannot schedule %s probe work (%d)", "IPv4", ret);
+			} else {
+				NET_DBG("%s %s probing scheduled for iface %d ctx %p",
+					"IPv4", "ACD", net_if_get_by_iface(iface),
 					&v4_ctx[i]);
 			}
 		} else {
@@ -1318,6 +1346,10 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 
 			if (!net_if_is_up(iface)) {
 				continue;
+			}
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
 			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
@@ -1337,7 +1369,8 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 }
 
 NET_MGMT_REGISTER_EVENT_HANDLER(mdns_addr_ipv4_events,
-				NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL,
+				NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL |
+					NET_EVENT_IPV4_ACD_SUCCEED,
 				mdns_addr_ipv4_event_handler, NULL);
 #endif /* defined(CONFIG_NET_IPV4) */
 
@@ -1368,6 +1401,11 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 				return;
 			}
 
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v6_ctx[i].probe_timer,
 							  K_MSEC(probe_delay));
@@ -1391,6 +1429,10 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 
 			if (!net_if_is_up(iface)) {
 				continue;
+			}
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
 			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
@@ -2243,7 +2285,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 
 		net_buf_add_be16(answer, type);
 		net_buf_add_be16(answer, DNS_CLASS_IN);
-		net_buf_add_be32(answer, ttl);
+		net_buf_add_be32(answer, addr_list[i].pending_goodbye ? 0 : ttl);
 
 		if (type == DNS_RR_TYPE_A) {
 			net_buf_add_be16(answer, sizeof(struct net_in_addr));
@@ -2283,6 +2325,18 @@ static bool check_if_needs_announce(struct net_if *iface)
 	}
 
 	return false;
+}
+
+static void clear_pending_goodbyes(struct net_if *iface, net_sa_family_t family)
+{
+	ARRAY_FOR_EACH(mon_if, i) {
+		if (mon_if[i].in_use && mon_if[i].iface == iface &&
+		    mon_if[i].addr.family == family && mon_if[i].pending_goodbye) {
+			mon_if[i].in_use = false;
+			mon_if[i].pending_goodbye = false;
+			mon_if[i].needs_announce = false;
+		}
+	}
 }
 
 #if defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
@@ -2390,6 +2444,7 @@ static int send_announce(const char *name)
 			NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 			continue;
 		}
+		clear_pending_goodbyes(v4_ctx[i].iface, NET_AF_INET);
 
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v4_ctx[i].iface));
@@ -2438,6 +2493,7 @@ static int send_announce(const char *name)
 			NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 			continue;
 		}
+		clear_pending_goodbyes(v6_ctx[i].iface, NET_AF_INET6);
 
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v6_ctx[i].iface));
@@ -2469,8 +2525,8 @@ static void announce_start(struct k_work *work)
 	do_announce = true;
 	announce_count++;
 
-	/* Do not re-schedule if we were triggered by the DHCP BOUND event */
-	if (COND_CODE_1(CONFIG_NET_DHCPV4, (&announce_timer != dwork), (true))) {
+	/* Address-change announces need only one packet. */
+	if (&announce_timer != dwork) {
 		ret = k_work_reschedule_for_queue(&mdns_work_q, dwork, K_SECONDS(ANNOUNCE_TIMEOUT));
 		if (ret < 0) {
 			NET_DBG("Cannot schedule %s work (%d)", "announce", ret);
