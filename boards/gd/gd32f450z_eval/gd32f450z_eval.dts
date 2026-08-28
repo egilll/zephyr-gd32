@@ -16,7 +16,7 @@
 	chosen {
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
-		zephyr,dtcm = &tcmsram0;
+		zephyr,dtcm = &tcmsram;
 		zephyr,console = &usart0;
 		zephyr,shell-uart = &usart0;
 		zephyr,flash-controller = &fmc;
@@ -78,8 +78,25 @@
 		sw0 = &user_key;
 		pwm-led0 = &pwm_led;
 		eeprom-0 = &eeprom0;
+		rtc = &rtc;
 		watchdog0 = &fwdgt;
 	};
+
+};
+
+zephyr_udc0: &usbfs {
+	pinctrl-0 = <&usbfs_default>;
+	pinctrl-names = "default";
+	clocks = <&cctl GD32_CLOCK_USBFS>,
+		 <&cctl GD32_CLOCK_IRC48M>,
+		 <&cctl GD32_CLOCK_CK48MSEL_IRC48M>;
+	status = "okay";
+};
+
+&usbhs {
+	pinctrl-0 = <&usbhs_ulpi_default>;
+	pinctrl-names = "default";
+	status = "disabled";
 };
 
 &gpioa {
@@ -98,6 +115,10 @@
 	status = "okay";
 };
 
+&gpiof {
+	status = "okay";
+};
+
 &gpiog {
 	status = "okay";
 };
@@ -106,6 +127,14 @@
 	status = "okay";
 	current-speed = <115200>;
 	pinctrl-0 = <&usart0_default>;
+	pinctrl-names = "default";
+	dmas = <&dma1 2 4 0 0>, <&dma1 7 4 0 0>;
+	dma-names = "rx", "tx";
+};
+
+&adc2 {
+	status = "okay";
+	pinctrl-0 = <&adc2_default>;
 	pinctrl-names = "default";
 };
 
@@ -130,6 +159,10 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-names = "default";
 
+	/* DMA1 ch0: RX, ch6: TX, sub-peripheral slot 1 */
+	dmas = <&dma1 0 1 0 0>, <&dma1 6 1 0 0>;
+	dma-names = "rx", "tx";
+
 	eeprom0: eeprom@50 {
 		compatible = "atmel,at24";
 		reg = <0x50>;
@@ -146,6 +179,8 @@
 	pinctrl-0 = <&spi5_default>;
 	pinctrl-names = "default";
 	cs-gpios = <&gpiog 9 GPIO_ACTIVE_LOW>;
+	dmas = <&dma1 5 1 0 0>, <&dma1 6 1 0 0>;
+	dma-names = "tx", "rx";
 
 	nor_flash: gd25q16@0 {
 		compatible = "jedec,spi-nor";
@@ -159,4 +194,67 @@
 
 &fwdgt {
 	status = "okay";
+};
+
+&dma1 {
+	status = "okay";
+};
+
+&rtc {
+	status = "okay";
+	clock-source = "lxtal";
+};
+
+&trng0 {
+	status = "okay";
+};
+
+&mdio {
+	status = "okay";
+	pinctrl-0 = <&mdio_default>;
+	pinctrl-names = "default";
+
+	eth_phy0: ethernet-phy@1 {
+		compatible = "ethernet-phy";
+		reg = <1>;
+		default-speeds = "10BASE Half-Duplex", "10BASE Full-Duplex",
+				 "100BASE Half-Duplex", "100BASE Full-Duplex";
+	};
+};
+&enet {
+	status = "okay";
+	pinctrl-0 = <&enet_default>;
+	pinctrl-names = "default";
+	gd,phy-clk-out;
+	phy-handle = <&eth_phy0>;
+};
+
+&dma0 {
+	status = "okay";
+};
+
+&i2s1 {
+	status = "okay";
+	pinctrl-0 = <&i2s1_default>;
+	pinctrl-names = "default";
+	mck-enabled;
+	dmas = <&dma0 3 0 0 0>, <&dma0 4 0 0 0>;
+	dma-names = "rx", "tx";
+};
+
+&sdio {
+	status = "okay";
+	bus-width = <4>;
+	pinctrl-0 = <&sdio_default>;
+	pinctrl-1 = <&sdio_slow>;
+	pinctrl-2 = <&sdio_fast>;
+	pinctrl-names = "default", "slow", "fast";
+	/* Use a single DMA channel: DMA1 channel 3, sub-periph slot 4 */
+	dmas = <&dma1 3 4 0 0>;
+
+	mmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+		status = "okay";
+	};
 };

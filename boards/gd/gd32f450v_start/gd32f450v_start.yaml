@@ -5,15 +5,18 @@ identifier: gd32f450v_start
 name: GigaDevice GD32F450V-START
 type: mcu
 arch: arm
-ram: 112
+ram: 256
 flash: 3072
 toolchain:
   - zephyr
   - gnuarmemb
 supported:
-  - pwm
-  - gpio
   - counter
   - dma
+  - gpio
+  - pwm
   - spi
+  - uart
+  - usb_device
+  - usbd
 vendor: gd

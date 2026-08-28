@@ -12,6 +12,12 @@
 		};
 	};
 
+	adc0_default: adc0_default {
+		group1 {
+			pinmux = <ADC012_IN13_PC3>;
+		};
+	};
+
 	dac_default: dac_default {
 		group1 {
 			pinmux = <DAC_OUT0_PA4>;
@@ -31,12 +37,101 @@
 		};
 	};
 
+	i2s1_default: i2s1_default {
+		group1 {
+			pinmux = <I2S1_MCK_PA6>, <I2S1_CK_PI1>,
+				 <I2S1_WS_PI0>, <I2S1_SD_PC1>;
+		};
+	};
+
 	spi5_default: spi5_default {
 		group1 {
 			pinmux = <SPI5_SCK_PG13>, <SPI5_MOSI_PG14>,
 				 <SPI5_MISO_PG12>,
 				 /* Use pinmux to pullup pg10 and pg11. */
 				 <SPI5_IO2_PG10>, <SPI5_IO3_PG11>;
+		};
+	};
+
+	enet_default: enet_default {
+		group1 {
+			pinmux = <ENET_RMII_REF_CLK_PA1>,
+				 <ENET_RMII_CRS_DV_PA7>,
+				 <ENET_RMII_RXD0_PC4>, <ENET_RMII_RXD1_PC5>,
+				 <ENET_RMII_TX_EN_PG11>, <ENET_RMII_TXD0_PG13>,
+				 <ENET_RMII_TXD1_PG14>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
+	mdio_default: mdio_default {
+		group1 {
+			pinmux = <ENET_MDIO_PA2>, <ENET_MDC_PC1>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
+	usbfs_default: usbfs_default {
+		group1 {
+			pinmux = <USBFS_DM_PA11>, <USBFS_DP_PA12>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
+	usbhs_ulpi_default: usbhs_ulpi_default {
+		group1 {
+			pinmux = <USBHS_ULPI_NXT_PC3>, <USBHS_ULPI_DIR_PC2>,
+				 <USBHS_ULPI_STP_PC0>, <USBHS_ULPI_CK_PA5>,
+				 <USBHS_ULPI_D7_PB5>, <USBHS_ULPI_D6_PB13>,
+				 <USBHS_ULPI_D5_PB12>, <USBHS_ULPI_D4_PB11>,
+				 <USBHS_ULPI_D3_PB10>, <USBHS_ULPI_D2_PB1>,
+				 <USBHS_ULPI_D1_PB0>, <USBHS_ULPI_D0_PA3>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
+	sdio_slow: sdio_slow {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-2mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-2mhz";
+		};
+	};
+
+	sdio_default: sdio_default {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-25mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-25mhz";
+		};
+	};
+
+	sdio_fast: sdio_fast {
+		group1 {
+			pinmux = <SDIO_CMD_PD2>,
+				 <SDIO_D0_PC8>, <SDIO_D1_PC9>,
+				 <SDIO_D2_PC10>, <SDIO_D3_PC11>;
+			slew-rate = "max-speed-50mhz";
+			bias-pull-up;
+		};
+
+		group2 {
+			pinmux = <SDIO_CK_PC12>;
+			slew-rate = "max-speed-50mhz";
 		};
 	};
 };
