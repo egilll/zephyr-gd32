@@ -313,9 +313,15 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define DISCOVER		1
 #define REQUEST			3
 #define OPTION_DNS_SERVER	6
+#define OPTION_SUBNET_MASK	1
+#define OPTION_ROUTER		3
 #define OPTION_REQ_IPADDR	50
+#define OPTION_LEASE_TIME	51
+#define OPTION_OVERLOAD		52
 #define OPTION_SERVER_ID	54
 #define OPTION_REQ_LIST		55
+#define OPTION_RENEWAL		58
+#define OPTION_REBINDING	59
 #define OPTION_DOMAIN		15
 #define OPTION_POP3		70
 #define OPTION_VENDOR_STRING	1
@@ -324,6 +330,12 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define OPTION_INVALID		254
 
 #define MAX_REQ_OPTIONS 16
+#define DHCP_BOOT_HEADER_SIZE 44
+
+enum dhcp_reply_mode {
+	DHCP_REPLY_STANDARD,
+	DHCP_REPLY_OVERLOADED,
+};
 
 struct dhcp_client_msg {
 	uint32_t xid;
@@ -349,6 +361,7 @@ static bool init_reboot_request_seen;
 static bool reject_init_reboot;
 static bool drop_init_reboot;
 static uint8_t init_reboot_request_count;
+static enum dhcp_reply_mode reply_mode;
 
 #define EVT_ADDR_ADD        BIT(0)
 #define EVT_ADDR_DEL        BIT(1)
@@ -389,6 +402,7 @@ static void dhcp_test_reset_iface(struct net_if *iface)
 	reject_init_reboot = false;
 	drop_init_reboot = false;
 	init_reboot_request_count = 0U;
+	reply_mode = DHCP_REPLY_STANDARD;
 }
 
 static void dhcpv4_tests_before(void *fixture)
@@ -525,6 +539,60 @@ struct net_pkt *prepare_dhcp_ack(struct net_if *iface, uint32_t xid, bool includ
 fail:
 	net_pkt_unref(pkt);
 	return NULL;
+}
+
+static bool write_dhcp_option(struct net_pkt *pkt, uint8_t type, const uint8_t *data,
+			      uint8_t len)
+{
+	return net_pkt_write_u8(pkt, type) == 0 && net_pkt_write_u8(pkt, len) == 0 &&
+	       (len == 0U || net_pkt_write(pkt, data, len) == 0);
+}
+
+static struct net_pkt *prepare_dhcp_overloaded_reply(struct net_if *iface, uint32_t xid,
+					     const unsigned char *template, uint8_t msg_type)
+{
+	static const uint8_t subnet_mask[] = {255, 255, 255, 0};
+	static const uint8_t renewal_time[] = {0x00, 0x00, 0x54, 0x60};
+	static const uint8_t rebinding_time[] = {0x00, 0x00, 0x93, 0xa8};
+	static const uint8_t lease_time[] = {0x00, 0x00, 0xa8, 0xc0};
+	static const uint8_t server_id[] = {10, 184, 9, 1};
+	static const uint8_t dns_servers[] = {10, 248, 2, 1, 163, 33, 253, 68, 10, 184, 9, 1};
+	static const uint8_t router[] = {10, 237, 72, 1};
+	uint8_t overload = BIT(0) | BIT(1);
+	uint8_t sname[64] = {OPTION_POP3, 4, 198, 51, 100, 16, 255};
+	uint8_t file[128] = {OPTION_ROUTER, 4, 10, 237, 72, 1, 255};
+	struct net_pkt *pkt;
+
+	pkt = net_pkt_alloc_with_buffer(iface, MAX(sizeof(offer), sizeof(ack)), NET_AF_INET,
+					NET_IPPROTO_UDP, K_FOREVER);
+	if (pkt == NULL) {
+		return NULL;
+	}
+
+	net_pkt_set_ipv4_ttl(pkt, 0xFF);
+	if (net_ipv4_create(pkt, &server_addr, &client_addr) ||
+	    net_udp_create(pkt, net_htons(SERVER_PORT), net_htons(CLIENT_PORT)) ||
+	    net_pkt_write(pkt, template, 4) || net_pkt_write_be32(pkt, xid) ||
+	    net_pkt_write(pkt, template + 8, DHCP_BOOT_HEADER_SIZE - 8) ||
+	    net_pkt_write(pkt, sname, sizeof(sname)) || net_pkt_write(pkt, file, sizeof(file)) ||
+	    net_pkt_write(pkt, "\x63\x82\x53\x63", 4) ||
+	    !write_dhcp_option(pkt, MSG_TYPE, &msg_type, 1) ||
+	    !write_dhcp_option(pkt, OPTION_RENEWAL, renewal_time, sizeof(renewal_time)) ||
+	    !write_dhcp_option(pkt, OPTION_REBINDING, rebinding_time, sizeof(rebinding_time)) ||
+	    !write_dhcp_option(pkt, OPTION_LEASE_TIME, lease_time, sizeof(lease_time)) ||
+	    !write_dhcp_option(pkt, OPTION_SERVER_ID, server_id, sizeof(server_id)) ||
+	    !write_dhcp_option(pkt, OPTION_SUBNET_MASK, subnet_mask, sizeof(subnet_mask)) ||
+	    !write_dhcp_option(pkt, OPTION_DNS_SERVER, dns_servers, sizeof(dns_servers)) ||
+	    !write_dhcp_option(pkt, OPTION_OVERLOAD, &overload, 1) ||
+	    net_pkt_write_u8(pkt, 255)) {
+		net_pkt_unref(pkt);
+		return NULL;
+	}
+
+	net_pkt_cursor_init(pkt);
+	net_ipv4_finalize(pkt, NET_IPPROTO_UDP);
+
+	return pkt;
 }
 
 static struct net_pkt *prepare_dhcp_nak(struct net_if *iface, uint32_t xid)
@@ -709,7 +777,12 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 		}
 
 		/* Reply with DHCPv4 offer message */
-		rpkt = prepare_dhcp_offer(net_pkt_iface(pkt), msg.xid);
+		if (reply_mode == DHCP_REPLY_OVERLOADED) {
+			rpkt = prepare_dhcp_overloaded_reply(net_pkt_iface(pkt), msg.xid, offer,
+						     NET_DHCPV4_MSG_TYPE_OFFER);
+		} else {
+			rpkt = prepare_dhcp_offer(net_pkt_iface(pkt), msg.xid);
+		}
 		if (!rpkt) {
 			return -EINVAL;
 		}
@@ -745,6 +818,9 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 
 		if (nak_reply) {
 			rpkt = prepare_dhcp_nak(net_pkt_iface(pkt), msg.xid);
+		} else if (reply_mode == DHCP_REPLY_OVERLOADED) {
+			rpkt = prepare_dhcp_overloaded_reply(net_pkt_iface(pkt), msg.xid, ack,
+						     NET_DHCPV4_MSG_TYPE_ACK);
 		} else {
 			rpkt = prepare_dhcp_ack(net_pkt_iface(pkt), msg.xid, include_dns);
 		}
@@ -1093,6 +1169,27 @@ ZTEST(dhcpv4_tests, test_dhcp)
 			      EVT_DNS_SERVER3_DEL,
 			      "Missing DHCP stop or deleted address");
 	}
+}
+
+ZTEST(dhcpv4_tests, test_overloaded_reply_options)
+{
+	const struct net_in_addr expected_gw = {{{10, 237, 72, 1}}};
+	struct net_if *iface;
+	uint32_t evt;
+
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+	reply_mode = DHCP_REPLY_OVERLOADED;
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Missing DHCP bound");
+	evt = k_event_wait_all(&events, EVT_DHCP_OFFER | EVT_DHCP_ACK, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_OFFER | EVT_DHCP_ACK, "Missing offer or ACK");
+	zassert_equal(net_if_ipv4_get_gw(iface).s_addr, expected_gw.s_addr,
+		      "Gateway from overloaded file field not applied");
+
+	net_dhcpv4_stop(iface);
 }
 
 ZTEST(dhcpv4_tests, test_init_reboot_hint)

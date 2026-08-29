@@ -1009,32 +1009,28 @@ static int dhcpv4_parse_option_vendor(struct net_pkt *pkt, struct net_if *iface,
 /* Parse DHCPv4 options and retrieve relevant information
  * as per RFC 2132.
  */
-static bool dhcpv4_parse_options(struct net_pkt *pkt,
-				 struct net_if *iface,
-				 enum net_dhcpv4_msg_type *msg_type)
+static bool dhcpv4_parse_options_field(struct net_pkt *pkt, struct net_if *iface,
+				       enum net_dhcpv4_msg_type *msg_type, size_t remaining,
+				       uint8_t *overload, bool *router_present,
+				       bool *renewal_present, bool *rebinding_present)
 {
 #if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS)
 	struct net_dhcpv4_option_callback *cb, *tmp;
 	struct net_pkt_cursor backup;
 #endif
-	uint8_t cookie[4];
 	uint8_t length;
 	uint8_t type;
-	bool router_present = false;
-	bool renewal_present = false;
-	bool rebinding_present = false;
 	bool unhandled = true;
 
-	if (net_pkt_read(pkt, cookie, sizeof(cookie)) ||
-	    memcmp(magic_cookie, cookie, sizeof(magic_cookie))) {
-		NET_DBG("Incorrect magic cookie");
-		return false;
-	}
+	while (remaining > 0U) {
+		if (net_pkt_read_u8(pkt, &type)) {
+			return false;
+		}
+		remaining--;
 
-	while (!net_pkt_read_u8(pkt, &type)) {
 		if (type == DHCPV4_OPTIONS_END) {
 			NET_DBG("options_end");
-			goto end;
+			return true;
 		}
 
 		if (type == DHCPV4_OPTIONS_PAD) {
@@ -1044,8 +1040,13 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			continue;
 		}
 
-		if (net_pkt_read_u8(pkt, &length)) {
+		if (remaining == 0U || net_pkt_read_u8(pkt, &length)) {
 			NET_ERR("option parsing, bad length");
+			return false;
+		}
+		remaining--;
+		if (length > remaining) {
+			NET_ERR("option parsing, malformed option");
 			return false;
 		}
 
@@ -1115,7 +1116,7 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			NET_DBG("options_router: %s",
 				net_sprint_ipv4_addr(&router));
 			net_if_ipv4_set_gw(iface, &router);
-			router_present = true;
+			*router_present = true;
 
 			break;
 		}
@@ -1361,6 +1362,20 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 				iface->config.dhcpv4.lease_time);
 
 			break;
+		case DHCPV4_OPTIONS_OPTION_OVERLOAD: {
+			uint8_t value;
+
+			if (overload == NULL || length != 1U || net_pkt_read_u8(pkt, &value) ||
+			    value == 0U ||
+			    (value & ~(DHCPV4_OPTIONS_OVERLOAD_FILE |
+				       DHCPV4_OPTIONS_OVERLOAD_SNAME)) != 0U) {
+				NET_ERR("options_overload, invalid value");
+				return false;
+			}
+
+			*overload = value;
+			break;
+		}
 		case DHCPV4_OPTIONS_RENEWAL:
 			if (length != 4U) {
 				NET_DBG("options_renewal, bad length");
@@ -1377,7 +1392,7 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			NET_DBG("options_renewal: %u",
 				iface->config.dhcpv4.renewal_time);
 
-			renewal_present = true;
+			*renewal_present = true;
 
 			break;
 		case DHCPV4_OPTIONS_REBINDING:
@@ -1397,7 +1412,7 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			NET_DBG("options_rebinding: %u",
 				iface->config.dhcpv4.rebinding_time);
 
-			rebinding_present = true;
+			*rebinding_present = true;
 
 			break;
 		case DHCPV4_OPTIONS_SERVER_ID:
@@ -1448,12 +1463,55 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			}
 			break;
 		}
+
+		remaining -= length;
 	}
 
 	/* Invalid case: Options without DHCPV4_OPTIONS_END. */
 	return false;
+}
 
-end:
+static bool dhcpv4_parse_options(struct net_pkt *pkt, struct net_if *iface,
+				 enum net_dhcpv4_msg_type *msg_type,
+				 struct net_pkt_cursor *sname_cursor,
+				 struct net_pkt_cursor *file_cursor)
+{
+	uint8_t cookie[sizeof(magic_cookie)];
+	uint8_t overload = 0U;
+	bool router_present = false;
+	bool renewal_present = false;
+	bool rebinding_present = false;
+
+	if (net_pkt_read(pkt, cookie, sizeof(cookie)) ||
+	    memcmp(magic_cookie, cookie, sizeof(magic_cookie))) {
+		NET_DBG("Incorrect magic cookie");
+		return false;
+	}
+
+	if (!dhcpv4_parse_options_field(pkt, iface, msg_type, net_pkt_remaining_data(pkt),
+					&overload, &router_present, &renewal_present,
+					&rebinding_present)) {
+		return false;
+	}
+
+	if ((overload & DHCPV4_OPTIONS_OVERLOAD_FILE) != 0U) {
+		net_pkt_cursor_restore(pkt, file_cursor);
+		if (!dhcpv4_parse_options_field(pkt, iface, msg_type, SIZE_OF_FILE, NULL,
+						&router_present, &renewal_present,
+						&rebinding_present)) {
+			return false;
+		}
+	}
+
+	if ((overload & DHCPV4_OPTIONS_OVERLOAD_SNAME) != 0U) {
+		net_pkt_cursor_restore(pkt, sname_cursor);
+		if (!dhcpv4_parse_options_field(pkt, iface, msg_type, SIZE_OF_SNAME, NULL,
+						&router_present, &renewal_present,
+						&rebinding_present)) {
+			return false;
+		}
+	}
+
 	if (*msg_type == NET_DHCPV4_MSG_TYPE_OFFER && !router_present) {
 		struct net_in_addr any = NET_INADDR_ANY_INIT;
 
@@ -1612,6 +1670,8 @@ static enum net_verdict net_dhcpv4_input(struct net_conn *conn,
 	NET_PKT_DATA_ACCESS_DEFINE(dhcp_access, struct dhcp_msg);
 	enum net_verdict verdict = NET_DROP;
 	enum net_dhcpv4_msg_type msg_type = 0;
+	struct net_pkt_cursor file_cursor;
+	struct net_pkt_cursor sname_cursor;
 	struct dhcp_msg *msg;
 	struct net_if *iface;
 	int ret;
@@ -1686,13 +1746,18 @@ static enum net_verdict net_dhcpv4_input(struct net_conn *conn,
 		goto drop;
 	}
 
-	/* SNAME, FILE are not used at the moment, skip it */
-	if (net_pkt_skip(pkt, SIZE_OF_SNAME + SIZE_OF_FILE)) {
+	net_pkt_cursor_backup(pkt, &sname_cursor);
+	if (net_pkt_skip(pkt, SIZE_OF_SNAME)) {
 		NET_DBG("short packet while skipping sname");
 		goto drop;
 	}
+	net_pkt_cursor_backup(pkt, &file_cursor);
+	if (net_pkt_skip(pkt, SIZE_OF_FILE)) {
+		NET_DBG("short packet while skipping file");
+		goto drop;
+	}
 
-	if (!dhcpv4_parse_options(pkt, iface, &msg_type)) {
+	if (!dhcpv4_parse_options(pkt, iface, &msg_type, &sname_cursor, &file_cursor)) {
 		goto drop;
 	}
 
