@@ -327,6 +327,7 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 
 struct dhcp_client_msg {
 	uint32_t xid;
+	uint16_t secs;
 	uint8_t type;
 	bool has_requested_ip;
 	bool has_server_id;
@@ -342,6 +343,8 @@ static uint32_t request_xid;
 static int discovers_to_drop;
 static int discovers_seen;
 static uint32_t discover_xids[4];
+static uint16_t discover_secs[4];
+static bool request_secs_mismatch;
 static bool strict_dhcp_server;
 static bool discover_req_included_dns;
 static bool init_reboot_req_included_dns;
@@ -382,6 +385,8 @@ static void dhcp_test_reset_iface(struct net_if *iface)
 	discovers_to_drop = 0;
 	discovers_seen = 0;
 	memset(discover_xids, 0, sizeof(discover_xids));
+	memset(discover_secs, 0, sizeof(discover_secs));
+	request_secs_mismatch = false;
 	strict_dhcp_server = false;
 	discover_req_included_dns = false;
 	init_reboot_req_included_dns = false;
@@ -597,8 +602,11 @@ static int parse_dhcp_client_message(struct net_pkt *pkt, struct dhcp_client_msg
 	if (net_pkt_read_be32(pkt, &msg->xid)) {
 		return -EINVAL;
 	}
+	if (net_pkt_read_be16(pkt, &msg->secs)) {
+		return -EINVAL;
+	}
 
-	if (net_pkt_skip(pkt, 36 + 64 + 128 + 4)) {
+	if (net_pkt_skip(pkt, 34 + 64 + 128 + 4)) {
 		return -EINVAL;
 	}
 
@@ -698,6 +706,7 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 
 		if (discovers_seen < ARRAY_SIZE(discover_xids)) {
 			discover_xids[discovers_seen] = msg.xid;
+			discover_secs[discovers_seen] = msg.secs;
 		}
 		discovers_seen++;
 
@@ -720,6 +729,10 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 
 		dns_requested = dhcp_msg_req_list_contains(&msg, OPTION_DNS_SERVER);
 		is_init_reboot = msg.has_requested_ip && !msg.has_server_id;
+		if (!is_init_reboot && msg.has_server_id && discovers_seen > 0 &&
+		    msg.secs != discover_secs[MIN(discovers_seen, ARRAY_SIZE(discover_secs)) - 1]) {
+			request_secs_mismatch = true;
+		}
 		init_reboot_request_seen |= is_init_reboot;
 		if (is_init_reboot) {
 			init_reboot_request_count++;
@@ -1070,6 +1083,8 @@ ZTEST(dhcpv4_tests, test_dhcp)
 				      "Offer/Request xid mismatch, "
 				      "Offer 0x%08x, Request 0x%08x",
 				      offer_xid, request_xid);
+			zassert_false(request_secs_mismatch,
+				      "Request did not retain its discover's secs value");
 		} else {
 			/* An init-reboot was done */
 			evt = k_event_wait(&events, EVT_DHCP_OFFER | EVT_DHCP_ACK, false,
@@ -1311,12 +1326,16 @@ ZTEST(dhcpv4_tests, test_discover_retransmission_keeps_xid)
 		     discovers_seen);
 
 	zassert_not_equal(discover_xids[0], 0U, "Transaction identifier is zero");
+	zassert_equal(discover_secs[0], 0U, "Initial discover secs is not zero");
 
 	for (int i = 1; i < MIN(discovers_seen, ARRAY_SIZE(discover_xids)); i++) {
 		zassert_equal(discover_xids[i], discover_xids[0],
 			      "Discover %d carries xid 0x%08x, the first carried "
 			      "0x%08x; a retransmission is the same transaction",
 			      i, discover_xids[i], discover_xids[0]);
+		zassert_true(discover_secs[i] > discover_secs[i - 1],
+			     "Discover %d secs did not advance (%u after %u)", i,
+			     discover_secs[i], discover_secs[i - 1]);
 	}
 }
 
