@@ -1275,7 +1275,9 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 	uint32_t probe_delay = sys_rand32_get() % 250;
 	int ret;
 
-	if ((mgmt_event != NET_EVENT_IPV4_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV4_ADDR_DEL)) {
+	if ((mgmt_event != NET_EVENT_IPV4_ADDR_ADD) &&
+	    (mgmt_event != NET_EVENT_IPV4_ADDR_DEL) &&
+	    (mgmt_event != NET_EVENT_IPV4_ACD_SUCCEED)) {
 		return;
 	}
 
@@ -1295,6 +1297,10 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 				return;
 			}
 
+			if (IS_ENABLED(CONFIG_NET_IPV4_ACD)) {
+				return;
+			}
+
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v4_ctx[i].probe_timer,
 							  K_MSEC(probe_delay));
@@ -1303,6 +1309,18 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 			} else {
 				NET_DBG("%s %s probing scheduled for iface %d ctx %p",
 					"IPv4", "add", net_if_get_by_iface(iface),
+					&v4_ctx[i]);
+			}
+		} else if (mgmt_event == NET_EVENT_IPV4_ACD_SUCCEED) {
+
+			ret = k_work_reschedule_for_queue(&mdns_work_q,
+							  &v4_ctx[i].probe_timer,
+							  K_MSEC(probe_delay));
+			if (ret < 0) {
+				NET_DBG("Cannot schedule %s probe work (%d)", "IPv4", ret);
+			} else {
+				NET_DBG("%s %s probing scheduled for iface %d ctx %p",
+					"IPv4", "ACD", net_if_get_by_iface(iface),
 					&v4_ctx[i]);
 			}
 		} else {
@@ -1337,7 +1355,8 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 }
 
 NET_MGMT_REGISTER_EVENT_HANDLER(mdns_addr_ipv4_events,
-				NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL,
+				NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL |
+					NET_EVENT_IPV4_ACD_SUCCEED,
 				mdns_addr_ipv4_event_handler, NULL);
 #endif /* defined(CONFIG_NET_IPV4) */
 
