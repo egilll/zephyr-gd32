@@ -251,10 +251,9 @@ NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(v6_svc, dns_dispatcher_svc_handler,
 
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 static void cancel_probes(struct mdns_responder_context *ctx);
-#if defined(CONFIG_NET_DHCPV4)
 static void announce_start(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(announce_timer, announce_start);
-#endif
+static void start_announce(struct net_if *iface);
 static struct k_work_q mdns_work_q;
 static K_KERNEL_STACK_DEFINE(mdns_work_q_stack, CONFIG_MDNS_WORKQ_STACK_SIZE);
 static void do_init_listener(struct k_work *work);
@@ -342,11 +341,8 @@ static void mdns_iface_event_handler(uint64_t mgmt_event, struct net_if *iface, 
 		return;
 	}
 
-	if (mgmt_event == NET_EVENT_IF_UP && init_listener_done) {
-		do_announce = true;
-		announce_count = 0;
-
-		mark_needs_announce(iface, true);
+	if (mgmt_event == NET_EVENT_IF_UP) {
+		start_announce(iface);
 	}
 }
 
@@ -1235,7 +1231,6 @@ static void probing(struct k_work *work)
 	}
 }
 
-#if defined(CONFIG_NET_DHCPV4)
 /* This is arbitrary delay to let things cool down a bit before announcing
  * the address.
  */
@@ -1266,7 +1261,6 @@ static void start_announce(struct net_if *iface)
 		NET_DBG("Cannot schedule %s announce work (%d)", "mDNS", ret);
 	}
 }
-#endif /* CONFIG_NET_DHCPV4 */
 
 #if defined(CONFIG_NET_IPV4)
 static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *iface, void *info,
@@ -1301,6 +1295,11 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 				return;
 			}
 
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v4_ctx[i].probe_timer,
 							  K_MSEC(probe_delay));
@@ -1312,6 +1311,10 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					&v4_ctx[i]);
 			}
 		} else if (mgmt_event == NET_EVENT_IPV4_ACD_SUCCEED) {
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v4_ctx[i].probe_timer,
@@ -1384,6 +1387,11 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 			ret = add_address(iface, NET_AF_INET6, info, info_length);
 			if (ret < 0 && ret != -EALREADY) {
 				NET_DBG("Cannot %s %s address (%d)", "add", "IPv6", ret);
+				return;
+			}
+
+			if (init_listener_done) {
+				start_announce(iface);
 				return;
 			}
 
@@ -2488,8 +2496,8 @@ static void announce_start(struct k_work *work)
 	do_announce = true;
 	announce_count++;
 
-	/* Do not re-schedule if we were triggered by the DHCP BOUND event */
-	if (COND_CODE_1(CONFIG_NET_DHCPV4, (&announce_timer != dwork), (true))) {
+	/* Address-change announces need only one packet. */
+	if (&announce_timer != dwork) {
 		ret = k_work_reschedule_for_queue(&mdns_work_q, dwork, K_SECONDS(ANNOUNCE_TIMEOUT));
 		if (ret < 0) {
 			NET_DBG("Cannot schedule %s work (%d)", "announce", ret);
