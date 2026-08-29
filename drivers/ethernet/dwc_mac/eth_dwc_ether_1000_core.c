@@ -518,6 +518,11 @@ static void dwmac_iface_init(struct net_if *iface)
 	k_sem_init(&p->free_rx_descs, NB_RX_DESCS - 1, NB_RX_DESCS - 1);
 	k_fifo_init(&p->tx_queue);
 
+	for (unsigned int i = 0; i < NB_RX_DESCS - 1; i++) {
+		(void)k_sem_take(&p->free_rx_descs, K_NO_WAIT);
+		dwmac_rx_refill(dev);
+	}
+
 	net_if_set_link_addr(iface, p->mac_addr, sizeof(p->mac_addr), NET_LINK_ETHERNET);
 	dwmac_set_mac_addr(dev, p->mac_addr);
 
