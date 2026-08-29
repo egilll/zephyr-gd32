@@ -315,6 +315,7 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define OPTION_DNS_SERVER	6
 #define OPTION_SUBNET_MASK	1
 #define OPTION_ROUTER		3
+#define OPTION_NTP_SERVER	42
 #define OPTION_REQ_IPADDR	50
 #define OPTION_LEASE_TIME	51
 #define OPTION_SERVER_ID	54
@@ -582,6 +583,7 @@ static struct net_pkt *prepare_dhcp_empty_router_reply(struct net_if *iface, uin
 	    !write_empty_address_option(pkt, OPTION_ROUTER, NULL, 0) ||
 	    !write_empty_address_option(pkt, OPTION_DNS_SERVER, dns_servers,
 					sizeof(dns_servers)) ||
+	    !write_empty_address_option(pkt, OPTION_NTP_SERVER, NULL, 0) ||
 	    net_pkt_write_u8(pkt, 255)) {
 		net_pkt_unref(pkt);
 		return NULL;
@@ -1187,6 +1189,30 @@ ZTEST(dhcpv4_tests, test_empty_router_option)
 		      "Empty router option installed a gateway");
 
 	net_dhcpv4_stop(iface);
+}
+
+ZTEST(dhcpv4_tests, test_empty_ntp_server_option)
+{
+#ifdef CONFIG_NET_DHCPV4_OPTION_NTP_SERVER
+	const struct net_in_addr previous_ntp = {{{192, 0, 2, 123}}};
+	struct net_if *iface;
+	uint32_t evt;
+
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+	iface->config.dhcpv4.ntp_addr = previous_ntp;
+	reply_mode = DHCP_REPLY_EMPTY_ROUTER;
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Empty NTP option discarded the lease");
+	zassert_equal(iface->config.dhcpv4.ntp_addr.s_addr, previous_ntp.s_addr,
+		      "Empty NTP option replaced the saved server");
+
+	net_dhcpv4_stop(iface);
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST(dhcpv4_tests, test_init_reboot_hint)

@@ -22,3 +22,7 @@ tests:
   net.dhcpv4_client.ignored_options:
     extra_configs:
       - CONFIG_NET_DHCPV4_OPTION_PRINT_IGNORED=y
+  net.dhcpv4_client.ntp:
+    extra_configs:
+      - CONFIG_NET_DHCPV4_OPTION_NTP_SERVER=y
+      - CONFIG_SNTP=y
