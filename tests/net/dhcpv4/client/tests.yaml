@@ -22,3 +22,7 @@ tests:
   net.dhcpv4_client.ignored_options:
     extra_configs:
       - CONFIG_NET_DHCPV4_OPTION_PRINT_IGNORED=y
+  net.dhcpv4_client.client_identifier:
+    extra_configs:
+      - CONFIG_NET_DHCPV4_CLIENT_IDENTIFIER=y
+      - CONFIG_NET_L2_ETHERNET=y

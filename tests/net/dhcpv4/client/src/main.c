@@ -316,6 +316,7 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define OPTION_REQ_IPADDR	50
 #define OPTION_SERVER_ID	54
 #define OPTION_REQ_LIST		55
+#define OPTION_CLIENT_ID	61
 #define OPTION_DOMAIN		15
 #define OPTION_POP3		70
 #define OPTION_VENDOR_STRING	1
@@ -332,6 +333,8 @@ struct dhcp_client_msg {
 	bool has_server_id;
 	uint8_t req_options[MAX_REQ_OPTIONS];
 	uint8_t req_options_cnt;
+	uint8_t client_id[NET_LINK_ADDR_MAX_LENGTH + 1];
+	uint8_t client_id_len;
 };
 
 static uint32_t offer_xid;
@@ -349,6 +352,8 @@ static bool init_reboot_request_seen;
 static bool reject_init_reboot;
 static bool drop_init_reboot;
 static uint8_t init_reboot_request_count;
+static bool discover_client_id_valid;
+static bool request_client_id_valid;
 
 #define EVT_ADDR_ADD        BIT(0)
 #define EVT_ADDR_DEL        BIT(1)
@@ -389,6 +394,17 @@ static void dhcp_test_reset_iface(struct net_if *iface)
 	reject_init_reboot = false;
 	drop_init_reboot = false;
 	init_reboot_request_count = 0U;
+	discover_client_id_valid = false;
+	request_client_id_valid = false;
+}
+
+static bool dhcp_client_id_is_valid(struct net_if *iface, const struct dhcp_client_msg *msg)
+{
+	const struct net_linkaddr *lladdr = net_if_get_link_addr(iface);
+
+	return msg->client_id_len == lladdr->len + 1U &&
+	       msg->client_id[0] == 1U &&
+	       memcmp(&msg->client_id[1], lladdr->addr, lladdr->len) == 0;
 }
 
 static void dhcpv4_tests_before(void *fixture)
@@ -655,6 +671,15 @@ static int parse_dhcp_client_message(struct net_pkt *pkt, struct dhcp_client_msg
 			continue;
 		}
 
+		if (opt == OPTION_CLIENT_ID) {
+			msg->client_id_len = MIN(len, sizeof(msg->client_id));
+			if (net_pkt_read(pkt, msg->client_id, msg->client_id_len) ||
+			    net_pkt_skip(pkt, len - msg->client_id_len)) {
+				return -EINVAL;
+			}
+			continue;
+		}
+
 		if (opt == OPTION_REQ_IPADDR && len == 4U) {
 			msg->has_requested_ip = true;
 		} else if (opt == OPTION_SERVER_ID && len == 4U) {
@@ -691,6 +716,7 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 	}
 
 	if (msg.type == DISCOVER) {
+		discover_client_id_valid = dhcp_client_id_is_valid(net_pkt_iface(pkt), &msg);
 		if (strict_dhcp_server) {
 			discover_req_included_dns =
 				dhcp_msg_req_list_contains(&msg, OPTION_DNS_SERVER);
@@ -717,6 +743,8 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 	} else if (msg.type == REQUEST) {
 		bool include_dns;
 		bool nak_reply;
+
+		request_client_id_valid = dhcp_client_id_is_valid(net_pkt_iface(pkt), &msg);
 
 		dns_requested = dhcp_msg_req_list_contains(&msg, OPTION_DNS_SERVER);
 		is_init_reboot = msg.has_requested_ip && !msg.has_server_id;
@@ -1093,6 +1121,24 @@ ZTEST(dhcpv4_tests, test_dhcp)
 			      EVT_DNS_SERVER3_DEL,
 			      "Missing DHCP stop or deleted address");
 	}
+}
+
+ZTEST(dhcpv4_tests, test_client_identifier)
+{
+	struct net_if *iface;
+	uint32_t evt;
+
+	Z_TEST_SKIP_IFNDEF(CONFIG_NET_DHCPV4_CLIENT_IDENTIFIER);
+	iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	zassert_not_null(iface, "Interface not available");
+
+	net_dhcpv4_start(iface);
+	evt = k_event_wait(&events, EVT_DHCP_BOUND, false, WAIT_TIME);
+	zassert_equal(evt, EVT_DHCP_BOUND, "Missing DHCP bound");
+	zassert_true(discover_client_id_valid, "DISCOVER client identifier is invalid");
+	zassert_true(request_client_id_valid, "REQUEST client identifier is invalid");
+
+	net_dhcpv4_stop(iface);
 }
 
 ZTEST(dhcpv4_tests, test_init_reboot_hint)
