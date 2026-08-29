@@ -203,6 +203,34 @@ static bool dhcpv4_add_vendor_class_id(struct net_pkt *pkt,
 }
 #endif
 
+static size_t dhcpv4_client_id_size(struct net_if *iface)
+{
+	const struct net_linkaddr *lladdr = net_if_get_link_addr(iface);
+
+	if (!IS_ENABLED(CONFIG_NET_DHCPV4_CLIENT_IDENTIFIER) ||
+	    lladdr->type != NET_LINK_ETHERNET || lladdr->len == 0U) {
+		return 0;
+	}
+
+	return sizeof(uint8_t) + lladdr->len;
+}
+
+static bool dhcpv4_add_client_id(struct net_pkt *pkt, struct net_if *iface)
+{
+	const struct net_linkaddr *lladdr = net_if_get_link_addr(iface);
+	const uint8_t hardware_type = HARDWARE_ETHERNET_TYPE;
+	uint8_t length = dhcpv4_client_id_size(iface);
+
+	if (length == 0U) {
+		return true;
+	}
+
+	return net_pkt_write_u8(pkt, DHCPV4_OPTIONS_CLIENT_ID) == 0 &&
+	       net_pkt_write_u8(pkt, length) == 0 &&
+	       net_pkt_write_u8(pkt, hardware_type) == 0 &&
+	       net_pkt_write(pkt, lladdr->addr, lladdr->len) == 0;
+}
+
 /* Add DHCPv4 Options end, rest of the message can be padded with zeros */
 static inline bool dhcpv4_add_end(struct net_pkt *pkt)
 {
@@ -242,6 +270,7 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 {
 	NET_PKT_DATA_ACCESS_DEFINE(dhcp_access, struct dhcp_msg);
 	const struct net_in_addr *addr;
+	const size_t client_id_size = dhcpv4_client_id_size(iface);
 	size_t size = DHCPV4_MESSAGE_SIZE;
 	struct net_pkt *pkt;
 	struct dhcp_msg *msg;
@@ -266,6 +295,10 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 
 	if (requested_ip) {
 		size +=  DHCPV4_OLV_MSG_REQ_IPADDR;
+	}
+
+	if (client_id_size > 0U) {
+		size += DHCPV4_OLV_HEADER_SIZE + client_id_size;
 	}
 
 	if (type == NET_DHCPV4_MSG_TYPE_DISCOVER ||
@@ -331,7 +364,8 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	if (!dhcpv4_add_sname(pkt) ||
 	    !dhcpv4_add_file(pkt) ||
 	    !dhcpv4_add_cookie(pkt) ||
-	    !dhcpv4_add_msg_type(pkt, type)) {
+	    !dhcpv4_add_msg_type(pkt, type) ||
+	    !dhcpv4_add_client_id(pkt, iface)) {
 		goto fail;
 	}
 
