@@ -310,6 +310,16 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 	msg->htype = HARDWARE_ETHERNET_TYPE;
 	msg->hlen  = net_if_get_link_addr(iface)->len;
 	msg->xid   = net_htonl(iface->config.dhcpv4.xid);
+	if (type == NET_DHCPV4_MSG_TYPE_DISCOVER ||
+	    (type == NET_DHCPV4_MSG_TYPE_REQUEST &&
+	     iface->config.dhcpv4.state != NET_DHCPV4_REQUESTING)) {
+		int64_t elapsed = k_uptime_get() - iface->config.dhcpv4.acquisition_start;
+		uint64_t elapsed_seconds = elapsed > 0 ? elapsed / MSEC_PER_SEC : 0;
+
+		iface->config.dhcpv4.secs =
+			(uint16_t)MIN(elapsed_seconds, (uint64_t)UINT16_MAX);
+	}
+	msg->secs = net_htons(iface->config.dhcpv4.secs);
 	msg->flags = IS_ENABLED(CONFIG_NET_DHCPV4_ACCEPT_UNICAST) ?
 		     net_htons(DHCPV4_MSG_UNICAST) : net_htons(DHCPV4_MSG_BROADCAST);
 
@@ -710,6 +720,8 @@ fail:
 static void dhcpv4_enter_selecting(struct net_if *iface)
 {
 	iface->config.dhcpv4.attempts = 0U;
+	iface->config.dhcpv4.acquisition_start = k_uptime_get();
+	iface->config.dhcpv4.secs = 0U;
 
 	/* A discover starts a new exchange, so it gets a new identifier.
 	 * Retransmissions of it do not: they are the same exchange.
@@ -786,6 +798,8 @@ static void dhcpv4_enter_renewing(struct net_if *iface)
 {
 	iface->config.dhcpv4.state = NET_DHCPV4_RENEWING;
 	iface->config.dhcpv4.attempts = 0U;
+	iface->config.dhcpv4.acquisition_start = k_uptime_get();
+	iface->config.dhcpv4.secs = 0U;
 
 	/* Renewing is a new exchange with the server, RFC 2131 4.4.5. */
 	dhcpv4_generate_xid(iface);
@@ -1902,6 +1916,8 @@ static void dhcpv4_start_internal(struct net_if *iface, bool first_start)
 		 * through to DISCOVER.
 		 */
 		iface->config.dhcpv4.attempts = 0U;
+		iface->config.dhcpv4.acquisition_start = k_uptime_get();
+		iface->config.dhcpv4.secs = 0U;
 
 		/* Random delay before sending the initial discover message,
 		 * drawn separately from the transaction identifier so that
