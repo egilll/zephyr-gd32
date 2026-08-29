@@ -403,7 +403,7 @@ int fs_opendir(struct fs_dir_t *zdp, const char *abs_path)
 	if (rc < 0) {
 		zdp->mp = NULL;
 		zdp->dirp = NULL;
-		LOG_ERR("directory open error (%d)", rc);
+		LOG_ERR("directory open error (%d, %s)", rc, abs_path);
 	}
 
 	return rc;
