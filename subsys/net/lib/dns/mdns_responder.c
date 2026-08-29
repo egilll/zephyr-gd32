@@ -270,6 +270,7 @@ struct mdns_monitor_iface_addr {
 	struct net_addr addr;
 	bool in_use : 1;
 	bool needs_announce : 1;
+	bool pending_goodbye : 1;
 };
 
 static struct mdns_monitor_iface_addr mon_if[
@@ -995,12 +996,14 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
 			mon_if[j].in_use = true;
+			mon_if[j].pending_goodbye = false;
 			return -EALREADY;
 		}
 	}
 
 	if (first_free >= 0) {
 		mon_if[first_free].in_use = true;
+		mon_if[first_free].pending_goodbye = false;
 		mon_if[first_free].iface = iface;
 		mon_if[first_free].addr.family = family;
 
@@ -1031,6 +1034,9 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 	} else {
 		expected_len = sizeof(struct net_in6_addr);
 	}
+	if (addrlen != expected_len) {
+		return -EINVAL;
+	}
 
 	ARRAY_FOR_EACH(mon_if, j) {
 		if (!mon_if[j].in_use) {
@@ -1046,7 +1052,8 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 		}
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
-			mon_if[j].in_use = false;
+			mon_if[j].pending_goodbye = true;
+			mon_if[j].needs_announce = true;
 			return 0;
 		}
 	}
@@ -1340,6 +1347,10 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 			if (!net_if_is_up(iface)) {
 				continue;
 			}
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
 							  &v4_ctx[i].probe_timer,
@@ -1418,6 +1429,10 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 
 			if (!net_if_is_up(iface)) {
 				continue;
+			}
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
 			}
 
 			ret = k_work_reschedule_for_queue(&mdns_work_q,
@@ -2270,7 +2285,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 
 		net_buf_add_be16(answer, type);
 		net_buf_add_be16(answer, DNS_CLASS_IN);
-		net_buf_add_be32(answer, ttl);
+		net_buf_add_be32(answer, addr_list[i].pending_goodbye ? 0 : ttl);
 
 		if (type == DNS_RR_TYPE_A) {
 			net_buf_add_be16(answer, sizeof(struct net_in_addr));
@@ -2310,6 +2325,18 @@ static bool check_if_needs_announce(struct net_if *iface)
 	}
 
 	return false;
+}
+
+static void clear_pending_goodbyes(struct net_if *iface, net_sa_family_t family)
+{
+	ARRAY_FOR_EACH(mon_if, i) {
+		if (mon_if[i].in_use && mon_if[i].iface == iface &&
+		    mon_if[i].addr.family == family && mon_if[i].pending_goodbye) {
+			mon_if[i].in_use = false;
+			mon_if[i].pending_goodbye = false;
+			mon_if[i].needs_announce = false;
+		}
+	}
 }
 
 #if defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
@@ -2417,6 +2444,7 @@ static int send_announce(const char *name)
 			NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 			continue;
 		}
+		clear_pending_goodbyes(v4_ctx[i].iface, NET_AF_INET);
 
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v4_ctx[i].iface));
@@ -2465,6 +2493,7 @@ static int send_announce(const char *name)
 			NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 			continue;
 		}
+		clear_pending_goodbyes(v6_ctx[i].iface, NET_AF_INET6);
 
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v6_ctx[i].iface));
