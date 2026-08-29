@@ -203,6 +203,17 @@ static bool dhcpv4_add_vendor_class_id(struct net_pkt *pkt,
 }
 #endif
 
+static bool dhcpv4_add_max_message_size(struct net_pkt *pkt, struct net_if *iface)
+{
+	uint16_t mtu = net_if_get_mtu(iface);
+	uint16_t max_size = MAX(mtu > NET_IPV4UDPH_LEN ? mtu - NET_IPV4UDPH_LEN : 0U, 576U);
+
+	max_size = net_htons(max_size);
+
+	return dhcpv4_add_option_length_value(pkt, DHCPV4_OPTIONS_MAX_MSG_SIZE,
+					      sizeof(max_size), &max_size);
+}
+
 /* Add DHCPv4 Options end, rest of the message can be padded with zeros */
 static inline bool dhcpv4_add_end(struct net_pkt *pkt)
 {
@@ -270,7 +281,8 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 
 	if (type == NET_DHCPV4_MSG_TYPE_DISCOVER ||
 	    type == NET_DHCPV4_MSG_TYPE_REQUEST) {
-		size +=  DHCPV4_OLV_MSG_REQ_LIST + ARRAY_SIZE(min_req_options);
+		size += DHCPV4_OLV_MSG_REQ_LIST + ARRAY_SIZE(min_req_options) +
+			DHCPV4_OLV_MSG_MAX_SIZE;
 #if defined(CONFIG_NET_DHCPV4_OPTION_CALLBACKS)
 		size += unique_types_in_callbacks;
 #endif
@@ -344,7 +356,7 @@ static struct net_pkt *dhcpv4_create_message(struct net_if *iface, uint8_t type,
 
 	if ((type == NET_DHCPV4_MSG_TYPE_DISCOVER ||
 	     type == NET_DHCPV4_MSG_TYPE_REQUEST) &&
-	    !dhcpv4_add_req_options(pkt)) {
+	    (!dhcpv4_add_req_options(pkt) || !dhcpv4_add_max_message_size(pkt, iface))) {
 		goto fail;
 	}
 
