@@ -318,6 +318,7 @@ static const struct net_in_addr client_addr = { { { 255, 255, 255, 255 } } };
 #define OPTION_REQ_LIST		55
 #define OPTION_DOMAIN		15
 #define OPTION_POP3		70
+#define OPTION_MAX_MSG_SIZE	57
 #define OPTION_VENDOR_STRING	1
 #define OPTION_VENDOR_BYTE	2
 #define OPTION_VENDOR_EMPTY	3
@@ -330,6 +331,8 @@ struct dhcp_client_msg {
 	uint8_t type;
 	bool has_requested_ip;
 	bool has_server_id;
+	bool has_max_msg_size;
+	uint16_t max_msg_size;
 	uint8_t req_options[MAX_REQ_OPTIONS];
 	uint8_t req_options_cnt;
 };
@@ -342,6 +345,7 @@ static uint32_t request_xid;
 static int discovers_to_drop;
 static int discovers_seen;
 static uint32_t discover_xids[4];
+static bool max_msg_size_invalid;
 static bool strict_dhcp_server;
 static bool discover_req_included_dns;
 static bool init_reboot_req_included_dns;
@@ -382,6 +386,7 @@ static void dhcp_test_reset_iface(struct net_if *iface)
 	discovers_to_drop = 0;
 	discovers_seen = 0;
 	memset(discover_xids, 0, sizeof(discover_xids));
+	max_msg_size_invalid = false;
 	strict_dhcp_server = false;
 	discover_req_included_dns = false;
 	init_reboot_req_included_dns = false;
@@ -655,6 +660,16 @@ static int parse_dhcp_client_message(struct net_pkt *pkt, struct dhcp_client_msg
 			continue;
 		}
 
+		if (opt == OPTION_MAX_MSG_SIZE) {
+			if (len != sizeof(msg->max_msg_size) ||
+			    net_pkt_read_be16(pkt, &msg->max_msg_size)) {
+				return -EINVAL;
+			}
+
+			msg->has_max_msg_size = true;
+			continue;
+		}
+
 		if (opt == OPTION_REQ_IPADDR && len == 4U) {
 			msg->has_requested_ip = true;
 		} else if (opt == OPTION_SERVER_ID && len == 4U) {
@@ -688,6 +703,16 @@ static int tester_send(const struct device *dev, struct net_pkt *pkt)
 
 	if (parse_dhcp_client_message(pkt, &msg) < 0) {
 		return -EINVAL;
+	}
+
+	if ((msg.type == DISCOVER || msg.type == REQUEST) &&
+	    (!msg.has_max_msg_size ||
+	     msg.max_msg_size !=
+		     MAX(net_if_get_mtu(net_pkt_iface(pkt)) > NET_IPV4UDPH_LEN
+			     ? net_if_get_mtu(net_pkt_iface(pkt)) - NET_IPV4UDPH_LEN
+			     : 0U,
+			 576U))) {
+		max_msg_size_invalid = true;
 	}
 
 	if (msg.type == DISCOVER) {
@@ -1070,6 +1095,8 @@ ZTEST(dhcpv4_tests, test_dhcp)
 				      "Offer/Request xid mismatch, "
 				      "Offer 0x%08x, Request 0x%08x",
 				      offer_xid, request_xid);
+			zassert_false(max_msg_size_invalid,
+				      "Discover or request had an invalid maximum message size");
 		} else {
 			/* An init-reboot was done */
 			evt = k_event_wait(&events, EVT_DHCP_OFFER | EVT_DHCP_ACK, false,
