@@ -1101,7 +1101,12 @@ static bool dhcpv4_parse_options(struct net_pkt *pkt,
 			 * of preference.  Hence we choose the first
 			 * and skip the rest.
 			 */
-			if (length % 4 != 0U || length < 4) {
+			if (length == 0U) {
+				NET_WARN("options_router, empty");
+				break;
+			}
+
+			if (length % 4 != 0U) {
 				NET_ERR("options_router, bad length");
 				return false;
 			}
