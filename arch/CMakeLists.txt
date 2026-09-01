@@ -5,6 +5,10 @@ add_compile_options($<TARGET_PROPERTY:compiler,warning_shadow_variables>)
 
 add_definitions(-D__ZEPHYR_SUPERVISOR__)
 
+if(NOT ARCH_DIR AND EXISTS "${ZEPHYR_BASE}/arch/${ARCH}")
+  set(ARCH_DIR "${ZEPHYR_BASE}/arch")
+endif()
+
 include_directories(
   ${ZEPHYR_BASE}/kernel/include
   ${ARCH_DIR}/${ARCH}/include
