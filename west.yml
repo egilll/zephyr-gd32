@@ -184,7 +184,7 @@ manifest:
         - hal
     - name: hal_gigadevice
       url: https://github.com/egilll/hal_gigadevice_tmp_fork.git
-      revision: 4d59e94dcb0df5cd1ecb134c088114813df83b0a
+      revision: 42fa8e01e4d3297032c82ad8633d25a0667dc2d8
       path: modules/hal/gigadevice
       groups:
         - hal
