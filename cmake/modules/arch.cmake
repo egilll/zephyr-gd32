@@ -49,3 +49,6 @@ if(NOT ARCH_DIR)
 please check your installation. ARCH roots searched: \n\
 ${ARCH_ROOT}")
 endif()
+
+set(ARCH "${ARCH}" CACHE INTERNAL "Resolved Zephyr architecture")
+set(ARCH_DIR "${ARCH_DIR}" CACHE INTERNAL "Resolved Zephyr architecture root")
