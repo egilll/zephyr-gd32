@@ -20,7 +20,6 @@
 #include <zephyr/net/ethernet.h>
 #include <zephyr/sys/crc.h>
 
-#include <gd32f4xx_rcu.h>
 #include <gd32f4xx_syscfg.h>
 
 #include "eth_dwmac_priv.h"
@@ -40,18 +39,14 @@ PINCTRL_DT_INST_DEFINE(0);
 
 static const struct pinctrl_dev_config *const eth0_pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(0);
 
-static uint16_t gd32_mac_clk = DT_INST_CLOCKS_CELL_BY_NAME(0, mac, id);
-static uint16_t gd32_tx_clk = DT_INST_CLOCKS_CELL_BY_NAME(0, tx, id);
-static uint16_t gd32_rx_clk = DT_INST_CLOCKS_CELL_BY_NAME(0, rx, id);
-static uint16_t gd32_ptp_clk = DT_INST_CLOCKS_CELL_BY_NAME(0, ptp, id);
+#define GD32_CLOCK_ID(node_id, prop, idx)   DT_PHA_BY_IDX(node_id, prop, idx, id),
+#define GD32_RESET_SPEC(node_id, prop, idx) RESET_DT_SPEC_GET_BY_IDX(node_id, idx),
+
+static uint16_t gd32_clocks[] = {DT_FOREACH_PROP_ELEM(DT_DRV_INST(0), clocks, GD32_CLOCK_ID)};
 static uint16_t gd32_syscfg_clk = GD32_CLOCK_SYSCFG;
 
 static const struct reset_dt_spec gd32_resets[] = {
-	RESET_DT_SPEC_INST_GET_BY_IDX(0, 0),
-	RESET_DT_SPEC_INST_GET_BY_IDX(0, 1),
-	RESET_DT_SPEC_INST_GET_BY_IDX(0, 2),
-	RESET_DT_SPEC_INST_GET_BY_IDX(0, 3),
-};
+	DT_FOREACH_PROP_ELEM(DT_DRV_INST(0), resets, GD32_RESET_SPEC)};
 
 #if defined(CONFIG_NOCACHE_MEMORY)
 #define __desc_mem __nocache_noinit __aligned(DESCRIPTOR_ALIGNMENT)
@@ -78,17 +73,6 @@ static void gd32_phy_interface_configure(void)
 	SYSCFG_CFG1 = cfg;
 }
 
-static void gd32_phy_clock_configure(void)
-{
-	if (DT_INST_PROP(0, gd_phy_clk_out)) {
-		uint32_t cfg = RCU_CFG0;
-
-		cfg &= ~(RCU_CFG0_CKOUT0SEL | RCU_CFG0_CKOUT0DIV);
-		cfg |= RCU_CKOUT0SRC_PLLP | RCU_CKOUT0_DIV4;
-		RCU_CFG0 = cfg;
-	}
-}
-
 int dwmac_bus_init(const struct device *dev)
 {
 	const struct dwmac_config *cfg = dev->config;
@@ -109,14 +93,13 @@ int dwmac_bus_init(const struct device *dev)
 	}
 
 	gd32_phy_interface_configure();
-	gd32_phy_clock_configure();
 
-	ret = gd32_clock_enable(cfg->clock, &gd32_mac_clk);
-	ret = ret < 0 ? ret : gd32_clock_enable(cfg->clock, &gd32_tx_clk);
-	ret = ret < 0 ? ret : gd32_clock_enable(cfg->clock, &gd32_rx_clk);
-	ret = ret < 0 ? ret : gd32_clock_enable(cfg->clock, &gd32_ptp_clk);
-	if (ret < 0) {
-		return ret;
+	for (size_t i = 0U; i < ARRAY_SIZE(gd32_clocks); i++) {
+		ret = gd32_clock_enable(cfg->clock, &gd32_clocks[i]);
+		if (ret < 0) {
+			LOG_ERR("Failed to enable Ethernet clock %zu (%d)", i, ret);
+			return ret;
+		}
 	}
 
 	for (size_t i = 0U; i < ARRAY_SIZE(gd32_resets); i++) {
@@ -139,20 +122,6 @@ static bool gd32_mac_is_valid(const uint8_t mac_addr[NET_ETH_ADDR_LEN])
 
 	memcpy(addr.addr, mac_addr, sizeof(addr.addr));
 	return net_eth_is_addr_valid(&addr);
-}
-
-static bool gd32_mac_suffix_is_erased(const struct net_eth_mac_config *cfg,
-				      const uint8_t mac_addr[NET_ETH_ADDR_LEN])
-{
-	bool all_zero = true;
-	bool all_one = true;
-
-	for (size_t i = cfg->addr_len; i < NET_ETH_ADDR_LEN; i++) {
-		all_zero = all_zero && mac_addr[i] == 0U;
-		all_one = all_one && mac_addr[i] == UINT8_MAX;
-	}
-
-	return all_zero || all_one;
 }
 
 static int gd32_mac_from_hwinfo(const struct net_eth_mac_config *cfg,
@@ -183,22 +152,11 @@ static int gd32_mac_from_hwinfo(const struct net_eth_mac_config *cfg,
 	return gd32_mac_is_valid(mac_addr) ? 0 : -EINVAL;
 }
 
-static int gd32_mac_load(const struct net_eth_mac_config *cfg,
-			 uint8_t mac_addr[NET_ETH_ADDR_LEN])
-{
-#if defined(CONFIG_NVMEM)
-	if (cfg->type == NET_ETH_MAC_NVMEM && cfg->cell.size == NET_ETH_ADDR_LEN) {
-		return nvmem_cell_read(&cfg->cell, mac_addr, 0, NET_ETH_ADDR_LEN);
-	}
-#endif
-
-	return net_eth_mac_load(cfg, mac_addr);
-}
-
 int dwmac_platform_init(const struct device *dev)
 {
 	const struct net_eth_mac_config mac_cfg = NET_ETH_MAC_DT_INST_CONFIG_INIT(0);
 	struct dwmac_priv *p = dev->data;
+	const char *mac_source;
 	int ret;
 
 	p->tx_descs = dwmac_tx_descs;
@@ -207,24 +165,41 @@ int dwmac_platform_init(const struct device *dev)
 	IRQ_CONNECT(DT_INST_IRQN(0), DT_INST_IRQ(0, priority), dwmac_isr, DEVICE_DT_INST_GET(0), 0);
 	irq_enable(DT_INST_IRQN(0));
 
-	ret = gd32_mac_load(&mac_cfg, p->mac_addr);
-	if (ret < 0 || !gd32_mac_is_valid(p->mac_addr) ||
-	    gd32_mac_suffix_is_erased(&mac_cfg, p->mac_addr)) {
+	ret = net_eth_mac_load(&mac_cfg, p->mac_addr);
+	if (ret == -ENODATA && mac_cfg.type == NET_ETH_MAC_DEFAULT) {
 		ret = gd32_mac_from_hwinfo(&mac_cfg, p->mac_addr);
+		mac_source = "device ID fallback";
+	} else if (mac_cfg.type == NET_ETH_MAC_NVMEM) {
+		mac_source = "NVMEM";
+	} else if (mac_cfg.type == NET_ETH_MAC_RANDOM) {
+		mac_source = "random";
+	} else {
+		mac_source = "devicetree";
 	}
 	if (ret < 0) {
 		LOG_ERR("Failed to load MAC address (%d)", ret);
 		return ret;
 	}
+	if (!gd32_mac_is_valid(p->mac_addr)) {
+		LOG_ERR("Loaded an invalid MAC address from %s", mac_source);
+		return -EINVAL;
+	}
+
+	LOG_INF("MAC %02x:%02x:%02x:%02x:%02x:%02x source=%s", p->mac_addr[0], p->mac_addr[1],
+		p->mac_addr[2], p->mac_addr[3], p->mac_addr[4], p->mac_addr[5], mac_source);
 
 	return 0;
 }
+
+BUILD_ASSERT(!DT_INST_NVMEM_CELLS_HAS_NAME(0, mac_address) || IS_ENABLED(CONFIG_NVMEM),
+	     "CONFIG_NVMEM is required when GD32 Ethernet uses an NVMEM MAC address");
 
 static const struct dwmac_config dwmac_config = {
 	DEVICE_MMIO_ROM_INIT(DT_DRV_INST(0)),
 	.phy_dev = DEVICE_DT_GET(DT_INST_PHANDLE(0, phy_handle)),
 	.clock = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR_BY_NAME(0, mac)),
-	.mac_clk = (clock_control_subsys_t)&gd32_mac_clk,
+	.mac_clk = (clock_control_subsys_t)&gd32_clocks[DT_PHA_ELEM_IDX_BY_NAME(DT_DRV_INST(0),
+										clocks, mac)],
 };
 
 static struct dwmac_priv dwmac_instance;
