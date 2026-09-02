@@ -79,12 +79,11 @@ struct stream {
 	struct k_work_delayable stop_work;
 	int64_t stop_deadline;
 	bool master;
+	bool starting;
 	bool tx_stop_for_drain;
 	bool tx_switch_buffer;
 	bool tx_drain_final;
-	uint8_t tx_completed_slot;
 	bool rx_switch_buffer;
-	uint8_t rx_completed_slot;
 };
 
 struct i2s_gd32_data {
@@ -261,14 +260,19 @@ static void gd32_i2s_clock_release(const struct device *dev)
 	}
 }
 
-static void gd32_i2s_rx_stream_disable(struct stream *stream)
+static int gd32_i2s_rx_stream_disable(struct stream *stream)
 {
 	const uint32_t rx_reg = gd32_i2s_rx_reg(stream->dev);
+	int ret;
 
 	SPI_CTL1(rx_reg) &= ~SPI_CTL1_ERRIE;
 	spi_dma_disable(rx_reg, SPI_DMA_RECEIVE);
-	(void)dma_stop(stream->dma_dev, stream->dma_channel);
 	i2s_disable(rx_reg);
+	ret = dma_stop(stream->dma_dev, stream->dma_channel);
+	if (ret < 0) {
+		stream->state = I2S_STATE_ERROR;
+		return ret;
+	}
 
 	if (stream->mem_block != NULL) {
 		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
@@ -282,17 +286,24 @@ static void gd32_i2s_rx_stream_disable(struct stream *stream)
 	stream->mem_block_size = 0U;
 	stream->mem_block_alt_size = 0U;
 	stream->rx_switch_buffer = false;
+	stream->starting = false;
+	return 0;
 }
 
-static void gd32_i2s_tx_stream_disable(struct stream *stream)
+static int gd32_i2s_tx_stream_disable(struct stream *stream)
 {
 	const struct i2s_gd32_config *cfg = stream->dev->config;
+	int ret;
 
 	SPI_CTL1(cfg->reg) &= ~SPI_CTL1_ERRIE;
 	spi_dma_disable(cfg->reg, SPI_DMA_TRANSMIT);
-	(void)dma_stop(stream->dma_dev, stream->dma_channel);
 	i2s_disable(cfg->reg);
 	(void)k_work_cancel_delayable(&stream->stop_work);
+	ret = dma_stop(stream->dma_dev, stream->dma_channel);
+	if (ret < 0) {
+		stream->state = I2S_STATE_ERROR;
+		return ret;
+	}
 
 	if (stream->mem_block != NULL) {
 		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
@@ -307,34 +318,61 @@ static void gd32_i2s_tx_stream_disable(struct stream *stream)
 	stream->mem_block_alt_size = 0U;
 	stream->tx_switch_buffer = false;
 	stream->tx_drain_final = false;
+	stream->starting = false;
+	return 0;
 }
 
-static void gd32_i2s_stream_disable(struct stream *stream);
+static int gd32_i2s_stream_disable(struct stream *stream);
 
 static void gd32_i2s_stream_fail(struct stream *stream)
 {
 	struct i2s_gd32_data *data = stream->dev->data;
 
 	if (data->duplex) {
+		const struct i2s_gd32_config *cfg = stream->dev->config;
+		const uint32_t rx_reg = gd32_i2s_rx_reg(stream->dev);
+
+		SPI_CTL1(rx_reg) &= ~SPI_CTL1_ERRIE;
+		SPI_CTL1(cfg->reg) &= ~SPI_CTL1_ERRIE;
+		spi_dma_disable(rx_reg, SPI_DMA_RECEIVE);
+		spi_dma_disable(cfg->reg, SPI_DMA_TRANSMIT);
+		i2s_disable(rx_reg);
+		i2s_disable(cfg->reg);
 		data->rx.state = I2S_STATE_ERROR;
 		data->tx.state = I2S_STATE_ERROR;
-		gd32_i2s_rx_stream_disable(&data->rx);
-		gd32_i2s_tx_stream_disable(&data->tx);
+		data->rx.starting = false;
+		data->tx.starting = false;
 	} else {
+		const struct i2s_gd32_config *cfg = stream->dev->config;
+		const uint32_t reg = stream->dir == I2S_DIR_RX ? gd32_i2s_rx_reg(stream->dev)
+								 : cfg->reg;
+
+		SPI_CTL1(reg) &= ~SPI_CTL1_ERRIE;
+		spi_dma_disable(reg, stream->dir == I2S_DIR_RX ? SPI_DMA_RECEIVE
+								      : SPI_DMA_TRANSMIT);
+		i2s_disable(reg);
 		stream->state = I2S_STATE_ERROR;
-		gd32_i2s_stream_disable(stream);
+		stream->starting = false;
 	}
 }
 
-static void gd32_i2s_tx_stop_work_handler(struct k_work *work)
+static void gd32_i2s_stop_work_handler(struct k_work *work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
 	struct stream *stream = CONTAINER_OF(dwork, struct stream, stop_work);
 	const struct i2s_gd32_config *cfg = stream->dev->config;
-	uint32_t stat = SPI_STAT(cfg->reg);
+	uint32_t stat;
 	unsigned int key;
+	int ret;
 
-	if ((stat & SPI_STAT_TBE) == 0U || (stat & SPI_STAT_TRANS) != 0U) {
+	if (stream->dir == I2S_DIR_TX) {
+		stat = SPI_STAT(cfg->reg);
+	} else {
+		stat = SPI_STAT_TBE;
+	}
+
+	if (stream->dir == I2S_DIR_TX &&
+	    ((stat & SPI_STAT_TBE) == 0U || (stat & SPI_STAT_TRANS) != 0U)) {
 		if (k_uptime_get() < stream->stop_deadline) {
 			k_work_reschedule(&stream->stop_work, K_USEC(20));
 			return;
@@ -342,10 +380,12 @@ static void gd32_i2s_tx_stop_work_handler(struct k_work *work)
 		LOG_WRN("%s tx did not become idle before stop", stream->dev->name);
 	}
 
-	i2s_disable(cfg->reg);
+	ret = gd32_i2s_stream_disable(stream);
 	key = irq_lock();
-	if (stream->state == I2S_STATE_STOPPING) {
+	if (ret == 0 && stream->state == I2S_STATE_STOPPING) {
 		stream->state = I2S_STATE_READY;
+	} else if (ret < 0) {
+		stream->state = I2S_STATE_ERROR;
 	}
 	irq_unlock(key);
 }
@@ -356,18 +396,27 @@ static void gd32_i2s_tx_finish_async(struct stream *stream)
 
 	SPI_CTL1(cfg->reg) &= ~SPI_CTL1_ERRIE;
 	spi_dma_disable(cfg->reg, SPI_DMA_TRANSMIT);
-	(void)dma_stop(stream->dma_dev, stream->dma_channel);
 	stream->stop_deadline = k_uptime_get() + GD32_I2S_STOP_TIMEOUT_MS;
 	k_work_reschedule(&stream->stop_work, K_NO_WAIT);
 }
 
-static void gd32_i2s_stream_disable(struct stream *stream)
+static void gd32_i2s_rx_finish_async(struct stream *stream)
+{
+	const uint32_t rx_reg = gd32_i2s_rx_reg(stream->dev);
+
+	SPI_CTL1(rx_reg) &= ~SPI_CTL1_ERRIE;
+	spi_dma_disable(rx_reg, SPI_DMA_RECEIVE);
+	stream->stop_deadline = k_uptime_get() + GD32_I2S_STOP_TIMEOUT_MS;
+	k_work_reschedule(&stream->stop_work, K_NO_WAIT);
+}
+
+static int gd32_i2s_stream_disable(struct stream *stream)
 {
 	if (stream->dir == I2S_DIR_RX) {
-		gd32_i2s_rx_stream_disable(stream);
-	} else {
-		gd32_i2s_tx_stream_disable(stream);
+		return gd32_i2s_rx_stream_disable(stream);
 	}
+
+	return gd32_i2s_tx_stream_disable(stream);
 }
 
 static bool gd32_i2s_dma_busy(struct stream *stream)
@@ -538,8 +587,8 @@ static bool gd32_i2s_rx_queue_latest(struct stream *stream, void *block, size_t 
 	return false;
 }
 
-static void *gd32_i2s_rx_exchange_block(struct stream *stream, void *completed_block,
-					size_t completed_size)
+static void *gd32_i2s_rx_exchange_single(struct stream *stream, void *completed_block,
+					 size_t completed_size)
 {
 	void *replacement = NULL;
 	size_t replacement_size;
@@ -569,41 +618,78 @@ static void *gd32_i2s_rx_exchange_block(struct stream *stream, void *completed_b
 	return completed_block;
 }
 
+static int gd32_i2s_inactive_block(struct stream *stream, void ***block, size_t **size)
+{
+	uint8_t active_bank;
+	int ret;
+
+	ret = dma_gd32_switch_buffer_active(stream->dma_dev, stream->dma_channel, &active_bank);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (active_bank == 0U) {
+		*block = &stream->mem_block_alt;
+		*size = &stream->mem_block_alt_size;
+	} else {
+		*block = &stream->mem_block;
+		*size = &stream->mem_block_size;
+	}
+
+	return 0;
+}
+
+static void gd32_i2s_rx_publish(struct stream *stream, const void *completed_block,
+				 size_t completed_size)
+{
+	void *output = NULL;
+	size_t unused_size;
+	uint8_t active_bank;
+
+	if (k_mem_slab_alloc(stream->cfg.mem_slab, &output, K_NO_WAIT) != 0 &&
+	    queue_get(stream->msgq, &output, &unused_size, 0) != 0) {
+		return;
+	}
+
+	memcpy(output, completed_block, completed_size);
+
+	if (dma_gd32_switch_buffer_active(stream->dma_dev, stream->dma_channel, &active_bank) < 0) {
+		k_mem_slab_free(stream->cfg.mem_slab, output);
+		return;
+	}
+	if ((active_bank == 0U && completed_block == stream->mem_block) ||
+	    (active_bank == 1U && completed_block == stream->mem_block_alt)) {
+		/* DMA caught the CPU while it copied the inactive bank. Discard the interval. */
+		k_mem_slab_free(stream->cfg.mem_slab, output);
+		return;
+	}
+
+	(void)gd32_i2s_rx_queue_latest(stream, output, completed_size);
+}
+
 static void gd32_i2s_tx_switch_callback(struct stream *stream)
 {
-	const struct i2s_gd32_config *cfg = stream->dev->config;
 	void **completed_block;
 	size_t *completed_size;
 	void *replacement = NULL;
 	size_t replacement_size = 0U;
-	void *active_block;
+	uint8_t active_bank;
 	int ret;
 
-	if (stream->tx_completed_slot == 0U) {
-		completed_block = &stream->mem_block;
-		completed_size = &stream->mem_block_size;
-		active_block = stream->mem_block_alt;
-	} else {
-		completed_block = &stream->mem_block_alt;
-		completed_size = &stream->mem_block_alt_size;
-		active_block = stream->mem_block;
+	ret = gd32_i2s_inactive_block(stream, &completed_block, &completed_size);
+	if (ret < 0) {
+		LOG_ERR("%s tx active bank unavailable: %d", stream->dev->name, ret);
+		gd32_i2s_stream_fail(stream);
+		return;
 	}
 
-	__ASSERT_NO_MSG(*completed_block != NULL && active_block != NULL);
+	__ASSERT_NO_MSG(*completed_block != NULL);
 	stream->frame_count += *completed_size / gd32_i2s_frame_bytes(&stream->cfg);
 	stream->timestamp_cycles = k_cycle_get_64();
 
 	if (stream->tx_drain_final ||
 	    (stream->state == I2S_STATE_STOPPING && !stream->tx_stop_for_drain)) {
 		gd32_i2s_tx_finish_async(stream);
-		k_mem_slab_free(stream->cfg.mem_slab, *completed_block);
-		k_mem_slab_free(stream->cfg.mem_slab, active_block);
-		stream->mem_block = NULL;
-		stream->mem_block_alt = NULL;
-		stream->mem_block_size = 0U;
-		stream->mem_block_alt_size = 0U;
-		stream->tx_switch_buffer = false;
-		stream->tx_drain_final = false;
 		return;
 	}
 
@@ -613,14 +699,12 @@ static void gd32_i2s_tx_switch_callback(struct stream *stream)
 			memset(*completed_block, 0, *completed_size);
 			sys_cache_data_flush_range(*completed_block, *completed_size);
 			stream->tx_drain_final = true;
-			stream->tx_completed_slot ^= 1U;
 			return;
 		}
 
 		memset(*completed_block, 0, stream->cfg.block_size);
 		sys_cache_data_flush_range(*completed_block, stream->cfg.block_size);
 		*completed_size = stream->cfg.block_size;
-		stream->tx_completed_slot ^= 1U;
 		return;
 	}
 
@@ -629,38 +713,33 @@ static void gd32_i2s_tx_switch_callback(struct stream *stream)
 		memset(*completed_block, 0, stream->cfg.block_size);
 		sys_cache_data_flush_range(*completed_block, stream->cfg.block_size);
 		*completed_size = stream->cfg.block_size;
-		stream->tx_completed_slot ^= 1U;
 		return;
 	}
 
-	k_mem_slab_free(stream->cfg.mem_slab, *completed_block);
-	*completed_block = replacement;
+	memcpy(*completed_block, replacement, replacement_size);
+	sys_cache_data_flush_range(*completed_block, replacement_size);
+	k_mem_slab_free(stream->cfg.mem_slab, replacement);
 	*completed_size = replacement_size;
-	ret = dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)replacement,
-			 (uint32_t)&SPI_DATA(cfg->reg), replacement_size);
-	if (ret < 0) {
-		LOG_ERR("%s tx switch-buffer reload failed: %d", stream->dev->name, ret);
-		gd32_i2s_stream_fail(stream);
-		return;
-	}
 
-	stream->tx_completed_slot ^= 1U;
+	ret = dma_gd32_switch_buffer_active(stream->dma_dev, stream->dma_channel, &active_bank);
+	if (ret < 0 || (active_bank == 0U && *completed_block == stream->mem_block) ||
+	    (active_bank == 1U && *completed_block == stream->mem_block_alt)) {
+		LOG_ERR("%s tx DMA bank changed while being refilled", stream->dev->name);
+		gd32_i2s_stream_fail(stream);
+	}
 }
 
 static void gd32_i2s_rx_switch_callback(struct stream *stream)
 {
-	const uint32_t rx_reg = gd32_i2s_rx_reg(stream->dev);
 	void **completed_block;
 	size_t *completed_size;
-	void *replacement = NULL;
 	int ret;
 
-	if (stream->rx_completed_slot == 0U) {
-		completed_block = &stream->mem_block;
-		completed_size = &stream->mem_block_size;
-	} else {
-		completed_block = &stream->mem_block_alt;
-		completed_size = &stream->mem_block_alt_size;
+	ret = gd32_i2s_inactive_block(stream, &completed_block, &completed_size);
+	if (ret < 0) {
+		LOG_ERR("%s rx active bank unavailable: %d", stream->dev->name, ret);
+		gd32_i2s_stream_fail(stream);
+		return;
 	}
 
 	__ASSERT_NO_MSG(*completed_block != NULL);
@@ -669,28 +748,12 @@ static void gd32_i2s_rx_switch_callback(struct stream *stream)
 	sys_cache_data_invd_range(*completed_block, *completed_size);
 
 	if (stream->state == I2S_STATE_STOPPING) {
-		(void)gd32_i2s_rx_queue_latest(stream, *completed_block, *completed_size);
-		*completed_block = NULL;
-		*completed_size = 0U;
-		stream->state = I2S_STATE_READY;
-		gd32_i2s_rx_stream_disable(stream);
+		gd32_i2s_rx_publish(stream, *completed_block, *completed_size);
+		gd32_i2s_rx_finish_async(stream);
 		return;
 	}
 
-	replacement = gd32_i2s_rx_exchange_block(stream, *completed_block, *completed_size);
-
-	sys_cache_data_invd_range(replacement, stream->cfg.block_size);
-	*completed_block = replacement;
-	*completed_size = stream->cfg.block_size;
-	ret = dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)&SPI_DATA(rx_reg),
-			 (uint32_t)replacement, stream->cfg.block_size);
-	if (ret < 0) {
-		LOG_ERR("%s rx switch-buffer reload failed: %d", stream->dev->name, ret);
-		gd32_i2s_stream_fail(stream);
-		return;
-	}
-
-	stream->rx_completed_slot ^= 1U;
+	gd32_i2s_rx_publish(stream, *completed_block, *completed_size);
 }
 
 static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint32_t channel,
@@ -705,7 +768,8 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	ARG_UNUSED(channel);
 
 	/* dma_stop() can leave one already-pending completion in the IRQ path. */
-	if (stream->state != I2S_STATE_RUNNING && stream->state != I2S_STATE_STOPPING) {
+	if (stream->state != I2S_STATE_RUNNING && stream->state != I2S_STATE_STOPPING &&
+	    !stream->starting) {
 		return;
 	}
 	if (stream->mem_block == NULL) {
@@ -738,13 +802,12 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 		if (stream->state == I2S_STATE_STOPPING) {
 			(void)gd32_i2s_rx_queue_latest(stream, filled_block,
 						       stream->cfg.block_size);
-			stream->state = I2S_STATE_READY;
-			gd32_i2s_rx_stream_disable(stream);
+			gd32_i2s_rx_finish_async(stream);
 			return;
 		}
 
 		stream->mem_block =
-			gd32_i2s_rx_exchange_block(stream, filled_block, stream->cfg.block_size);
+			gd32_i2s_rx_exchange_single(stream, filled_block, stream->cfg.block_size);
 		stream->mem_block_size = stream->cfg.block_size;
 		sys_cache_data_invd_range(stream->mem_block, stream->cfg.block_size);
 		ret = dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)&SPI_DATA(rx_reg),
@@ -880,7 +943,6 @@ static int gd32_i2s_stream_start(struct stream *stream)
 		stream->dma_blk_alt.block_size = stream->cfg.block_size;
 		stream->dma_blk_alt.fifo_mode_control = stream->dma_blk.fifo_mode_control;
 		stream->rx_switch_buffer = true;
-		stream->rx_completed_slot = 0U;
 		sys_cache_data_invd_range(stream->mem_block, stream->cfg.block_size);
 		sys_cache_data_invd_range(stream->mem_block_alt, stream->cfg.block_size);
 
@@ -941,7 +1003,6 @@ static int gd32_i2s_stream_start(struct stream *stream)
 		stream->dma_blk_alt.block_size = stream->mem_block_alt_size;
 		stream->dma_blk_alt.fifo_mode_control = stream->dma_blk.fifo_mode_control;
 		stream->tx_switch_buffer = true;
-		stream->tx_completed_slot = 0U;
 		stream->tx_drain_final = false;
 	}
 
@@ -1095,7 +1156,10 @@ static int i2s_gd32_configure(const struct device *dev, enum i2s_dir dir,
 		if (data->duplex && !data->paired_transition) {
 			return -EBUSY;
 		}
-		gd32_i2s_stream_disable(stream);
+		ret = gd32_i2s_stream_disable(stream);
+		if (ret < 0) {
+			return ret;
+		}
 		stream_queue_drop(stream);
 		memset(&stream->cfg, 0, sizeof(stream->cfg));
 		stream->state = I2S_STATE_NOT_READY;
@@ -1271,8 +1335,8 @@ static int i2s_gd32_trigger(const struct device *dev, enum i2s_dir dir, enum i2s
 				irq_unlock(key);
 				return -EIO;
 			}
-			data->rx.state = I2S_STATE_RUNNING;
-			data->tx.state = I2S_STATE_RUNNING;
+			data->rx.starting = true;
+			data->tx.starting = true;
 			data->rx.tx_stop_for_drain = false;
 			data->tx.tx_stop_for_drain = false;
 			irq_unlock(key);
@@ -1282,14 +1346,35 @@ static int i2s_gd32_trigger(const struct device *dev, enum i2s_dir dir, enum i2s
 				ret = gd32_i2s_stream_start(&data->tx);
 			}
 			if (ret < 0) {
-				gd32_i2s_rx_stream_disable(&data->rx);
-				gd32_i2s_tx_stream_disable(&data->tx);
+				int rx_stop = gd32_i2s_rx_stream_disable(&data->rx);
+				int tx_stop = gd32_i2s_tx_stream_disable(&data->tx);
+
 				stream_queue_drop(&data->rx);
 				stream_queue_drop(&data->tx);
-				data->rx.state = I2S_STATE_READY;
-				data->tx.state = I2S_STATE_READY;
+				data->rx.state = rx_stop < 0 ? I2S_STATE_ERROR : I2S_STATE_READY;
+				data->tx.state = tx_stop < 0 ? I2S_STATE_ERROR : I2S_STATE_READY;
+				data->rx.starting = false;
+				data->tx.starting = false;
+				if (rx_stop < 0 || tx_stop < 0) {
+					return rx_stop < 0 ? rx_stop : tx_stop;
+				}
 				return ret;
 			}
+
+			key = irq_lock();
+			if (!data->rx.starting || !data->tx.starting ||
+			    data->rx.state != I2S_STATE_READY ||
+			    data->tx.state != I2S_STATE_READY) {
+				data->rx.starting = false;
+				data->tx.starting = false;
+				irq_unlock(key);
+				return -EIO;
+			}
+			data->rx.starting = false;
+			data->tx.starting = false;
+			data->rx.state = I2S_STATE_RUNNING;
+			data->tx.state = I2S_STATE_RUNNING;
+			irq_unlock(key);
 
 			LOG_DBG("%s rx and tx started", dev->name);
 			return 0;
@@ -1309,8 +1394,14 @@ static int i2s_gd32_trigger(const struct device *dev, enum i2s_dir dir, enum i2s
 			tx_cfg = data->tx.cfg;
 			irq_unlock(key);
 
-			gd32_i2s_rx_stream_disable(&data->rx);
-			gd32_i2s_tx_stream_disable(&data->tx);
+			ret = gd32_i2s_rx_stream_disable(&data->rx);
+			if (ret < 0) {
+				goto duplex_prepare_failed;
+			}
+			ret = gd32_i2s_tx_stream_disable(&data->tx);
+			if (ret < 0) {
+				goto duplex_prepare_failed;
+			}
 			stream_queue_drop(&data->rx);
 			stream_queue_drop(&data->tx);
 			ret = reset_line_toggle_dt(&cfg->reset);
@@ -1387,25 +1478,26 @@ duplex_prepare_failed:
 				dir == I2S_DIR_TX ? "tx" : "rx", stream->state);
 			return -EIO;
 		}
-		stream->state = I2S_STATE_RUNNING;
+		stream->starting = true;
 		stream->tx_stop_for_drain = false;
 		irq_unlock(key);
 
 		ret = gd32_i2s_stream_start(stream);
 		if (ret < 0) {
 			key = irq_lock();
-			if (stream->state == I2S_STATE_RUNNING) {
-				stream->state = I2S_STATE_READY;
-			}
+			stream->starting = false;
 			irq_unlock(key);
 			return ret;
 		}
 
 		key = irq_lock();
-		if (stream->state != I2S_STATE_RUNNING) {
+		if (!stream->starting || stream->state != I2S_STATE_READY) {
+			stream->starting = false;
 			irq_unlock(key);
 			return -EIO;
 		}
+		stream->starting = false;
+		stream->state = I2S_STATE_RUNNING;
 		irq_unlock(key);
 		LOG_DBG("%s %s started", dev->name, dir == I2S_DIR_TX ? "tx" : "rx");
 		return 0;
@@ -1430,8 +1522,11 @@ duplex_prepare_failed:
 			if (dir == I2S_DIR_TX) {
 				gd32_i2s_tx_finish_async(stream);
 			} else {
+				ret = gd32_i2s_stream_disable(stream);
+				if (ret < 0) {
+					return ret;
+				}
 				stream->state = I2S_STATE_READY;
-				gd32_i2s_stream_disable(stream);
 			}
 		}
 
@@ -1463,9 +1558,12 @@ duplex_prepare_failed:
 				stream->state = I2S_STATE_STOPPING;
 				irq_unlock(key);
 			} else {
-				stream->state = I2S_STATE_READY;
 				irq_unlock(key);
-				gd32_i2s_stream_disable(stream);
+				ret = gd32_i2s_stream_disable(stream);
+				if (ret < 0) {
+					return ret;
+				}
+				stream->state = I2S_STATE_READY;
 			}
 		}
 
@@ -1485,7 +1583,10 @@ duplex_prepare_failed:
 		stream->tx_stop_for_drain = false;
 		irq_unlock(key);
 
-		gd32_i2s_stream_disable(stream);
+		ret = gd32_i2s_stream_disable(stream);
+		if (ret < 0) {
+			return ret;
+		}
 		stream_queue_drop(stream);
 		LOG_DBG("%s %s dropped", dev->name, dir == I2S_DIR_TX ? "tx" : "rx");
 		return 0;
@@ -1504,7 +1605,10 @@ duplex_prepare_failed:
 		cfg_copy = stream->cfg;
 		irq_unlock(key);
 
-		gd32_i2s_stream_disable(stream);
+		ret = gd32_i2s_stream_disable(stream);
+		if (ret < 0) {
+			return ret;
+		}
 		stream_queue_drop(stream);
 		ret = reset_line_toggle_dt(&((const struct i2s_gd32_config *)dev->config)->reset);
 		if (ret < 0) {
@@ -1645,7 +1749,7 @@ static int i2s_gd32_init(const struct device *dev)
 	data->tx.dma_channel = cfg->dma_tx.channel;
 	data->tx.dma_slot = cfg->dma_tx.slot;
 	data->tx.dma_priority = GD32_DMA_CONFIG_PRIORITY(cfg->dma_tx.config);
-	k_work_init_delayable(&data->tx.stop_work, gd32_i2s_tx_stop_work_handler);
+	k_work_init_delayable(&data->tx.stop_work, gd32_i2s_stop_work_handler);
 
 	data->rx.dev = dev;
 	data->rx.dir = I2S_DIR_RX;
@@ -1654,6 +1758,7 @@ static int i2s_gd32_init(const struct device *dev)
 	data->rx.dma_channel = cfg->dma_rx.channel;
 	data->rx.dma_slot = cfg->dma_rx.slot;
 	data->rx.dma_priority = GD32_DMA_CONFIG_PRIORITY(cfg->dma_rx.config);
+	k_work_init_delayable(&data->rx.stop_work, gd32_i2s_stop_work_handler);
 
 	cfg->irq_configure(dev);
 	return 0;
