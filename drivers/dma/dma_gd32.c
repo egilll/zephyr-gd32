@@ -10,6 +10,7 @@
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_gd32.h>
 #include <zephyr/drivers/reset.h>
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include <gd32_dma.h>
@@ -96,7 +97,7 @@ struct dma_gd32_channel {
 #define DMA_GD32_CHANNEL_FIFO_MODE  BIT(2)
 #define DMA_GD32_CHANNEL_POISONED   BIT(3)
 #define DMA_GD32_CHANNEL_SWITCH_BUF BIT(4)
-#define DMA_GD32_STOP_TIMEOUT_US    1000U
+#define DMA_GD32_STOP_TIMEOUT_MS    2U
 
 struct dma_gd32_data {
 	struct dma_context ctx;
@@ -856,38 +857,14 @@ static int dma_gd32_reload(const struct device *dev, uint32_t ch, uint32_t src, 
 		return -EINVAL;
 	}
 	if (dma_gd32_channel_enabled(cfg, ch)) {
-#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
-		uint32_t memory_address;
-		uint32_t peripheral_address;
-
-		if (!(data->channels[ch].flags & DMA_GD32_CHANNEL_SWITCH_BUF)) {
-			return -EBUSY;
-		}
-		if (size != data->channels[ch].block_size) {
-			return -EINVAL;
-		}
-
-		if (data->channels[ch].direction == MEMORY_TO_PERIPHERAL) {
-			memory_address = src;
-			peripheral_address = dst;
-		} else {
-			memory_address = dst;
-			peripheral_address = src;
-		}
-		if (peripheral_address != data->channels[ch].peripheral_address ||
-		    (memory_address % data->channels[ch].memory_width) != 0U) {
-			return -EINVAL;
-		}
-
-		if (gd32_dma_uses_memory1(cfg->reg, ch)) {
-			gd32_dma_memory_address_config(cfg->reg, ch, memory_address);
-		} else {
-			gd32_dma_memory1_address_config(cfg->reg, ch, memory_address);
-		}
-		return 0;
-#else
+		/*
+		 * MBS can change between selecting the inactive address register and
+		 * writing it.  In switch-buffer mode that race writes the active bank,
+		 * raises TAE, and terminates the channel.  Keep both addresses immutable
+		 * for the whole running epoch; clients refill the inactive buffers in
+		 * place after querying dma_gd32_switch_buffer_active().
+		 */
 		return -EBUSY;
-#endif
 	}
 
 	if ((size == 0U) || (data->channels[ch].periph_width == 0U) ||
@@ -1008,6 +985,7 @@ static int dma_gd32_stop(const struct device *dev, uint32_t ch)
 {
 	const struct dma_gd32_config *cfg = dev->config;
 	struct dma_gd32_data *data = dev->data;
+	int64_t deadline;
 
 	if (ch >= cfg->channels) {
 		LOG_ERR("stop channel must be < %" PRIu32 " (%" PRIu32 ")", cfg->channels, ch);
@@ -1020,8 +998,16 @@ static int dma_gd32_stop(const struct device *dev, uint32_t ch)
 	gd32_dma_fifo_error_interrupt_disable(cfg->reg, ch);
 	gd32_dma_channel_disable(cfg->reg, ch);
 
-	if (!WAIT_FOR(!dma_gd32_channel_enabled(cfg, ch), DMA_GD32_STOP_TIMEOUT_US,
-		      k_busy_wait(1U))) {
+	if (dma_gd32_channel_enabled(cfg, ch) && k_is_in_isr()) {
+		return -EWOULDBLOCK;
+	}
+
+	deadline = k_uptime_get() + DMA_GD32_STOP_TIMEOUT_MS;
+	while (dma_gd32_channel_enabled(cfg, ch) && k_uptime_get() < deadline) {
+		k_sleep(K_MSEC(1));
+	}
+
+	if (dma_gd32_channel_enabled(cfg, ch)) {
 		data->channels[ch].flags |= DMA_GD32_CHANNEL_POISONED;
 		return -ETIMEDOUT;
 	}
@@ -1052,6 +1038,36 @@ static int dma_gd32_get_status(const struct device *dev, uint32_t ch, struct dma
 	stat->busy = dma_gd32_channel_enabled(cfg, ch);
 
 	return 0;
+}
+
+int dma_gd32_switch_buffer_active(const struct device *dev, uint32_t ch, uint8_t *active_bank)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+	const struct dma_gd32_config *cfg;
+	struct dma_gd32_data *data;
+
+	if (dev == NULL || active_bank == NULL) {
+		return -EINVAL;
+	}
+
+	cfg = dev->config;
+	data = dev->data;
+	if (ch >= cfg->channels ||
+	    (data->channels[ch].flags & DMA_GD32_CHANNEL_CONFIGURED) == 0U) {
+		return -EINVAL;
+	}
+	if ((data->channels[ch].flags & DMA_GD32_CHANNEL_SWITCH_BUF) == 0U) {
+		return -ENOTSUP;
+	}
+
+	*active_bank = gd32_dma_uses_memory1(cfg->reg, ch) ? 1U : 0U;
+	return 0;
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(ch);
+	ARG_UNUSED(active_bank);
+	return -ENOTSUP;
+#endif
 }
 
 static bool dma_gd32_api_chan_filter(const struct device *dev, int ch, void *filter_param)
