@@ -50,6 +50,13 @@
 		};
 	};
 
+	ckout0_default: ckout0_default {
+		group1 {
+			pinmux = <CK_OUT0_PA8>;
+			slew-rate = "max-speed-200mhz";
+		};
+	};
+
 	mdio_default: mdio_default {
 		group1 {
 			pinmux = <ETH_MDIO_PA2>, <ETH_MDC_PC1>;
