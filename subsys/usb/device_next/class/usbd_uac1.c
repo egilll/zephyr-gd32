@@ -34,8 +34,15 @@ LOG_MODULE_REGISTER(usbd_uac1, CONFIG_USBD_UAC1_LOG_LEVEL);
 	DT_INST_FOREACH_CHILD(i, COUNT_UAC1_AS_ENDPOINT_BUFFERS)
 #define UAC1_NUM_EP_BUFFERS DT_INST_FOREACH_STATUS_OKAY(COUNT_UAC1_EP_BUFFERS)
 
+struct uac1_buf_info {
+	struct udc_buf_info udc;
+	uint32_t generation;
+	uint8_t as_idx;
+	bool is_feedback;
+};
+
 UDC_BUF_POOL_DEFINE(uac1_pool, UAC1_NUM_EP_BUFFERS, 6,
-		    sizeof(struct udc_buf_info), NULL);
+		    sizeof(struct uac1_buf_info), NULL);
 
 /* Audio class specific request types */
 #define SET_CLASS_INTERFACE_REQUEST_TYPE	0x21
@@ -85,6 +92,7 @@ struct uac1_fu_cfg {
 struct uac1_stream_runtime {
 	atomic_t data_outstanding;
 	atomic_t feedback_outstanding;
+	atomic_t generation;
 	uint32_t service_number;
 };
 
@@ -260,10 +268,11 @@ static uint8_t as_feedback_ep(const struct device *dev, int as_idx)
 	return cfg->hs_fb_ep ? cfg->hs_fb_ep[as_idx] : 0U;
 }
 
-static struct net_buf *uac1_buf_alloc(const uint8_t ep, void *data, uint16_t size)
+static struct net_buf *uac1_buf_alloc(const uint8_t ep, void *data, uint16_t size,
+				     uint8_t as_idx, uint32_t generation)
 {
 	struct net_buf *buf;
-	struct udc_buf_info *bi;
+	struct uac1_buf_info *info;
 
 	if (data == NULL || !IS_UDC_ALIGNED(data)) {
 		return NULL;
@@ -274,8 +283,11 @@ static struct net_buf *uac1_buf_alloc(const uint8_t ep, void *data, uint16_t siz
 		return NULL;
 	}
 
-	bi = udc_get_buf_info(buf);
-	bi->ep = ep;
+	info = net_buf_user_data(buf);
+	info->udc.ep = ep;
+	info->generation = generation;
+	info->as_idx = as_idx;
+	info->is_feedback = false;
 
 	if (USB_EP_DIR_IS_OUT(ep)) {
 		buf->len = 0;
@@ -339,11 +351,13 @@ static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t 
 	const uint8_t ep = as_data_ep(dev, as_idx);
 	const uint16_t mps = as_data_mps(dev, as_idx);
 	void *data_buf = NULL;
+	uint32_t generation;
 	int ret;
 
 	if (!stream_available(ctx, as_idx) || !outstanding_acquire(&stream->data_outstanding)) {
 		return;
 	}
+	generation = atomic_get(&stream->generation);
 
 	ret = ctx->ops->rx_buf_acquire(dev, terminal, mps, &data_buf, ctx->user_data);
 	if (ret != 0 || data_buf == NULL) {
@@ -355,7 +369,7 @@ static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t 
 		return;
 	}
 
-	buf = uac1_buf_alloc(ep, data_buf, mps);
+	buf = uac1_buf_alloc(ep, data_buf, mps, as_idx, generation);
 	if (!buf) {
 		LOG_ERR("Invalid or unavailable receive buffer for terminal %u", terminal);
 		release_rx_buffer(dev, terminal, data_buf, 0, -ENOMEM);
@@ -384,11 +398,13 @@ static void schedule_iso_in_write(struct usbd_class_data *const c_data, uint8_t 
 	struct net_buf *buf;
 	void *data = NULL;
 	uint16_t size = 0U;
+	uint32_t generation;
 	int ret;
 
 	if (!stream_available(ctx, as_idx) || !outstanding_acquire(&stream->data_outstanding)) {
 		return;
 	}
+	generation = atomic_get(&stream->generation);
 
 	const uint32_t service_number = stream->service_number++;
 
@@ -409,7 +425,7 @@ static void schedule_iso_in_write(struct usbd_class_data *const c_data, uint8_t 
 		return;
 	}
 
-	buf = uac1_buf_alloc(ep, data, size);
+	buf = uac1_buf_alloc(ep, data, size, as_idx, generation);
 	if (buf == NULL) {
 		release_tx_buffer(dev, terminal, data, -ENOMEM);
 		outstanding_release(&stream->data_outstanding);
@@ -437,6 +453,8 @@ static void write_explicit_feedback(struct usbd_class_data *const c_data, uint8_
 	const uint8_t ep = as_feedback_ep(dev, as_idx);
 	struct net_buf *buf;
 	struct udc_buf_info *bi;
+	struct uac1_buf_info *info;
+	uint32_t generation;
 	uint32_t fb_value;
 	int ret;
 
@@ -444,6 +462,7 @@ static void write_explicit_feedback(struct usbd_class_data *const c_data, uint8_
 	    !outstanding_acquire(&stream->feedback_outstanding)) {
 		return;
 	}
+	generation = atomic_get(&stream->generation);
 
 	buf = net_buf_alloc(&uac1_pool, K_NO_WAIT);
 	if (!buf) {
@@ -454,6 +473,10 @@ static void write_explicit_feedback(struct usbd_class_data *const c_data, uint8_
 
 	bi = udc_get_buf_info(buf);
 	bi->ep = ep;
+	info = net_buf_user_data(buf);
+	info->generation = generation;
+	info->as_idx = as_idx;
+	info->is_feedback = true;
 
 	fb_value = ctx->ops->feedback_cb(dev, terminal, ctx->user_data);
 
@@ -1105,6 +1128,7 @@ static void uac1_update(struct usbd_class_data *const c_data, uint8_t iface, uin
 
 	if (alternate == 0U) {
 		if (atomic_test_and_clear_bit(&ctx->as_selected, as_idx)) {
+			atomic_inc(&cfg->streams[as_idx].generation);
 			ctx->ops->stream_event_cb(dev, cfg->as_terminals[as_idx],
 						  UAC1_STREAM_DEACTIVATED, microframes,
 						  ctx->user_data);
@@ -1113,6 +1137,7 @@ static void uac1_update(struct usbd_class_data *const c_data, uint8_t iface, uin
 	}
 
 	if (!atomic_test_and_set_bit(&ctx->as_selected, as_idx)) {
+		atomic_inc(&cfg->streams[as_idx].generation);
 		cfg->streams[as_idx].service_number = 0U;
 		ctx->ops->stream_event_cb(dev, cfg->as_terminals[as_idx],
 					  UAC1_STREAM_ACTIVATED, microframes, ctx->user_data);
@@ -1136,12 +1161,15 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 	struct uac1_ctx *ctx = dev->data;
 	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
 	struct udc_buf_info *bi;
+	struct uac1_buf_info *info;
 	uint8_t ep;
 	uint8_t terminal;
+	uint32_t generation;
 	int as_idx;
 	bool is_feedback;
 
 	bi = udc_get_buf_info(buf);
+	info = net_buf_user_data(buf);
 	if (err) {
 		if (err == -ECONNABORTED) {
 			LOG_WRN("request ep 0x%02x, len %u cancelled", bi->ep, buf->len);
@@ -1157,13 +1185,15 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 		return 0;
 	}
 
-	as_idx = ep_to_as_interface(dev, ep, &is_feedback);
+	as_idx = info->as_idx;
+	is_feedback = info->is_feedback;
 	if (as_idx < 0 || as_idx >= cfg->num_ifaces) {
 		LOG_ERR("Completion for unknown endpoint 0x%02x", ep);
 		usbd_ep_buf_free(uds_ctx, buf);
 		return 0;
 	}
 	terminal = cfg->as_terminals[as_idx];
+	generation = info->generation;
 
 	for (struct net_buf *fragment = buf; fragment != NULL; fragment = fragment->frags) {
 		if (is_feedback) {
@@ -1180,7 +1210,7 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 	}
 
 	usbd_ep_buf_free(uds_ctx, buf);
-	if (err) {
+	if (err || generation != (uint32_t)atomic_get(&cfg->streams[as_idx].generation)) {
 		return 0;
 	}
 
@@ -1302,6 +1332,7 @@ static void uac1_disable(struct usbd_class_data *const c_data)
 	atomic_clear(&ctx->suspended);
 	atomic_clear(&ctx->status_queued);
 	for (uint8_t as_idx = 0U; as_idx < cfg->num_ifaces; as_idx++) {
+		atomic_inc(&cfg->streams[as_idx].generation);
 		cfg->streams[as_idx].service_number = 0U;
 	}
 
