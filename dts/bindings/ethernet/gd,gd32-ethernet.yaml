@@ -39,15 +39,6 @@ properties:
   pinctrl-names:
     required: true
 
-  gd,phy-clk-out:
-    type: boolean
-    required: false
-    description: |
-      When present, configure CKOUT0 on PA8 to output 50 MHz from PLLP/4
-      to feed the external PHY XI pin. Some designs rely on the MCU as the
-      PHY clock source. If not present, the driver assumes the PHY has its own
-      crystal or clocking source and no CKOUT is configured.
-
   zephyr,mac-address-prefix:
     type: uint8-array
     required: false

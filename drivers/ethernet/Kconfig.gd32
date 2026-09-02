@@ -10,6 +10,7 @@ config ETH_GD32_DWC_ETHER_1000
 	select HWINFO
 	select CRC
 	select RESET
+	imply NVMEM if $(dt_compat_any_has_prop,$(DT_COMPAT_GD_GD32_ETHERNET),nvmem-cells)
 	default y
 	help
 	  Use Zephyr's native Synopsys DesignWare Ethernet MAC 10/100/1G

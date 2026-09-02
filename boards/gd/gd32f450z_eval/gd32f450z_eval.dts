@@ -225,8 +225,15 @@ zephyr_udc0: &usbfs {
 	status = "okay";
 	pinctrl-0 = <&enet_default>;
 	pinctrl-names = "default";
-	gd,phy-clk-out;
 	phy-handle = <&eth_phy0>;
+};
+
+&ckout0 {
+	status = "okay";
+	clock-frequency = <DT_FREQ_M(50)>;
+	gd,clock-source = "pllp";
+	pinctrl-0 = <&ckout0_default>;
+	pinctrl-names = "default";
 };
 
 &dma0 {
