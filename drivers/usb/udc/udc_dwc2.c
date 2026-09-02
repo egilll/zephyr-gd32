@@ -2336,22 +2336,61 @@ static void udc_dwc2_unlock(const struct device *dev)
 static void dwc2_on_bus_reset(const struct device *dev)
 {
 	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
+	const struct udc_dwc2_config *const config = dev->config;
 	struct udc_dwc2_data *const priv = udc_get_private(dev);
 	uint32_t doepmsk;
 	uint32_t diepmsk;
 
-	/* Set the NAK bit for all OUT endpoints */
+	atomic_clear(&priv->xfer_new);
+	atomic_clear(&priv->xfer_finished);
+	priv->iso_enabled = 0U;
+	priv->iso_in_rearm = 0U;
+	priv->iso_out_rearm = 0U;
+	priv->ep_out_disable = 0U;
+	priv->ep_out_stall = 0U;
+
+	/*
+	 * USBRST resets the endpoint state machine before the stack can dequeue
+	 * its requests. Quiesce every endpoint here and mark it disabled so the
+	 * later thread-context dequeue cannot wait for an EPDISBLD interrupt that
+	 * the reset has already consumed.
+	 */
 	for (uint8_t i = 0U; i < priv->numdeveps; i++) {
 		uint32_t epdir = usb_dwc2_get_ghwcfg1_epdir(priv->ghwcfg1, i);
 		mem_addr_t doepctl_reg;
+		mem_addr_t diepctl_reg;
+		uint32_t diepctl;
 
 		LOG_DBG("ep 0x%02x EPDIR %u", i, epdir);
 		if (epdir == USB_DWC2_GHWCFG1_EPDIR_OUT ||
 		    epdir == USB_DWC2_GHWCFG1_EPDIR_BDIR) {
 			doepctl_reg = dwc2_get_dxepctl_reg(dev, i);
 			sys_write32(USB_DWC2_DEPCTL_SNAK, doepctl_reg);
+			sys_write32(UINT32_MAX, (mem_addr_t)&base->out_ep[i].doepint);
+		}
+
+		if (epdir == USB_DWC2_GHWCFG1_EPDIR_IN ||
+		    epdir == USB_DWC2_GHWCFG1_EPDIR_BDIR) {
+			diepctl_reg = dwc2_get_dxepctl_reg(dev, i | USB_EP_DIR_IN);
+			diepctl = sys_read32(diepctl_reg) | USB_DWC2_DEPCTL_SNAK;
+			if (diepctl & USB_DWC2_DEPCTL_EPENA) {
+				diepctl |= USB_DWC2_DEPCTL_EPDIS;
+			}
+			sys_write32(diepctl, diepctl_reg);
+			sys_write32(UINT32_MAX, (mem_addr_t)&base->in_ep[i].diepint);
 		}
 	}
+
+	k_event_set(&priv->ep_disabled, UINT32_MAX);
+	for (size_t i = 0U; i < config->num_out_eps; i++) {
+		udc_ep_set_busy(&config->ep_cfg_out[i], false);
+	}
+	for (size_t i = 0U; i < config->num_in_eps; i++) {
+		udc_ep_set_busy(&config->ep_cfg_in[i], false);
+	}
+
+	/* Ignore every non-control endpoint until Chapter 9 enables it again. */
+	sys_write32(BIT(0) | BIT(16), (mem_addr_t)&base->daintmsk);
 
 	doepmsk = USB_DWC2_DOEPINT_SETUP | USB_DWC2_DOEPINT_EPDISBLD | USB_DWC2_DOEPINT_XFERCOMPL;
 	if (dwc2_in_buffer_dma_mode(dev)) {
@@ -2394,6 +2433,30 @@ static void dwc2_handle_enumdone(const struct device *dev)
 	priv->enumdone = 1;
 
 	k_event_post(&priv->drv_evt, BIT(DWC2_DRV_EVT_ENUM_DONE));
+}
+
+static int dwc2_flush_reset_fifo(const struct device *dev, bool tx)
+{
+	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
+	mem_addr_t grstctl_reg = (mem_addr_t)&base->grstctl;
+	const uint32_t flush = tx ? USB_DWC2_GRSTCTL_TXFFLSH : USB_DWC2_GRSTCTL_RXFFLSH;
+	k_timepoint_t deadline = sys_timepoint_calc(K_MSEC(10));
+	uint32_t command = flush;
+
+	if (tx) {
+		command |= usb_dwc2_set_grstctl_txfnum(0x10U);
+	}
+	sys_write32(command, grstctl_reg);
+
+	while ((sys_read32(grstctl_reg) & flush) != 0U) {
+		if (sys_timepoint_expired(deadline)) {
+			LOG_ERR("USB reset %s FIFO flush timed out", tx ? "TX" : "RX");
+			return -ETIMEDOUT;
+		}
+		k_usleep(10);
+	}
+
+	return 0;
 }
 
 static inline int dwc2_read_fifo_setup(const struct device *dev, uint8_t ep,
@@ -2999,7 +3062,6 @@ static void udc_dwc2_isr_handler(const struct device *dev)
 			/* Clear and handle Enumeration Done interrupt. */
 			sys_write32(USB_DWC2_GINTSTS_ENUMDONE, gintsts_reg);
 			dwc2_handle_enumdone(dev);
-			udc_submit_event(dev, UDC_EVT_RESET, 0);
 		}
 
 		if (int_status & USB_DWC2_GINTSTS_WKUPINT) {
@@ -3266,6 +3328,9 @@ static ALWAYS_INLINE void dwc2_thread_handler(void *const arg)
 
 	if (evt & BIT(DWC2_DRV_EVT_ENUM_DONE)) {
 		k_event_clear(&priv->drv_evt, BIT(DWC2_DRV_EVT_ENUM_DONE));
+		(void)dwc2_flush_reset_fifo(dev, true);
+		(void)dwc2_flush_reset_fifo(dev, false);
+		udc_submit_event(dev, UDC_EVT_RESET, 0);
 	}
 
 	if (evt & BIT(DWC2_DRV_EVT_DISABLE)) {
