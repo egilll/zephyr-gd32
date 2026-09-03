@@ -1149,6 +1149,32 @@ ZTEST(dns_resolve, test_dns_unpack_name_with_pointer)
 	net_buf_unref(result);
 }
 
+ZTEST(dns_resolve, test_dns_unpack_name_with_forward_pointer)
+{
+	static const uint8_t forward_pointer[] = {0xc0, 0x02, 0x00};
+	static const uint8_t self_pointer[] = {0xc0, 0x00};
+	static const uint8_t label_then_forward_pointer[] = {0x01, 'a', 0xc0, 0x04, 0x00};
+	static const struct {
+		const uint8_t *record;
+		size_t size;
+	} cases[] = {
+		{forward_pointer, sizeof(forward_pointer)},
+		{self_pointer, sizeof(self_pointer)},
+		{label_then_forward_pointer, sizeof(label_then_forward_pointer)},
+	};
+
+	for (size_t i = 0U; i < ARRAY_SIZE(cases); i++) {
+		struct net_buf *result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+		int ret;
+
+		zassert_not_null(result, "Failed to allocate buffer");
+		ret = dns_unpack_name(cases[i].record, cases[i].size, cases[i].record, result,
+				      NULL);
+		zassert_equal(ret, -EMSGSIZE, "Accepted non-backward compression pointer");
+		net_buf_unref(result);
+	}
+}
+
 ZTEST(dns_resolve, test_dns_unpack_name_overflow)
 {
 	static const uint8_t *test_records[] = {
