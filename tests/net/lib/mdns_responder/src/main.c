@@ -2070,6 +2070,36 @@ static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type 
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "net_pkt skip failed");
 }
 
+static void check_service_instance_nsec_answer(struct net_pkt *pkt, bool legacy)
+{
+	static const uint8_t expected_bitmap[] = {0U, 0U, 0x80U, 0U, 0x40U};
+	struct dns_rr record;
+	uint8_t bitmap[sizeof(expected_bitmap)];
+	uint8_t value8;
+	uint16_t value;
+
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_NSEC, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN | (legacy ? 0U : DNS_CLASS_FLUSH),
+		      "Unexpected answer class");
+	if (legacy) {
+		zassert_true(net_ntohl(record.ttl) <= 10U, "Legacy response TTL is too long");
+	} else {
+		zassert_equal(net_ntohl(record.ttl), 120U, "Unexpected NSEC TTL");
+	}
+	zassert_equal(net_ntohs(record.rdlength), DNS_POINTER_SIZE + 2U + sizeof(bitmap),
+		      "Unexpected NSEC length");
+	zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
+	zassert_equal(value, 0xc00c, "NSEC next name does not point to its owner");
+	zassert_ok(net_pkt_read_u8(pkt, &value8), "net_pkt read failed");
+	zassert_equal(value8, 0U, "Unexpected NSEC window");
+	zassert_ok(net_pkt_read_u8(pkt, &value8), "net_pkt read failed");
+	zassert_equal(value8, sizeof(bitmap), "Unexpected NSEC bitmap length");
+	zassert_ok(net_pkt_read(pkt, bitmap, sizeof(bitmap)), "net_pkt read failed");
+	zassert_mem_equal(bitmap, expected_bitmap, sizeof(bitmap), "Unexpected NSEC bitmap");
+}
+
 static void check_ipv6_address_additional(struct net_pkt *pkt, bool legacy)
 {
 	struct dns_rr record;
@@ -2658,19 +2688,97 @@ ZTEST(test_mdns_responder, test_dns_sd_owner_type_mismatch)
 		0x00,
 		0x01,
 	};
-	uint8_t instance_ptr_query[sizeof(service_instance_srv_query)];
-
 	send_msg(service_owner_srv_query, sizeof(service_owner_srv_query));
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
 		      "SRV question at service owner received an answer");
+	zassert_equal(responses_count, 0U, "Mismatched service owner type produced a response");
+}
 
-	memcpy(instance_ptr_query, service_instance_srv_query, sizeof(instance_ptr_query));
-	instance_ptr_query[sizeof(instance_ptr_query) - 4U] = 0x00;
-	instance_ptr_query[sizeof(instance_ptr_query) - 3U] = DNS_RR_TYPE_PTR;
-	send_msg(instance_ptr_query, sizeof(instance_ptr_query));
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_nsec_queries)
+{
+	const size_t qtype_low = sizeof(service_instance_srv_query) - 3U;
+	struct net_ipv6_hdr *header;
+	uint8_t query[sizeof(service_instance_srv_query)];
+
+	memcpy(query, service_instance_srv_query, sizeof(query));
+	query[qtype_low] = DNS_RR_TYPE_A;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an A NSEC response");
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
+	check_service_instance_nsec_answer(response_pkts[0], false);
+
+	query[qtype_low] = DNS_RR_TYPE_NSEC;
+	query[sizeof(query) - 2U] = 0x80U;
+	query[sizeof(query) - 1U] = DNS_CLASS_IN;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive an explicit NSEC response");
+	header = NET_IPV6_HDR(response_pkts[1]);
+	zassert_true(net_ipv6_addr_cmp_raw(header->dst, (const uint8_t *)&sender_ll_addr),
+		     "QU NSEC response was not unicast to the querier");
+	zassert_equal(header->hop_limit, 255U, "QU NSEC response used the wrong hop limit");
+	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 0U);
+	check_service_instance_nsec_answer(response_pkts[1], false);
+
+	query[0] = 0x12U;
+	query[1] = 0x34U;
+	query[qtype_low] = DNS_RR_TYPE_PTR;
+	query[sizeof(query) - 2U] = 0U;
+	query[sizeof(query) - 1U] = DNS_CLASS_IN;
+	send_msg_from_port(query, sizeof(query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a legacy PTR NSEC response");
+	check_service_instance_header(response_pkts[2], 0x1234U, 1U, 1U, 0U);
+	check_service_instance_question(response_pkts[2], DNS_RR_TYPE_PTR);
+	check_service_instance_nsec_answer(response_pkts[2], true);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_nsec_known_answer_suppression)
+{
+	static const uint8_t known_nsec[] = {
+		/* Owner pointer, NSEC, class IN, TTL 120, RDLENGTH 9. */
+		0xc0,
+		0x0c,
+		0x00,
+		0x2f,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x78,
+		0x00,
+		0x09,
+		/* Next Domain Name pointer, window 0, bitmap for TXT and SRV. */
+		0xc0,
+		0x0c,
+		0x00,
+		0x05,
+		0x00,
+		0x00,
+		0x80,
+		0x00,
+		0x40,
+	};
+	const size_t qtype_low = sizeof(service_instance_srv_query) - 3U;
+	const size_t known_ttl_low = sizeof(service_instance_srv_query) + 9U;
+	uint8_t query[sizeof(service_instance_srv_query) + sizeof(known_nsec)];
+
+	memcpy(query, service_instance_srv_query, sizeof(service_instance_srv_query));
+	memcpy(query + sizeof(service_instance_srv_query), known_nsec, sizeof(known_nsec));
+	query[7] = 1U;
+	query[qtype_low] = DNS_RR_TYPE_A;
+	send_msg(query, sizeof(query));
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
-		      "PTR question at instance owner received an answer");
-	zassert_equal(responses_count, 0U, "Mismatched owner types produced a response");
+		      "Fresh NSEC known answer was not suppressed");
+	zassert_equal(responses_count, 0U, "Fresh NSEC known answer produced a response");
+
+	query[known_ttl_low] = 59U;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Stale NSEC known answer did not receive a response");
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
+	check_service_instance_nsec_answer(response_pkts[0], false);
 }
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_known_answer_suppression)
