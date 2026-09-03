@@ -514,6 +514,11 @@ struct mdns_answer {
 	uint16_t class_;
 };
 
+struct address_rrset_state {
+	uint16_t total;
+	uint16_t known;
+};
+
 static int mdns_unpack_answer(const uint8_t *msg, uint16_t msg_size, uint16_t *offset,
 			      struct net_buf *scratch, struct mdns_answer *answer)
 {
@@ -568,6 +573,8 @@ struct answer_ctx {
 	uint16_t query_size;
 	uint16_t answer_offset;
 	uint16_t known_answer_count;
+	struct address_rrset_state a;
+	struct address_rrset_state aaaa;
 	bool legacy;
 	bool additional;
 };
@@ -933,6 +940,48 @@ static void collect_address_types_cb(struct net_if *iface, struct net_if_addr *i
 	}
 }
 
+static struct address_rrset_state *address_rrset_state(struct answer_ctx *ctx,
+						       enum dns_rr_type type)
+{
+	return type == DNS_RR_TYPE_A ? &ctx->a : &ctx->aaaa;
+}
+
+static void inspect_address_cb(struct net_if *iface, struct net_if_addr *ifaddr, void *user_data)
+{
+	struct answer_ctx *ctx = user_data;
+	struct address_rrset_state *rrset;
+	enum dns_rr_type type;
+	const uint8_t *addr;
+	uint16_t addr_len;
+	int ret;
+
+	ARG_UNUSED(iface);
+
+	if (ctx->error < 0 || (ifaddr->addr_state != NET_ADDR_PREFERRED &&
+			       ifaddr->addr_state != NET_ADDR_DEPRECATED)) {
+		return;
+	}
+
+	if (ifaddr->address.family == NET_AF_INET6) {
+		type = DNS_RR_TYPE_AAAA;
+		addr_len = sizeof(struct net_in6_addr);
+		addr = ifaddr->address.in6_addr.s6_addr;
+	} else {
+		type = DNS_RR_TYPE_A;
+		addr_len = sizeof(struct net_in_addr);
+		addr = ifaddr->address.in_addr.s4_addr;
+	}
+
+	rrset = address_rrset_state(ctx, type);
+	rrset->total++;
+	ret = mdns_addr_known(ctx, type, addr, addr_len);
+	if (ret < 0) {
+		ctx->error = ret;
+	} else if (ret > 0) {
+		rrset->known++;
+	}
+}
+
 static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uint32_t ttl,
 			      uint16_t addr_len, const uint8_t *addr, bool include_name_ptr)
 {
@@ -945,6 +994,7 @@ static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uin
 	if (net_buf_tailroom(ctx->query) < (DNS_QTYPE_LEN + DNS_QCLASS_LEN +
 					    DNS_TTL_LEN + DNS_RDLENGTH_LEN +
 					    addr_len + name_len)) {
+		ctx->error = -ENOBUFS;
 		return;
 	}
 
@@ -979,11 +1029,11 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 			   void *user_data)
 {
 	struct answer_ctx *ctx = (struct answer_ctx *)user_data;
+	struct address_rrset_state *rrset;
 	enum dns_rr_type type;
 	bool include_name_ptr = true;
 	const uint8_t *addr;
 	uint16_t addr_len;
-	int ret;
 
 	if (ctx->error < 0) {
 		return;
@@ -1005,12 +1055,11 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 	}
 
 	ctx->candidate_count++;
-	ret = mdns_addr_known(ctx, type, addr, addr_len);
-	if (ret < 0) {
-		ctx->error = ret;
-		return;
-	}
-	if (ret > 0) {
+	rrset = address_rrset_state(ctx, type);
+	/* RFC 6762 Section 10.2 requires every member when any member of a
+	 * unique RRset is sent. Suppress the RRset only when all members are known.
+	 */
+	if (rrset->known == rrset->total) {
 		return;
 	}
 
@@ -1078,6 +1127,17 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 	}
 	if (IS_ENABLED(CONFIG_NET_IPV6)) {
 		net_if_ipv6_addr_foreach(iface, collect_address_types_cb, &address_types);
+	}
+	if (qtype == DNS_RR_TYPE_A || qtype == DNS_RR_TYPE_AAAA || qtype == DNS_RR_TYPE_ANY) {
+		if (IS_ENABLED(CONFIG_NET_IPV4)) {
+			net_if_ipv4_addr_foreach(iface, inspect_address_cb, &ctx);
+		}
+		if (IS_ENABLED(CONFIG_NET_IPV6)) {
+			net_if_ipv6_addr_foreach(iface, inspect_address_cb, &ctx);
+		}
+		if (ctx.error < 0) {
+			return ctx.error;
+		}
 	}
 
 	if ((qtype == DNS_RR_TYPE_A) && IS_ENABLED(CONFIG_NET_IPV4)) {
