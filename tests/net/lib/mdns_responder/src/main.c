@@ -2707,18 +2707,25 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_nsec_queries)
 	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
 	check_service_instance_nsec_answer(response_pkts[0], false);
 
+	query[qtype_low] = DNS_RR_TYPE_CNAME;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a CNAME NSEC response");
+	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 0U);
+	check_service_instance_nsec_answer(response_pkts[1], false);
+
 	query[qtype_low] = DNS_RR_TYPE_NSEC;
 	query[sizeof(query) - 2U] = 0x80U;
 	query[sizeof(query) - 1U] = DNS_CLASS_IN;
 	send_msg(query, sizeof(query));
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Did not receive an explicit NSEC response");
-	header = NET_IPV6_HDR(response_pkts[1]);
+	header = NET_IPV6_HDR(response_pkts[2]);
 	zassert_true(net_ipv6_addr_cmp_raw(header->dst, (const uint8_t *)&sender_ll_addr),
 		     "QU NSEC response was not unicast to the querier");
 	zassert_equal(header->hop_limit, 255U, "QU NSEC response used the wrong hop limit");
-	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 0U);
-	check_service_instance_nsec_answer(response_pkts[1], false);
+	check_service_instance_header(response_pkts[2], 0U, 0U, 1U, 0U);
+	check_service_instance_nsec_answer(response_pkts[2], false);
 
 	query[0] = 0x12U;
 	query[1] = 0x34U;
@@ -2728,9 +2735,9 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_nsec_queries)
 	send_msg_from_port(query, sizeof(query), 45678U);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Did not receive a legacy PTR NSEC response");
-	check_service_instance_header(response_pkts[2], 0x1234U, 1U, 1U, 0U);
-	check_service_instance_question(response_pkts[2], DNS_RR_TYPE_PTR);
-	check_service_instance_nsec_answer(response_pkts[2], true);
+	check_service_instance_header(response_pkts[3], 0x1234U, 1U, 1U, 0U);
+	check_service_instance_question(response_pkts[3], DNS_RR_TYPE_PTR);
+	check_service_instance_nsec_answer(response_pkts[3], true);
 }
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_nsec_known_answer_suppression)
