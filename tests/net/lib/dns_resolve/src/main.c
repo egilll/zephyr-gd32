@@ -1744,6 +1744,49 @@ ZTEST(dns_resolve, test_dns_unpack_query_classes)
 	}
 }
 
+ZTEST(dns_resolve, test_dns_unpack_query_cname)
+{
+	uint8_t query[] = {
+		0U,
+		0U,
+		0U,
+		0U,
+		0U,
+		1U,
+		0U,
+		0U,
+		0U,
+		0U,
+		0U,
+		0U,
+		1U,
+		'a',
+		0U,
+		0U,
+		DNS_RR_TYPE_CNAME,
+		0U,
+		DNS_CLASS_IN,
+	};
+	struct dns_msg_t msg = {
+		.msg = query,
+		.msg_size = sizeof(query),
+		.query_offset = DNS_MSG_HEADER_SIZE,
+	};
+	enum dns_rr_type type;
+	struct net_buf *result;
+	int ret;
+
+	result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+	zassert_not_null(result, "Failed to allocate query-name buffer");
+
+	ret = dns_unpack_query(&msg, result, &type, NULL);
+	zassert_equal(ret, 1, "CNAME question was rejected");
+	zassert_equal(type, DNS_RR_TYPE_CNAME, "Wrong parsed query type");
+	zassert_mem_equal(result->data, "a", sizeof("a"), "Wrong parsed query name");
+
+	net_buf_unref(result);
+}
+
 ZTEST(dns_resolve, test_dns_pack_qname)
 {
 	static const uint8_t expected[] = {
