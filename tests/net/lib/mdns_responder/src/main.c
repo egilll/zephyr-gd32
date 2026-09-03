@@ -1068,6 +1068,137 @@ static const uint8_t service_instance_srv_query[] = {
 	0x01,
 };
 
+static const uint8_t service_instance_srv_known_answer_query[] = {
+	/* Header: one question and one known answer */
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x01,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	/* zephyr._foo._udp.local, SRV, class IN */
+	0x06,
+	0x7a,
+	0x65,
+	0x70,
+	0x68,
+	0x79,
+	0x72,
+	0x04,
+	0x5f,
+	0x66,
+	0x6f,
+	0x6f,
+	0x04,
+	0x5f,
+	0x75,
+	0x64,
+	0x70,
+	0x05,
+	0x6c,
+	0x6f,
+	0x63,
+	0x61,
+	0x6c,
+	0x00,
+	0x00,
+	0x21,
+	0x00,
+	0x01,
+	/* Known SRV: priority 0, weight 0, port 5353, target zephyr.local */
+	0xc0,
+	0x0c,
+	0x00,
+	0x21,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x00,
+	0x78,
+	0x00,
+	0x0f,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x14,
+	0xe9,
+	0x06,
+	0x7a,
+	0x65,
+	0x70,
+	0x68,
+	0x79,
+	0x72,
+	0xc0,
+	0x1d,
+};
+
+static const uint8_t service_instance_txt_known_answer_query[] = {
+	/* Header: one question and one known answer */
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x01,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	/* zephyr._foo._udp.local, TXT, class IN */
+	0x06,
+	0x7a,
+	0x65,
+	0x70,
+	0x68,
+	0x79,
+	0x72,
+	0x04,
+	0x5f,
+	0x66,
+	0x6f,
+	0x6f,
+	0x04,
+	0x5f,
+	0x75,
+	0x64,
+	0x70,
+	0x05,
+	0x6c,
+	0x6f,
+	0x63,
+	0x61,
+	0x6c,
+	0x00,
+	0x00,
+	0x10,
+	0x00,
+	0x01,
+	/* Known empty TXT */
+	0xc0,
+	0x0c,
+	0x00,
+	0x10,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x11,
+	0x94,
+	0x00,
+	0x00,
+};
+
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_query)
 {
 	send_msg(service_instance_srv_query, sizeof(service_instance_srv_query));
@@ -1090,6 +1221,41 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_txt_query)
 
 	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_known_answer_suppression)
+{
+	uint8_t query[sizeof(service_instance_srv_known_answer_query)];
+
+	memcpy(query, service_instance_srv_known_answer_query, sizeof(query));
+	send_msg(query, sizeof(query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Fresh SRV known answer was not suppressed");
+	zassert_equal(responses_count, 0U, "Fresh SRV known answer produced a response");
+
+	query[57] = 0xe8;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Different SRV known answer did not receive a response");
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_txt_known_answer_suppression)
+{
+	uint8_t query[sizeof(service_instance_txt_known_answer_query)];
+
+	memcpy(query, service_instance_txt_known_answer_query, sizeof(query));
+	send_msg(query, sizeof(query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Fresh TXT known answer was not suppressed");
+	zassert_equal(responses_count, 0U, "Fresh TXT known answer produced a response");
+
+	query[48] = 0x08;
+	query[49] = 0xc9;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Stale TXT known answer did not receive a response");
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
 }
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_query)
