@@ -278,6 +278,28 @@ static bool domain_is_valid(const char *domain)
 	return domain_size;
 }
 
+static bool txt_is_valid(const char *text, size_t text_size)
+{
+	const uint8_t *data = (const uint8_t *)text;
+	size_t offset = 0U;
+
+	if (text == NULL || text_size > UINT16_MAX) {
+		return false;
+	}
+
+	while (offset < text_size) {
+		size_t item_size = data[offset++];
+
+		if (item_size > text_size - offset) {
+			return false;
+		}
+
+		offset += item_size;
+	}
+
+	return true;
+}
+
 static bool hostname_is_valid(const char *hostname)
 {
 	size_t hostname_size;
@@ -300,15 +322,10 @@ static bool hostname_is_valid(const char *hostname)
  */
 bool rec_is_valid(const struct dns_sd_rec *inst)
 {
-	return true
-	       && inst != NULL
-	       && instance_is_valid(inst->instance)
-	       && service_is_valid(inst->service)
-	       && proto_is_valid(inst->proto)
-	       && domain_is_valid(inst->domain)
-	       && inst->text != NULL
-	       && inst->port != NULL
-	;
+	return true && inst != NULL && instance_is_valid(inst->instance) &&
+	       service_is_valid(inst->service) && proto_is_valid(inst->proto) &&
+	       domain_is_valid(inst->domain) && txt_is_valid(inst->text, inst->text_size) &&
+	       inst->port != NULL;
 }
 
 bool dns_sd_rec_is_valid(const struct dns_sd_rec *rec)
@@ -489,10 +506,14 @@ int add_txt_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		   uint16_t instance_offset, uint8_t *buf,
 		   uint16_t buf_offset, uint16_t buf_size)
 {
-	uint16_t total_size;
+	size_t total_size;
 	struct dns_rr *rr;
 	uint16_t inst_offs;
 	uint16_t offset = buf_offset;
+
+	if (!rec_is_valid(inst)) {
+		return -EINVAL;
+	}
 
 	if ((DNS_SD_PTR_MASK & instance_offset) != 0) {
 		NET_DBG("offset %u too big for message compression",
@@ -506,8 +527,8 @@ int add_txt_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		DNS_POINTER_SIZE + sizeof(*rr) + dns_sd_txt_size(inst);
 
 	if (offset > buf_size || total_size > buf_size - offset) {
-		NET_DBG("Buffer too small. required: %u available: %d",
-			total_size, (int)buf_size - (int)offset);
+		NET_DBG("Buffer too small. required: %zu available: %d", total_size,
+			(int)buf_size - (int)offset);
 		return -ENOSPC;
 	}
 
