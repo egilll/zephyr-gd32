@@ -803,9 +803,15 @@ static size_t append_reverse_known_answer(uint8_t *query, size_t offset, uint32_
 	return offset;
 }
 
-static size_t append_reverse_known_nsec(uint8_t *query, size_t offset, uint32_t ttl)
+static size_t append_known_nsec(uint8_t *query, size_t offset, enum dns_rr_type existing_type,
+				uint32_t ttl)
 {
-	static const uint8_t ptr_bitmap[] = {0U, 2U, 0U, BIT(3)};
+	uint8_t bitmap[2U + sizeof(uint32_t)] = {0};
+	size_t bitmap_len = existing_type / 8U + 1U;
+	size_t rdata_size = DNS_POINTER_SIZE + 2U + bitmap_len;
+
+	bitmap[1] = bitmap_len;
+	bitmap[2U + existing_type / 8U] = BIT(7U - existing_type % 8U);
 
 	query[7] = 1U;
 	query[offset++] = NS_CMPRSFLGS;
@@ -816,13 +822,13 @@ static size_t append_reverse_known_nsec(uint8_t *query, size_t offset, uint32_t 
 	offset += DNS_QCLASS_LEN;
 	sys_put_be32(ttl, &query[offset]);
 	offset += DNS_TTL_LEN;
-	sys_put_be16(DNS_POINTER_SIZE + sizeof(ptr_bitmap), &query[offset]);
+	sys_put_be16(rdata_size, &query[offset]);
 	offset += DNS_RDLENGTH_LEN;
 	query[offset++] = NS_CMPRSFLGS;
 	query[offset++] = sizeof(struct dns_header);
-	memcpy(&query[offset], ptr_bitmap, sizeof(ptr_bitmap));
+	memcpy(&query[offset], bitmap, 2U + bitmap_len);
 
-	return offset + sizeof(ptr_bitmap);
+	return offset + 2U + bitmap_len;
 }
 
 static void check_reverse_response(struct net_pkt *pkt, bool legacy, enum dns_rr_type qtype,
@@ -886,6 +892,47 @@ static void check_reverse_nsec_response(struct net_pkt *pkt, bool legacy, enum d
 		zassert_equal(value, qtype, "Repeated question has the wrong type");
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
 		zassert_equal(value, qclass, "Repeated question has the wrong class");
+	}
+
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_NSEC, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_),
+		      legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Unexpected answer class");
+	zassert_equal(net_ntohl(record.ttl), legacy ? 10U : CONFIG_MDNS_RESPONDER_TTL,
+		      "Unexpected answer TTL");
+	zassert_equal(net_ntohs(record.rdlength), DNS_POINTER_SIZE + sizeof(bitmap),
+		      "Unexpected NSEC length");
+	zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
+	zassert_equal(value, 0xc00c, "NSEC next name does not point to its owner");
+	zassert_ok(net_pkt_read(pkt, bitmap, sizeof(bitmap)), "net_pkt read failed");
+	zassert_mem_equal(bitmap, expected_bitmap, sizeof(bitmap), "Unexpected NSEC bitmap");
+}
+
+static void check_host_nsec_response(struct net_pkt *pkt, bool legacy, uint16_t id)
+{
+	static const uint8_t expected_bitmap[] = {0U, 4U, 0U, 0U, 0U, BIT(3)};
+	struct dns_header header;
+	struct dns_rr record;
+	uint8_t bitmap[sizeof(expected_bitmap)];
+	uint16_t value;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "net_pkt skip failed");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "net_pkt read failed");
+	zassert_equal(net_ntohs(header.id), legacy ? id : 0U, "Unexpected response ID");
+	zassert_equal(net_ntohs(header.qdcount), legacy ? 1U : 0U, "Unexpected question count");
+	zassert_equal(net_ntohs(header.ancount), 1U, "Unexpected answer count");
+	zassert_equal(net_ntohs(header.arcount), 0U, "Unexpected additional count");
+
+	if (legacy) {
+		skip_labels(pkt);
+		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
+		zassert_equal(value, DNS_RR_TYPE_A, "Repeated question has the wrong type");
+		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
+		zassert_equal(value, DNS_CLASS_IN, "Repeated question has the wrong class");
 	}
 
 	skip_labels(pkt);
@@ -1279,6 +1326,49 @@ ZTEST(test_mdns_responder, test_hostname_known_answer_suppression)
 	zassert_equal(responses_count, 3U, "Complete host known answers produced a response");
 }
 
+ZTEST(test_mdns_responder, test_hostname_missing_address_nsec)
+{
+	static const uint8_t a_query[] = {/* Header: one question */
+					  0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+					  0x00, 0x00, 0x00,
+					  /* zephyr.local, A, class IN */
+					  0x06, 0x7a, 0x65, 0x70, 0x68, 0x79, 0x72, 0x05, 0x6c,
+					  0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x01, 0x00, 0x01};
+	static const uint16_t query_id = 0x4321;
+	uint8_t query[sizeof(a_query) + sizeof(struct dns_rr) + 10U];
+	size_t query_size;
+
+	memcpy(query, a_query, sizeof(a_query));
+	send_msg(query, sizeof(a_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No missing-A NSEC response");
+	check_host_nsec_response(response_pkts[0], false, 0U);
+
+	memcpy(query, a_query, sizeof(a_query));
+	sys_put_be16(query_id, query);
+	send_msg_from_port(query, sizeof(a_query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No legacy missing-A NSEC response");
+	check_host_nsec_response(response_pkts[1], true, query_id);
+	zassert_true(net_ipv6_addr_cmp_raw(NET_IPV6_HDR(response_pkts[1])->dst,
+					   (const uint8_t *)&sender_ll_addr),
+		     "Legacy NSEC response was not unicast");
+
+	memcpy(query, a_query, sizeof(a_query));
+	query_size = append_known_nsec(query, sizeof(a_query), DNS_RR_TYPE_AAAA,
+				       CONFIG_MDNS_RESPONDER_TTL);
+	send_msg(query, query_size);
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Fresh host NSEC known answer was not suppressed");
+	zassert_equal(responses_count, 2U, "Fresh host NSEC produced a response");
+
+	memcpy(query, a_query, sizeof(a_query));
+	query_size = append_known_nsec(query, sizeof(a_query), DNS_RR_TYPE_AAAA,
+				       CONFIG_MDNS_RESPONDER_TTL / 2U - 1U);
+	send_msg(query, query_size);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Stale host NSEC did not receive a response");
+	check_host_nsec_response(response_pkts[2], false, 0U);
+}
+
 ZTEST(test_mdns_responder, test_reverse_ptr_queries)
 {
 	struct net_addr addr = {0};
@@ -1385,15 +1475,16 @@ ZTEST(test_mdns_responder, test_reverse_nsec_known_answer_suppression)
 	size_t query_size;
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
-	query_size = append_reverse_known_nsec(query, query_size, CONFIG_MDNS_RESPONDER_TTL);
+	query_size =
+		append_known_nsec(query, query_size, DNS_RR_TYPE_PTR, CONFIG_MDNS_RESPONDER_TTL);
 	send_msg(query, query_size);
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
 		      "Fresh reverse NSEC known answer was not suppressed");
 	zassert_equal(responses_count, 0U, "Fresh reverse NSEC produced a response");
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
-	query_size =
-		append_reverse_known_nsec(query, query_size, CONFIG_MDNS_RESPONDER_TTL / 2U - 1U);
+	query_size = append_known_nsec(query, query_size, DNS_RR_TYPE_PTR,
+				       CONFIG_MDNS_RESPONDER_TTL / 2U - 1U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Stale reverse NSEC did not receive a response");
