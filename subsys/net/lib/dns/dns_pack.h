@@ -222,7 +222,7 @@ static inline int dns_header_aa(uint8_t *header)
 }
 
 /** It returns the TC field in the DNS msg header	*/
-static inline int dns_header_tc(uint8_t *header)
+static inline int dns_header_tc(const uint8_t *header)
 {
 	return ((*(header + 2)) & 0x02) ? 1 : 0;
 }
@@ -305,27 +305,26 @@ static inline int dns_unpack_query_qclass(const uint8_t *question)
 	return net_ntohs(UNALIGNED_GET((uint16_t *)(question + 2)));
 }
 
-static inline int dns_answer_type(uint16_t dname_size, uint8_t *answer)
+static inline int dns_answer_type(uint16_t dname_size, const uint8_t *answer)
 {
 	/* 4.1.3. Resource record format */
-	return net_ntohs(UNALIGNED_GET((uint16_t *)(answer + dname_size + 0)));
+	return net_ntohs(UNALIGNED_GET((const uint16_t *)(answer + dname_size + 0)));
 }
 
-static inline int dns_answer_class(uint16_t dname_size, uint8_t *answer)
+static inline int dns_answer_class(uint16_t dname_size, const uint8_t *answer)
 {
 	/* 4.1.3. Resource record format */
-	return net_ntohs(UNALIGNED_GET((uint16_t *)(answer + dname_size + 2)));
+	return net_ntohs(UNALIGNED_GET((const uint16_t *)(answer + dname_size + 2)));
 }
 
-static inline int dns_answer_ttl(uint16_t dname_size, uint8_t *answer)
+static inline int dns_answer_ttl(uint16_t dname_size, const uint8_t *answer)
 {
-	return net_ntohl(UNALIGNED_GET((uint32_t *)(answer + dname_size + 4)));
+	return net_ntohl(UNALIGNED_GET((const uint32_t *)(answer + dname_size + 4)));
 }
 
-static inline int dns_answer_rdlength(uint16_t dname_size,
-					     uint8_t *answer)
+static inline int dns_answer_rdlength(uint16_t dname_size, const uint8_t *answer)
 {
-	return net_ntohs(UNALIGNED_GET((uint16_t *)(answer + dname_size + 8)));
+	return net_ntohs(UNALIGNED_GET((const uint16_t *)(answer + dname_size + 8)));
 }
 
 static inline int dns_unpack_srv_priority(const uint8_t *srv)
