@@ -521,10 +521,16 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 	const uint8_t *end_of_label = NULL;
 	const uint8_t *curr_src = src;
 	size_t wire_size = 1U;
+	uint16_t initial_len;
 	int loop_check = 0, len = -1;
 	int label_len;
 	int val;
 
+	if (msg == NULL || src == NULL || buf == NULL || maxlen <= 0) {
+		return -EINVAL;
+	}
+
+	initial_len = buf->len;
 	if (curr_src < msg || curr_src >= (msg + maxlen)) {
 		return -EMSGSIZE;
 	}
@@ -536,7 +542,7 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 			size_t pos;
 
 			if (curr_src >= (msg + maxlen)) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			if (len < 0) {
@@ -551,17 +557,17 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 			/* Strip compress bits from length calculation */
 			pos = ((val & 0x3f) << 8) | (*curr_src & 0xff);
 			if (pos >= pointer_offset) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			curr_src = msg + pos;
 			if (curr_src >= (msg + maxlen)) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			loop_check += 2;
 			if (loop_check >= maxlen) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 		} else {
 			size_t dest_size = net_buf_tailroom(buf);
@@ -570,17 +576,17 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 			/* The top two bits are reserved for compression. */
 			label_len = val;
 			if (label_len > DNS_LABEL_MAX_SIZE) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			wire_size += DNS_LABEL_LEN_SIZE + label_len;
 			if (wire_size > DNS_NAME_MAX_SIZE) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			if ((separator_size + label_len + 1U > dest_size) ||
 			    ((curr_src + label_len) >= (msg + maxlen))) {
-				return -EMSGSIZE;
+				goto malformed;
 			}
 
 			loop_check += label_len + 1;
@@ -606,6 +612,10 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 	}
 
 	return buf->len;
+
+malformed:
+	buf->len = initial_len;
+	return -EMSGSIZE;
 }
 
 const char *dns_qtype_to_str(enum dns_rr_type qtype)
