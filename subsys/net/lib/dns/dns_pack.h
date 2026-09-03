@@ -478,8 +478,8 @@ static inline int llmnr_unpack_query_header(struct dns_msg_t *msg,
  * @retval 0 on success
  * @retval -ENOMEM if the null label is not found after traversing the buffer
  *         or if QCLASS and QTYPE are not found.
- * @retval -EINVAL if QTYPE is not "A" (IPv4) or "AAAA" (IPv6) or if QCLASS
- *         is not "IN".
+ * @retval -EINVAL if QTYPE is unsupported or QCLASS is neither "IN" nor
+ *         "ANY".
  */
 int dns_unpack_query(struct dns_msg_t *dns_msg, struct net_buf *buf,
 		     enum dns_rr_type *qtype,
