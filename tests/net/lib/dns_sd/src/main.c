@@ -702,6 +702,11 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	/* IPv4 case */
 	int v4;
 	struct net_in_addr addr_v4_expect = { { { 224, 0, 0, 251 } } };
+	struct net_sockaddr_in src_v4 = {
+		.sin_family = NET_AF_INET,
+		.sin_port = 12345,
+		.sin_addr = {{{192, 0, 2, 1}}},
+	};
 
 	memset(&dst, 0, sizeof(struct net_sockaddr));
 
@@ -718,6 +723,19 @@ ZTEST(dns_sd, test_setup_dst_addr)
 				       &net_sin(&dst)->sin_addr), "");
 	zassert_equal(8, dst_len, "");
 
+	memset(&dst, 0, sizeof(struct net_sockaddr));
+	zassert_equal(0,
+		      setup_dst_addr(v4, NET_AF_INET, (struct net_sockaddr *)&src_v4,
+				     sizeof(src_v4), true, &dst, &dst_len),
+		      "");
+
+	optlen = sizeof(int);
+	(void)zsock_getsockopt(v4, NET_IPPROTO_IP, ZSOCK_IP_TTL, &ttl, &optlen);
+
+	zassert_equal(255, ttl, "Unicast TTL invalid (%d vs %d)", 255, ttl);
+	zassert_mem_equal(&dst, &src_v4, sizeof(src_v4));
+	zassert_equal(sizeof(src_v4), dst_len, "");
+
 	(void)zsock_close(v4);
 
 #if defined(CONFIG_NET_IPV6)
@@ -725,6 +743,11 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	int v6;
 	struct net_in6_addr addr_v6_expect = { { { 0xff, 0x02, 0, 0, 0, 0, 0, 0,
 						   0, 0, 0, 0, 0, 0, 0, 0xfb } } };
+	struct net_sockaddr_in6 src_v6 = {
+		.sin6_family = NET_AF_INET6,
+		.sin6_port = 12345,
+		.sin6_addr = {{{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}}},
+	};
 
 	memset(&dst, 0, sizeof(struct net_sockaddr));
 
@@ -740,6 +763,19 @@ ZTEST(dns_sd, test_setup_dst_addr)
 	zassert_true(net_ipv6_addr_cmp(&addr_v6_expect,
 				       &net_sin6(&dst)->sin6_addr), "");
 	zassert_equal(24, dst_len, "");
+
+	memset(&dst, 0, sizeof(struct net_sockaddr));
+	zassert_equal(0,
+		      setup_dst_addr(v6, NET_AF_INET6, (struct net_sockaddr *)&src_v6,
+				     sizeof(src_v6), true, &dst, &dst_len),
+		      "");
+
+	optlen = sizeof(int);
+	(void)zsock_getsockopt(v6, NET_IPPROTO_IPV6, ZSOCK_IPV6_UNICAST_HOPS, &ttl, &optlen);
+
+	zassert_equal(255, ttl, "Unicast hop limit invalid (%d vs %d)", 255, ttl);
+	zassert_mem_equal(&dst, &src_v6, sizeof(src_v6));
+	zassert_equal(sizeof(src_v6), dst_len, "");
 
 	(void)zsock_close(v6);
 #endif
