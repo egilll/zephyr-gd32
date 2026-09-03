@@ -1329,13 +1329,13 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	txt_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_TXT_TTL;
 	ptr_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_PTR_TTL;
 	include_srv = (query->type == DNS_RR_TYPE_SRV || query->type == DNS_RR_TYPE_ANY ||
-		       query->type == DNS_RR_TYPE_PTR) &&
+		       query->browse) &&
 		      !query->suppress_srv;
 	include_txt = (query->type == DNS_RR_TYPE_TXT || query->type == DNS_RR_TYPE_ANY ||
-		       query->type == DNS_RR_TYPE_PTR) &&
+		       query->browse) &&
 		      !query->suppress_txt;
 
-	if (!query->legacy && query->type == DNS_RR_TYPE_PTR) {
+	if (!query->legacy && query->browse) {
 		return dns_sd_handle_ptr_query(iface, inst, addr4, addr6, buf, buf_size, false);
 	}
 
@@ -1347,7 +1347,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	memset(header, 0, sizeof(*header));
 
 	if (query->legacy) {
-		if (query->type == DNS_RR_TYPE_PTR) {
+		if (query->browse) {
 			ret = dns_sd_buf_add_service_name(&output, inst);
 		} else {
 			ret = dns_sd_buf_add_instance_name(&output, inst);
@@ -1367,7 +1367,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		}
 	}
 
-	if (query->type == DNS_RR_TYPE_PTR) {
+	if (query->browse) {
 		ret = dns_sd_buf_add_ptr(&output, inst, ptr_ttl);
 		if (ret < 0) {
 			return ret;
@@ -1380,7 +1380,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		if (ret < 0) {
 			return ret;
 		}
-		if (query->type == DNS_RR_TYPE_PTR) {
+		if (query->browse) {
 			additional_count++;
 		} else {
 			answer_count++;
@@ -1392,7 +1392,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		if (ret < 0) {
 			return ret;
 		}
-		if (query->type == DNS_RR_TYPE_PTR) {
+		if (query->browse) {
 			additional_count++;
 		} else {
 			answer_count++;
@@ -1453,7 +1453,8 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst, const struct 
 	struct dns_rr *rr;
 	struct dns_header *const rsp = (struct dns_header *)buf;
 
-	if (!rec_is_valid(inst) || request == NULL || request->type != DNS_RR_TYPE_PTR) {
+	if (!rec_is_valid(inst) || request == NULL ||
+	    (request->type != DNS_RR_TYPE_PTR && request->type != DNS_RR_TYPE_ANY)) {
 		return -EINVAL;
 	}
 
@@ -1501,7 +1502,7 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst, const struct 
 	offset += sizeof(query_name);
 
 	if (request->legacy) {
-		sys_put_be16(DNS_RR_TYPE_PTR, &buf[offset]);
+		sys_put_be16(request->type, &buf[offset]);
 		offset += DNS_QTYPE_LEN;
 		sys_put_be16(DNS_CLASS_IN, &buf[offset]);
 		offset += DNS_QCLASS_LEN;
