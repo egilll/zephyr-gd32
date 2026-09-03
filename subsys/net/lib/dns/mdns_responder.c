@@ -284,9 +284,9 @@ static size_t external_records_count;
 #define BUF_ALLOC_TIMEOUT K_MSEC(100)
 
 #ifndef CONFIG_NET_TEST
-static int setup_dst_addr(int sock, net_sa_family_t family,
-			  struct net_sockaddr *src, net_socklen_t src_len,
-			  struct net_sockaddr *dst, net_socklen_t *dst_len);
+static int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
+			  net_socklen_t src_len, bool unicast, struct net_sockaddr *dst,
+			  net_socklen_t *dst_len);
 #endif /* CONFIG_NET_TEST */
 
 #define DNS_RESOLVER_MIN_BUF		2
@@ -380,14 +380,14 @@ static bool is_legacy_query(const struct net_sockaddr *src)
 	return false;
 }
 
-int setup_dst_addr(int sock, net_sa_family_t family,
-		   struct net_sockaddr *src, net_socklen_t src_len,
-		   struct net_sockaddr *dst, net_socklen_t *dst_len)
+int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
+		   net_socklen_t src_len, bool unicast, struct net_sockaddr *dst,
+		   net_socklen_t *dst_len)
 {
 	int ret;
 
 	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
-		if (is_legacy_query(src)) {
+		if (unicast && src != NULL) {
 			memcpy(dst, src, src_len);
 			*dst_len = src_len;
 		} else {
@@ -400,7 +400,7 @@ int setup_dst_addr(int sock, net_sa_family_t family,
 			}
 		}
 	} else if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
-		if (is_legacy_query(src)) {
+		if (unicast && src != NULL) {
 			memcpy(dst, src, src_len);
 			*dst_len = src_len;
 		} else {
@@ -625,14 +625,9 @@ static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
 	return 0;
 }
 
-static int send_response(int sock,
-			 net_sa_family_t family,
-			 struct net_sockaddr *src_addr,
-			 size_t addrlen,
-			 struct net_buf *query,
-			 enum dns_rr_type qtype,
-			 struct net_if *recv_if,
-			 uint16_t dns_id)
+static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
+			 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
+			 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id)
 {
 	struct net_if *iface;
 	net_socklen_t dst_len;
@@ -641,6 +636,7 @@ static int send_response(int sock,
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
 	ret = setup_dst_addr(sock, family, src_addr, addrlen,
+			     is_legacy_query(src_addr) || (qclass & DNS_CLASS_FLUSH) != 0,
 			     (struct net_sockaddr *)&dst, &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
@@ -680,12 +676,9 @@ static int send_response(int sock,
 	return ret;
 }
 
-static void send_sd_response(int sock,
-			     net_sa_family_t family,
-			     struct net_sockaddr *src_addr,
-			     size_t addrlen,
-			     struct net_buf *result,
-			     struct net_if *recv_if)
+static void send_sd_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
+			     size_t addrlen, struct net_buf *result, struct net_if *recv_if,
+			     enum dns_rr_type qtype, enum dns_class qclass, uint16_t dns_id)
 {
 	struct net_if *iface;
 	net_socklen_t dst_len;
@@ -713,6 +706,11 @@ static void send_sd_response(int sock,
 	size_t n = ARRAY_SIZE(label);
 	size_t rec_num;
 	size_t ext_rec_num = external_records_count;
+	struct dns_sd_query query = {
+		.type = qtype,
+		.id = dns_id,
+		.legacy = is_legacy_query(src_addr),
+	};
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
@@ -728,6 +726,7 @@ static void send_sd_response(int sock,
 	label[3] = domain_buf;
 
 	ret = setup_dst_addr(sock, family, src_addr, addrlen,
+			     query.legacy || (qclass & DNS_CLASS_FLUSH) != 0,
 			     (struct net_sockaddr *)&dst, &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
@@ -828,10 +827,10 @@ static void send_sd_response(int sock,
 					continue;
 				}
 			} else {
-				ret = dns_sd_handle_ptr_query(iface, record, addr4, addr6,
-						result->data, net_buf_max_len(result), false);
+				ret = dns_sd_handle_query(iface, record, addr4, addr6, &query,
+							  result->data, net_buf_max_len(result));
 				if (ret < 0) {
-					NET_DBG("dns_sd_handle_ptr_query() failed (%d)", ret);
+					NET_DBG("dns_sd_handle_query() failed (%d)", ret);
 					continue;
 				}
 			}
@@ -915,7 +914,11 @@ static int dns_read(int sock,
 
 		/* Handle only .local queries */
 		lquery = strrchr(result->data, '.');
-		if (!lquery || memcmp(lquery, (const void *){ ".local" }, 7)) {
+		if (!lquery || strcasecmp(lquery, ".local") != 0) {
+			continue;
+		}
+
+		if ((qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_IN) {
 			continue;
 		}
 
@@ -933,11 +936,13 @@ static int dns_read(int sock,
 			NET_DBG("%s %s %s to our hostname %s%s", "mDNS",
 				family == NET_AF_INET ? "IPv4" : "IPv6", "query",
 				hostname, ".local");
-			send_response(sock, family, src_addr, addrlen,
-				      result, qtype, recv_if, dns_id);
-		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD)
-			&& qtype == DNS_RR_TYPE_PTR) {
-			send_sd_response(sock, family, src_addr, addrlen, result, recv_if);
+			send_response(sock, family, src_addr, addrlen, result, qtype, qclass,
+				      recv_if, dns_id);
+		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD) &&
+			   (qtype == DNS_RR_TYPE_PTR || qtype == DNS_RR_TYPE_SRV ||
+			    qtype == DNS_RR_TYPE_TXT || qtype == DNS_RR_TYPE_ANY)) {
+			send_sd_response(sock, family, src_addr, addrlen, result, recv_if, qtype,
+					 qclass, dns_id);
 		}
 
 	} while (--queries);
@@ -2193,7 +2198,7 @@ static int send_unsolicited_response(struct net_if *iface,
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
-	ret = setup_dst_addr(sock, family, NULL, 0, (struct net_sockaddr *)&dst, &dst_len);
+	ret = setup_dst_addr(sock, family, NULL, 0, false, (struct net_sockaddr *)&dst, &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
 		return ret;

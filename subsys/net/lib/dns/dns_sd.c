@@ -1002,6 +1002,437 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	return offset;
 }
 
+struct dns_sd_buf {
+	uint8_t *data;
+	uint16_t size;
+	uint16_t offset;
+};
+
+static int dns_sd_buf_add(struct dns_sd_buf *buf, const void *data, size_t len)
+{
+	if (buf->offset > buf->size || len > buf->size - buf->offset) {
+		return -ENOSPC;
+	}
+
+	memcpy(&buf->data[buf->offset], data, len);
+	buf->offset += len;
+
+	return 0;
+}
+
+static int dns_sd_buf_add_u8(struct dns_sd_buf *buf, uint8_t value)
+{
+	return dns_sd_buf_add(buf, &value, sizeof(value));
+}
+
+static int dns_sd_buf_add_be16(struct dns_sd_buf *buf, uint16_t value)
+{
+	value = net_htons(value);
+	return dns_sd_buf_add(buf, &value, sizeof(value));
+}
+
+static int dns_sd_buf_add_be32(struct dns_sd_buf *buf, uint32_t value)
+{
+	value = net_htonl(value);
+	return dns_sd_buf_add(buf, &value, sizeof(value));
+}
+
+static int dns_sd_buf_add_name(struct dns_sd_buf *buf, const char *const *labels,
+			       size_t label_count)
+{
+	int ret;
+
+	for (size_t i = 0; i < label_count; ++i) {
+		size_t label_size = strlen(labels[i]);
+
+		if (label_size > DNS_LABEL_MAX_SIZE) {
+			return -EINVAL;
+		}
+
+		ret = dns_sd_buf_add_u8(buf, label_size);
+		if (ret < 0) {
+			return ret;
+		}
+
+		ret = dns_sd_buf_add(buf, labels[i], label_size);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+
+	return dns_sd_buf_add_u8(buf, 0U);
+}
+
+static int dns_sd_buf_add_instance_name(struct dns_sd_buf *buf, const struct dns_sd_rec *inst)
+{
+	const char *const labels[] = {
+		inst->instance,
+		inst->service,
+		inst->proto,
+		inst->domain,
+	};
+
+	return dns_sd_buf_add_name(buf, labels, ARRAY_SIZE(labels));
+}
+
+static int dns_sd_buf_add_service_name(struct dns_sd_buf *buf, const struct dns_sd_rec *inst)
+{
+	const char *const labels[] = {
+		inst->service,
+		inst->proto,
+		inst->domain,
+	};
+
+	return dns_sd_buf_add_name(buf, labels, ARRAY_SIZE(labels));
+}
+
+static int dns_sd_buf_add_host_name(struct dns_sd_buf *buf, const struct dns_sd_rec *inst)
+{
+	const char *const labels[] = {
+		net_hostname_get(),
+		inst->domain,
+	};
+
+	if (!hostname_is_valid(labels[0])) {
+		return -EINVAL;
+	}
+
+	return dns_sd_buf_add_name(buf, labels, ARRAY_SIZE(labels));
+}
+
+static int dns_sd_buf_add_rr_header(struct dns_sd_buf *buf, enum dns_rr_type type, uint32_t ttl,
+				    uint16_t rdlength, bool legacy)
+{
+	int ret;
+
+	ret = dns_sd_buf_add_be16(buf, type);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_be16(buf, DNS_CLASS_IN | (legacy ? 0U : DNS_CLASS_FLUSH));
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_be32(buf, ttl);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return dns_sd_buf_add_be16(buf, rdlength);
+}
+
+static int dns_sd_buf_add_txt(struct dns_sd_buf *buf, const struct dns_sd_rec *inst, uint32_t ttl,
+			      bool legacy)
+{
+	int ret;
+
+	ret = dns_sd_buf_add_instance_name(buf, inst);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_rr_header(buf, DNS_RR_TYPE_TXT, ttl, dns_sd_txt_size(inst), legacy);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return dns_sd_buf_add(buf, inst->text, dns_sd_txt_size(inst));
+}
+
+static int dns_sd_buf_add_srv(struct dns_sd_buf *buf, const struct dns_sd_rec *inst, uint32_t ttl,
+			      bool legacy)
+{
+	const char *host = net_hostname_get();
+	size_t host_size;
+	size_t domain_size = strlen(inst->domain);
+	uint16_t rdlength;
+	uint16_t zero = 0U;
+	int ret;
+
+	if (!hostname_is_valid(host)) {
+		return -EINVAL;
+	}
+
+	host_size = strlen(host);
+	rdlength = sizeof(struct dns_srv_rdata) + DNS_LABEL_LEN_SIZE + host_size +
+		   DNS_LABEL_LEN_SIZE + domain_size + DNS_LABEL_LEN_SIZE;
+
+	ret = dns_sd_buf_add_instance_name(buf, inst);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_rr_header(buf, DNS_RR_TYPE_SRV, ttl, rdlength, legacy);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add(buf, &zero, sizeof(zero));
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add(buf, &zero, sizeof(zero));
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add(buf, inst->port, sizeof(*inst->port));
+	if (ret < 0) {
+		return ret;
+	}
+
+	return dns_sd_buf_add_host_name(buf, inst);
+}
+
+static int dns_sd_buf_add_ptr(struct dns_sd_buf *buf, const struct dns_sd_rec *inst, uint32_t ttl)
+{
+	uint16_t rdlength = DNS_LABEL_LEN_SIZE + strlen(inst->instance) + service_proto_size(inst);
+	int ret;
+
+	ret = dns_sd_buf_add_service_name(buf, inst);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_rr_header(buf, DNS_RR_TYPE_PTR, ttl, rdlength, true);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return dns_sd_buf_add_instance_name(buf, inst);
+}
+
+struct dns_sd_addr_ctx {
+	struct dns_sd_buf *buf;
+	const struct dns_sd_rec *inst;
+	const struct net_in_addr *skip_addr4;
+	const struct net_in6_addr *skip_addr6;
+	uint32_t ttl;
+	uint16_t count;
+	bool legacy;
+};
+
+static int dns_sd_buf_add_addr(struct dns_sd_addr_ctx *ctx, enum dns_rr_type type,
+			       const uint8_t *addr, uint16_t addr_size)
+{
+	uint16_t initial_offset = ctx->buf->offset;
+	int ret;
+
+	ret = dns_sd_buf_add_host_name(ctx->buf, ctx->inst);
+	if (ret < 0) {
+		ctx->buf->offset = initial_offset;
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_rr_header(ctx->buf, type, ctx->ttl, addr_size, ctx->legacy);
+	if (ret < 0) {
+		ctx->buf->offset = initial_offset;
+		return ret;
+	}
+
+	ret = dns_sd_buf_add(ctx->buf, addr, addr_size);
+	if (ret < 0) {
+		ctx->buf->offset = initial_offset;
+		return ret;
+	}
+
+	ctx->count++;
+	return 0;
+}
+
+static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, void *user_data)
+{
+	struct dns_sd_addr_ctx *ctx = user_data;
+
+	if (ifaddr->addr_state != NET_ADDR_PREFERRED && ifaddr->addr_state != NET_ADDR_DEPRECATED) {
+		return;
+	}
+
+	if (ifaddr->address.family == NET_AF_INET6) {
+		if (ctx->skip_addr6 != NULL &&
+		    net_ipv6_addr_cmp(&ifaddr->address.in6_addr, ctx->skip_addr6)) {
+			return;
+		}
+
+		(void)dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_AAAA, ifaddr->address.in6_addr.s6_addr,
+					  sizeof(ifaddr->address.in6_addr));
+	} else {
+		if (ctx->skip_addr4 != NULL &&
+		    net_ipv4_addr_cmp(&ifaddr->address.in_addr, ctx->skip_addr4)) {
+			return;
+		}
+
+		(void)dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_A, ifaddr->address.in_addr.s4_addr,
+					  sizeof(ifaddr->address.in_addr));
+	}
+}
+
+static int dns_sd_service_available(const struct dns_sd_rec *inst, const struct net_in_addr *addr4,
+				    const struct net_in6_addr *addr6)
+{
+	uint16_t proto;
+
+	if (!rec_is_valid(inst)) {
+		return -EINVAL;
+	}
+
+	if (*(inst->port) == 0U) {
+		return -EHOSTDOWN;
+	}
+
+	if (strncasecmp("_tcp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
+		proto = NET_IPPROTO_TCP;
+	} else if (strncasecmp("_udp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
+		proto = NET_IPPROTO_UDP;
+	} else {
+		return -EINVAL;
+	}
+
+	return port_in_use(proto, net_ntohs(*(inst->port)), addr4, addr6) ? 0 : -EHOSTDOWN;
+}
+
+int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
+			const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
+			const struct dns_sd_query *query, uint8_t *buf, uint16_t buf_size)
+{
+	struct dns_header *header = (struct dns_header *)buf;
+	struct dns_sd_buf output = {
+		.data = buf,
+		.size = buf_size,
+		.offset = sizeof(*header),
+	};
+	struct dns_sd_addr_ctx addr_ctx;
+	uint32_t srv_ttl;
+	uint32_t txt_ttl;
+	uint32_t ptr_ttl;
+	uint16_t answer_count = 0U;
+	uint16_t additional_count = 0U;
+	int ret;
+
+	if (query == NULL || buf_size < sizeof(*header)) {
+		return -EINVAL;
+	}
+
+	addr_ctx = (struct dns_sd_addr_ctx){
+		.buf = &output,
+		.inst = inst,
+		.skip_addr4 = addr4,
+		.skip_addr6 = addr6,
+		.ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_A_TTL,
+		.legacy = query->legacy,
+	};
+	srv_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_SRV_TTL;
+	txt_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_TXT_TTL;
+	ptr_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_PTR_TTL;
+
+	if (!query->legacy && query->type == DNS_RR_TYPE_PTR) {
+		return dns_sd_handle_ptr_query(iface, inst, addr4, addr6, buf, buf_size, false);
+	}
+
+	ret = dns_sd_service_available(inst, addr4, addr6);
+	if (ret < 0) {
+		return ret;
+	}
+
+	memset(header, 0, sizeof(*header));
+
+	if (query->legacy) {
+		if (query->type == DNS_RR_TYPE_PTR) {
+			ret = dns_sd_buf_add_service_name(&output, inst);
+		} else {
+			ret = dns_sd_buf_add_instance_name(&output, inst);
+		}
+		if (ret < 0) {
+			return ret;
+		}
+
+		ret = dns_sd_buf_add_be16(&output, query->type);
+		if (ret < 0) {
+			return ret;
+		}
+
+		ret = dns_sd_buf_add_be16(&output, DNS_CLASS_IN);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+
+	if (query->type == DNS_RR_TYPE_PTR) {
+		ret = dns_sd_buf_add_ptr(&output, inst, ptr_ttl);
+		if (ret < 0) {
+			return ret;
+		}
+		answer_count++;
+	}
+
+	if (query->type == DNS_RR_TYPE_SRV || query->type == DNS_RR_TYPE_ANY ||
+	    query->type == DNS_RR_TYPE_PTR) {
+		ret = dns_sd_buf_add_srv(&output, inst, srv_ttl, query->legacy);
+		if (ret < 0) {
+			return ret;
+		}
+		if (query->type == DNS_RR_TYPE_PTR) {
+			additional_count++;
+		} else {
+			answer_count++;
+		}
+	}
+
+	if (query->type == DNS_RR_TYPE_TXT || query->type == DNS_RR_TYPE_ANY ||
+	    query->type == DNS_RR_TYPE_PTR) {
+		ret = dns_sd_buf_add_txt(&output, inst, txt_ttl, query->legacy);
+		if (ret < 0) {
+			return ret;
+		}
+		if (query->type == DNS_RR_TYPE_PTR) {
+			additional_count++;
+		} else {
+			answer_count++;
+		}
+	}
+
+	if (query->type == DNS_RR_TYPE_SRV || query->type == DNS_RR_TYPE_ANY ||
+	    query->type == DNS_RR_TYPE_PTR) {
+		if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
+			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_AAAA, addr6->s6_addr,
+						  sizeof(*addr6));
+			if (ret < 0) {
+				return ret;
+			}
+		}
+
+		if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
+			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_A, addr4->s4_addr,
+						  sizeof(*addr4));
+			if (ret < 0) {
+				return ret;
+			}
+		}
+
+		if (iface != NULL) {
+			if (IS_ENABLED(CONFIG_NET_IPV6)) {
+				net_if_ipv6_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
+			}
+			if (IS_ENABLED(CONFIG_NET_IPV4)) {
+				net_if_ipv4_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
+			}
+		}
+
+		additional_count += addr_ctx.count;
+	}
+
+	header->id = net_htons(query->legacy ? query->id : 0U);
+	header->flags = net_htons(BIT(15) | BIT(10));
+	header->qdcount = net_htons(query->legacy ? 1U : 0U);
+	header->ancount = net_htons(answer_count);
+	header->arcount = net_htons(additional_count);
+
+	return output.offset;
+}
+
 int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
 				    const struct net_in_addr *addr4,
 				    const struct net_in6_addr *addr6,

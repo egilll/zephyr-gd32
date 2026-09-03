@@ -23,8 +23,15 @@
 #define DNS_SD_SRV_TTL 120u
 #define DNS_SD_A_TTL 120u
 #define DNS_SD_AAAA_TTL 120u
+#define DNS_SD_LEGACY_TTL 10u
 
 #define DNS_SD_PTR_MASK (NS_CMPRSFLGS << 8)
+
+struct dns_sd_query {
+	enum dns_rr_type type;
+	uint16_t id;
+	bool legacy;
+};
 
 #ifdef __cplusplus
 extern "C" {
@@ -143,6 +150,28 @@ bool dns_sd_rec_match(const struct dns_sd_rec *record,
 int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
 	uint8_t *buf, uint16_t buf_size, bool announce);
+
+/**
+ * @brief Handle a matching DNS-SD question
+ *
+ * Builds PTR browse responses and direct SRV, TXT, and ANY service-instance
+ * responses. Legacy queries repeat the question and use conventional DNS
+ * response semantics required by RFC 6762 Section 6.7.
+ *
+ * @param iface the network interface the query was received on
+ * @param inst the matching DNS-SD record
+ * @param addr4 pointer to the IPv4 address, or NULL
+ * @param addr6 pointer to the IPv6 address, or NULL
+ * @param query metadata from the received question
+ * @param buf output buffer
+ * @param buf_size size of the output buffer
+ *
+ * @return on success, number of bytes written to @p buf
+ * @return on failure, a negative errno value
+ */
+int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
+			const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
+			const struct dns_sd_query *query, uint8_t *buf, uint16_t buf_size);
 
 /**
  * @brief Handle a Service Type Enumeration with DNS Service Discovery
