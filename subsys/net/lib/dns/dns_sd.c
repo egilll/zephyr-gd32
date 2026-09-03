@@ -1522,9 +1522,6 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
 	return offset;
 }
 
-/* TODO: dns_sd_handle_srv_query() */
-/* TODO: dns_sd_handle_txt_query() */
-
 bool dns_sd_rec_match(const struct dns_sd_rec *record,
 		      const struct dns_sd_rec *filter)
 {
