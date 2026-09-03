@@ -234,6 +234,7 @@ ZTEST(dns_sd, test_label_is_valid)
 	zassert_equal(false, label_is_valid("-abc", 4), "");
 	zassert_equal(true,  label_is_valid("a-bc", 4), "");
 	zassert_equal(true,  label_is_valid("A-Bc", 4), "");
+	zassert_equal(false, label_is_valid("\xc3\xa1", 2), "");
 }
 
 /** Test for @ref dns_sd_rec_is_valid */
@@ -281,6 +282,10 @@ ZTEST(dns_sd, test_dns_sd_rec_is_valid)
 				DNS_SD_EMPTY_TXT,
 				CONST_PORT);
 	zassert_equal(false, rec_is_valid(&invalid_instance), "");
+
+	DNS_SD_REGISTER_TCP_SERVICE(utf8_instance, "H\xc3\xa1talari", "_x", "xx", DNS_SD_EMPTY_TXT,
+				    CONST_PORT);
+	zassert_equal(true, rec_is_valid(&utf8_instance), "");
 
 	DNS_SD_REGISTER_TCP_SERVICE(invalid_service_prefix,
 				"x",
