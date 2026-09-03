@@ -31,6 +31,8 @@ struct dns_sd_query {
 	enum dns_rr_type type;
 	uint16_t id;
 	bool legacy;
+	bool suppress_srv;
+	bool suppress_txt;
 };
 
 #ifdef __cplusplus

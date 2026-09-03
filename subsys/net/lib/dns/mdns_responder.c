@@ -894,6 +894,38 @@ static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type
 	return 0;
 }
 
+static int dns_sd_suppress_known_answers(const struct dns_sd_rec *record,
+					 struct dns_sd_query *query, uint8_t *msg,
+					 uint16_t msg_size, uint16_t answer_offset,
+					 uint16_t answer_count, bool service_type_enum,
+					 struct net_buf *scratch)
+{
+	int ret;
+
+	query->suppress_srv = false;
+	query->suppress_txt = false;
+
+	if (query->type != DNS_RR_TYPE_ANY) {
+		return dns_sd_answer_known(record, query->type, msg, msg_size, answer_offset,
+					   answer_count, service_type_enum, scratch);
+	}
+	ret = dns_sd_answer_known(record, DNS_RR_TYPE_SRV, msg, msg_size, answer_offset,
+				  answer_count, false, scratch);
+	if (ret < 0) {
+		return ret;
+	}
+	query->suppress_srv = ret > 0;
+
+	ret = dns_sd_answer_known(record, DNS_RR_TYPE_TXT, msg, msg_size, answer_offset,
+				  answer_count, false, scratch);
+	if (ret < 0) {
+		return ret;
+	}
+	query->suppress_txt = ret > 0;
+
+	return query->suppress_srv && query->suppress_txt;
+}
+
 static void send_sd_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
 			     size_t addrlen, struct net_buf *result, struct net_if *recv_if,
 			     enum dns_rr_type qtype, enum dns_class qclass, uint16_t dns_id,
@@ -1042,9 +1074,9 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 			}
 
 			if (!query.legacy && answer_count > 0U) {
-				ret = dns_sd_answer_known(record, qtype, query_msg, query_size,
-							  answer_offset, answer_count,
-							  service_type_enum, result);
+				ret = dns_sd_suppress_known_answers(
+					record, &query, query_msg, query_size, answer_offset,
+					answer_count, service_type_enum, result);
 				if (ret != 0) {
 					if (ret < 0) {
 						NET_DBG("invalid known answer (%d)", ret);
