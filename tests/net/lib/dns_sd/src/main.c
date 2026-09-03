@@ -342,6 +342,25 @@ ZTEST(dns_sd, test_dns_sd_rec_is_valid)
 	zassert_equal(true, rec_is_valid(&nasxxxxxx), "");
 }
 
+ZTEST(dns_sd, test_dns_sd_service_name_validation)
+{
+	static const struct {
+		const char *service;
+		bool valid;
+	} cases[] = {
+		{"_http", true},  {"_3d-printer", true}, {"_9abc", true},
+		{"_foo-9", true}, {"_9", false},         {"_-foo", false},
+		{"_foo-", false}, {"_foo--bar", false},  {"_foo.bar", false},
+	};
+	struct dns_sd_rec record = nasxxxxxx;
+
+	for (size_t i = 0U; i < ARRAY_SIZE(cases); ++i) {
+		record.service = cases[i].service;
+		zassert_equal(dns_sd_rec_is_valid(&record), cases[i].valid,
+			      "Unexpected validity for %s", cases[i].service);
+	}
+}
+
 ZTEST(dns_sd, test_dns_sd_txt_is_valid)
 {
 	static const uint8_t valid_txt[] = {
