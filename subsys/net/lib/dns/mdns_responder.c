@@ -393,11 +393,12 @@ int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
 		} else {
 			create_ipv4_addr(net_sin(dst));
 			*dst_len = sizeof(struct net_sockaddr_in);
+		}
 
-			ret = set_ttl_hop_limit(sock, NET_IPPROTO_IP, ZSOCK_IP_MULTICAST_TTL, 255);
-			if (ret < 0) {
-				NET_DBG("Cannot set %s multicast %s (%d)", "IPv4", "TTL", ret);
-			}
+		ret = set_ttl_hop_limit(sock, NET_IPPROTO_IP,
+					unicast ? ZSOCK_IP_TTL : ZSOCK_IP_MULTICAST_TTL, 255);
+		if (ret < 0) {
+			NET_DBG("Cannot set %s %s (%d)", "IPv4", "TTL", ret);
 		}
 	} else if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
 		if (unicast && src != NULL) {
@@ -406,12 +407,13 @@ int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
 		} else {
 			create_ipv6_addr(net_sin6(dst));
 			*dst_len = sizeof(struct net_sockaddr_in6);
+		}
 
-			ret = set_ttl_hop_limit(sock, NET_IPPROTO_IPV6,
-						ZSOCK_IPV6_MULTICAST_HOPS, 255);
-			if (ret < 0) {
-				NET_DBG("Cannot set %s multicast %s (%d)", "IPv6", "hoplimit", ret);
-			}
+		ret = set_ttl_hop_limit(
+			sock, NET_IPPROTO_IPV6,
+			unicast ? ZSOCK_IPV6_UNICAST_HOPS : ZSOCK_IPV6_MULTICAST_HOPS, 255);
+		if (ret < 0) {
+			NET_DBG("Cannot set %s %s (%d)", "IPv6", "hoplimit", ret);
 		}
 	} else {
 		return -EPFNOSUPPORT;
