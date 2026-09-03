@@ -280,6 +280,7 @@ static struct mdns_monitor_iface_addr mon_if[
 
 static const struct dns_sd_rec *external_records;
 static size_t external_records_count;
+static K_MUTEX_DEFINE(external_records_lock);
 
 #define BUF_ALLOC_TIMEOUT K_MSEC(100)
 
@@ -1539,8 +1540,8 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 	size_t n = ARRAY_SIZE(label);
 	size_t rec_num;
 	size_t rec_count;
-	size_t ext_rec_num = external_records_count;
-	size_t ext_rec_count = external_records_count;
+	size_t ext_rec_num;
+	size_t ext_rec_count;
 	struct dns_sd_query query = {
 		.type = qtype,
 		.class_ = qclass & ~DNS_CLASS_FLUSH,
@@ -1639,6 +1640,10 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 
 	query.browse = filter.instance == NULL;
 
+	k_mutex_lock(&external_records_lock, K_FOREVER);
+	ext_rec_num = external_records_count;
+	ext_rec_count = external_records_count;
+
 	DNS_SD_COUNT(&rec_num);
 	rec_count = rec_num;
 
@@ -1712,6 +1717,8 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 			}
 		}
 	}
+
+	k_mutex_unlock(&external_records_lock);
 }
 
 static int dns_read(int sock,
@@ -3293,7 +3300,7 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 	const struct dns_sd_rec *record;
 	struct net_buf *answer;
 	size_t rec_num;
-	size_t ext_rec_num = external_records_count;
+	size_t ext_rec_num;
 	int ret;
 
 	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
@@ -3308,6 +3315,9 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 	if (answer == NULL) {
 		return;
 	}
+
+	k_mutex_lock(&external_records_lock, K_FOREVER);
+	ext_rec_num = external_records_count;
 
 	DNS_SD_COUNT(&rec_num);
 
@@ -3338,6 +3348,7 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 		}
 	}
 
+	k_mutex_unlock(&external_records_lock);
 	net_buf_unref(answer);
 }
 #endif /* CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD */
@@ -3549,12 +3560,14 @@ static int mdns_responder_init(void)
 
 int mdns_responder_set_ext_records(const struct dns_sd_rec *records, size_t count)
 {
-	if (records == NULL || count == 0) {
+	if ((records == NULL) != (count == 0U)) {
 		return -EINVAL;
 	}
 
+	k_mutex_lock(&external_records_lock, K_FOREVER);
 	external_records = records;
 	external_records_count = count;
+	k_mutex_unlock(&external_records_lock);
 
 	return 0;
 }
