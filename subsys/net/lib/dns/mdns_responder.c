@@ -1813,8 +1813,8 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 	return -ENOENT;
 }
 
-static int del_address(struct net_if *iface, net_sa_family_t family,
-		       const void *address, size_t addrlen)
+static int del_address(struct net_if *iface, net_sa_family_t family, const void *address,
+		       size_t addrlen, bool goodbye)
 {
 	size_t expected_len;
 
@@ -1845,8 +1845,14 @@ static int del_address(struct net_if *iface, net_sa_family_t family,
 		}
 
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
-			mon_if[j].pending_goodbye = true;
-			mon_if[j].needs_announce = true;
+			if (goodbye) {
+				mon_if[j].pending_goodbye = true;
+				mon_if[j].needs_announce = true;
+			} else {
+				mon_if[j].in_use = false;
+				mon_if[j].pending_goodbye = false;
+				mon_if[j].needs_announce = false;
+			}
 			return 0;
 		}
 	}
@@ -2127,13 +2133,19 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					&v4_ctx[i]);
 			}
 		} else {
-			ret = del_address(iface, NET_AF_INET, info, info_length);
+			struct net_if_addr *ifaddr = net_if_ipv4_addr_lookup_by_iface(iface, info);
+			bool goodbye = ifaddr == NULL || ifaddr->addr_state != NET_ADDR_TENTATIVE;
+
+			ret = del_address(iface, NET_AF_INET, info, info_length, goodbye);
 			if (ret < 0) {
 				if (ret == -ENOENT) {
 					continue;
 				}
 
 				NET_DBG("Cannot %s %s address (%d)", "del", "IPv4", ret);
+				return;
+			}
+			if (!goodbye) {
 				return;
 			}
 
@@ -2174,7 +2186,8 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 	uint32_t probe_delay = sys_rand32_get() % 250;
 	int ret;
 
-	if ((mgmt_event != NET_EVENT_IPV6_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV6_ADDR_DEL)) {
+	if ((mgmt_event != NET_EVENT_IPV6_ADDR_ADD) && (mgmt_event != NET_EVENT_IPV6_ADDR_DEL) &&
+	    (mgmt_event != NET_EVENT_IPV6_DAD_SUCCEED)) {
 		return;
 	}
 
@@ -2188,9 +2201,17 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 		}
 
 		if (mgmt_event == NET_EVENT_IPV6_ADDR_ADD) {
+			struct net_if_addr *ifaddr;
+
 			ret = add_address(iface, NET_AF_INET6, info, info_length);
 			if (ret < 0 && ret != -EALREADY) {
 				NET_DBG("Cannot %s %s address (%d)", "add", "IPv6", ret);
+				return;
+			}
+
+			ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, info);
+			if (IS_ENABLED(CONFIG_NET_IPV6_DAD) && ifaddr != NULL &&
+			    ifaddr->addr_state == NET_ADDR_TENTATIVE) {
 				return;
 			}
 
@@ -2209,14 +2230,34 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					"IPv6", "add", net_if_get_by_iface(iface),
 					&v6_ctx[i]);
 			}
+		} else if (mgmt_event == NET_EVENT_IPV6_DAD_SUCCEED) {
+			if (init_listener_done) {
+				start_announce(iface);
+				return;
+			}
+
+			ret = k_work_reschedule_for_queue(&mdns_work_q, &v6_ctx[i].probe_timer,
+							  K_MSEC(probe_delay));
+			if (ret < 0) {
+				NET_DBG("Cannot schedule %s probe work (%d)", "IPv6", ret);
+			} else {
+				NET_DBG("%s %s probing scheduled for iface %d ctx %p", "IPv6",
+					"DAD", net_if_get_by_iface(iface), &v6_ctx[i]);
+			}
 		} else {
-			ret = del_address(iface, NET_AF_INET6, info, info_length);
+			struct net_if_addr *ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, info);
+			bool goodbye = ifaddr == NULL || ifaddr->addr_state != NET_ADDR_TENTATIVE;
+
+			ret = del_address(iface, NET_AF_INET6, info, info_length, goodbye);
 			if (ret < 0) {
 				if (ret == -ENOENT) {
 					continue;
 				}
 
 				NET_DBG("Cannot %s %s address (%d)", "del", "IPv6", ret);
+				return;
+			}
+			if (!goodbye) {
 				return;
 			}
 
@@ -2245,7 +2286,8 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 }
 
 NET_MGMT_REGISTER_EVENT_HANDLER(mdns_addr_ipv6_events,
-				NET_EVENT_IPV6_ADDR_ADD | NET_EVENT_IPV6_ADDR_DEL,
+				NET_EVENT_IPV6_ADDR_ADD | NET_EVENT_IPV6_ADDR_DEL |
+					NET_EVENT_IPV6_DAD_SUCCEED,
 				mdns_addr_ipv6_event_handler, NULL);
 #endif /* defined(CONFIG_NET_IPV6) */
 
