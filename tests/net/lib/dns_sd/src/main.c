@@ -151,6 +151,23 @@ static int build_expected_ptr_response(uint8_t *buf, size_t buf_size, bool annou
 	return offset;
 }
 
+static size_t skip_uncompressed_name(const uint8_t *buf, size_t buf_size, size_t offset)
+{
+	while (true) {
+		uint8_t label_len;
+
+		zassert_true(offset < buf_size, "Truncated DNS name");
+		label_len = buf[offset++];
+		zassert_equal(label_len & 0xc0, 0U, "Unexpected compressed name");
+		if (label_len == 0U) {
+			return offset;
+		}
+
+		zassert_true(label_len <= buf_size - offset, "Truncated DNS label");
+		offset += label_len;
+	}
+}
+
 /**
  * @brief Create a DNS query
  *
@@ -764,6 +781,62 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query_announce)
 	zassert_equal(actual_int, expected_int, "act: %d exp: %d", actual_int, expected_int);
 
 	zassert_mem_equal(actual_rsp, expected_rsp, MIN(actual_int, expected_int), "");
+}
+
+ZTEST(dns_sd, test_dns_sd_handle_goodbye)
+{
+	static const uint16_t expected_types[] = {
+		DNS_RR_TYPE_PTR,
+		DNS_RR_TYPE_SRV,
+		DNS_RR_TYPE_TXT,
+	};
+	static const uint16_t expected_classes[] = {
+		DNS_CLASS_IN,
+		DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		DNS_CLASS_IN | DNS_CLASS_FLUSH,
+	};
+	static uint8_t response[BUFSZ];
+	struct dns_header *header = (struct dns_header *)response;
+	size_t offset = sizeof(*header);
+	int response_len;
+
+	response_len = dns_sd_handle_goodbye(&nasxxxxxx, response, sizeof(response));
+	zassert_true(response_len > 0, "Goodbye encoding failed (%d)", response_len);
+	zassert_equal(net_ntohs(header->flags), BIT(15) | BIT(10), "Unexpected flags");
+	zassert_equal(net_ntohs(header->qdcount), 0U, "Goodbye contains a question");
+	zassert_equal(net_ntohs(header->ancount), ARRAY_SIZE(expected_types),
+		      "Unexpected answer count");
+	zassert_equal(net_ntohs(header->nscount), 0U, "Goodbye contains authority records");
+	zassert_equal(net_ntohs(header->arcount), 0U, "Goodbye contains additional records");
+
+	for (size_t i = 0U; i < ARRAY_SIZE(expected_types); ++i) {
+		uint16_t rdlength;
+
+		offset = skip_uncompressed_name(response, response_len, offset);
+		zassert_true(sizeof(struct dns_rr) <= response_len - offset,
+			     "Truncated resource record");
+		zassert_equal(sys_get_be16(&response[offset]), expected_types[i],
+			      "Unexpected record type");
+		zassert_equal(sys_get_be16(&response[offset + 2U]), expected_classes[i],
+			      "Unexpected record class");
+		zassert_equal(sys_get_be32(&response[offset + 4U]), 0U,
+			      "Goodbye record has a nonzero TTL");
+		rdlength = sys_get_be16(&response[offset + 8U]);
+		offset += sizeof(struct dns_rr);
+		zassert_true(rdlength <= response_len - offset, "Truncated RDATA");
+		offset += rdlength;
+	}
+
+	zassert_equal(offset, response_len, "Goodbye contains unexpected records");
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx, response, response_len), response_len,
+		      "Exact-size buffer was rejected");
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx, response, response_len - 1U), -ENOSPC,
+		      "One-byte-short buffer was accepted");
+	zassert_equal(dns_sd_handle_goodbye(&invalid_dns_sd_record, response, sizeof(response)),
+		      -EINVAL, "Invalid record was accepted");
+	nonconst_port = 0U;
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx_ephemeral, response, sizeof(response)),
+		      -EHOSTDOWN, "Uninitialized service was withdrawn");
 }
 
 /** Test for @ref dns_sd_handle_ptr_query */
