@@ -276,6 +276,15 @@ struct mdns_monitor_iface_addr {
 static struct mdns_monitor_iface_addr mon_if[
 	MDNS_MAX_IFACE_COUNT *
 	(NET_IF_MAX_IPV4_ADDR + NET_IF_MAX_IPV6_ADDR)];
+
+#define MDNS_TRANSPORT_IPV4 BIT(0)
+#define MDNS_TRANSPORT_IPV6 BIT(1)
+
+/* Address records are sent over every IP transport enabled on an interface,
+ * so retain pending goodbyes until each transport succeeds.
+ */
+static uint8_t goodbye_attempted[MDNS_MAX_IFACE_COUNT];
+static uint8_t goodbye_sent[MDNS_MAX_IFACE_COUNT];
 #endif
 
 static const struct dns_sd_rec *external_records;
@@ -3274,14 +3283,39 @@ static bool check_if_needs_announce(struct net_if *iface)
 	return false;
 }
 
-static void clear_pending_goodbyes(struct net_if *iface, net_sa_family_t family)
+static void clear_pending_goodbyes(struct net_if *iface)
 {
 	ARRAY_FOR_EACH(mon_if, i) {
-		if (mon_if[i].in_use && mon_if[i].iface == iface &&
-		    mon_if[i].addr.family == family && mon_if[i].pending_goodbye) {
+		if (mon_if[i].in_use && mon_if[i].iface == iface && mon_if[i].pending_goodbye) {
 			mon_if[i].in_use = false;
 			mon_if[i].pending_goodbye = false;
 			mon_if[i].needs_announce = false;
+		}
+	}
+}
+
+static void mark_goodbye_transport(struct net_if *iface, uint8_t *transports, uint8_t transport)
+{
+	int idx = net_if_get_by_iface(iface) - 1;
+
+	if (idx >= 0 && idx < (int)ARRAY_SIZE(goodbye_attempted)) {
+		transports[idx] |= transport;
+	}
+}
+
+static void clear_sent_goodbyes(void)
+{
+	ARRAY_FOR_EACH(mon_if, i) {
+		int idx;
+
+		if (!mon_if[i].in_use || !mon_if[i].pending_goodbye) {
+			continue;
+		}
+
+		idx = net_if_get_by_iface(mon_if[i].iface) - 1;
+		if (idx >= 0 && idx < (int)ARRAY_SIZE(goodbye_attempted) &&
+		    goodbye_attempted[idx] != 0U && goodbye_attempted[idx] == goodbye_sent[idx]) {
+			clear_pending_goodbyes(mon_if[i].iface);
 		}
 	}
 }
@@ -3358,6 +3392,9 @@ static int send_announce(const char *name)
 	struct net_buf *answer;
 	int ret;
 
+	memset(goodbye_attempted, 0, sizeof(goodbye_attempted));
+	memset(goodbye_sent, 0, sizeof(goodbye_sent));
+
 #if defined(CONFIG_NET_IPV4)
 	struct net_sockaddr_in dst_addr4;
 
@@ -3365,13 +3402,17 @@ static int send_announce(const char *name)
 
 	ARRAY_FOR_EACH(v4_ctx, i) {
 		if (v4_ctx[i].sock < 0 || v4_ctx[i].iface == NULL ||
-		    !net_if_is_up(v4_ctx[i].iface)) {
+		    !net_if_is_up(v4_ctx[i].iface) ||
+		    net_ipv4_is_addr_unspecified(
+			    net_if_ipv4_select_src_addr(v4_ctx[i].iface, &dst_addr4.sin_addr))) {
 			continue;
 		}
 
 		if (!check_if_needs_announce(v4_ctx[i].iface)) {
 			continue;
 		}
+
+		mark_goodbye_transport(v4_ctx[i].iface, goodbye_attempted, MDNS_TRANSPORT_IPV4);
 
 		answer = create_unsolicited_mdns_answer(v4_ctx[i].iface,
 							name,
@@ -3395,7 +3436,8 @@ static int send_announce(const char *name)
 			NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 			continue;
 		}
-		clear_pending_goodbyes(v4_ctx[i].iface, NET_AF_INET);
+
+		mark_goodbye_transport(v4_ctx[i].iface, goodbye_sent, MDNS_TRANSPORT_IPV4);
 
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v4_ctx[i].iface));
@@ -3414,13 +3456,17 @@ static int send_announce(const char *name)
 
 	ARRAY_FOR_EACH(v6_ctx, i) {
 		if (v6_ctx[i].sock < 0 || v6_ctx[i].iface == NULL ||
-		    !net_if_is_up(v6_ctx[i].iface)) {
+		    !net_if_is_up(v6_ctx[i].iface) ||
+		    net_ipv6_is_addr_unspecified(
+			    net_if_ipv6_select_src_addr(v6_ctx[i].iface, &dst_addr6.sin6_addr))) {
 			continue;
 		}
 
 		if (!check_if_needs_announce(v6_ctx[i].iface)) {
 			continue;
 		}
+
+		mark_goodbye_transport(v6_ctx[i].iface, goodbye_attempted, MDNS_TRANSPORT_IPV6);
 
 		answer = create_unsolicited_mdns_answer(v6_ctx[i].iface,
 							name,
@@ -3444,7 +3490,8 @@ static int send_announce(const char *name)
 			NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 			continue;
 		}
-		clear_pending_goodbyes(v6_ctx[i].iface, NET_AF_INET6);
+
+		mark_goodbye_transport(v6_ctx[i].iface, goodbye_sent, MDNS_TRANSPORT_IPV6);
 
 		NET_DBG("Announcing %s responder for %s%s (iface %d)",
 			"mDNS", name, ".local", net_if_get_by_iface(v6_ctx[i].iface));
@@ -3455,6 +3502,8 @@ static int send_announce(const char *name)
 #endif
 	}
 #endif /* defined(CONFIG_NET_IPV6) */
+
+	clear_sent_goodbyes();
 
 	return 0;
 }
