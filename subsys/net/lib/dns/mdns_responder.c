@@ -716,9 +716,117 @@ static bool dns_sd_service_type_was_sent(const struct dns_sd_rec *record, size_t
 	return false;
 }
 
+static bool dns_sd_name_matches(const char *name, const struct dns_sd_rec *record,
+				bool include_instance)
+{
+	const struct {
+		const char *value;
+	} labels[] = {
+		{record->instance},
+		{record->service},
+		{record->proto},
+		{record->domain},
+	};
+	size_t first = include_instance ? 0U : 1U;
+	size_t expected_len = ARRAY_SIZE(labels) - first - 1U;
+
+	for (size_t i = first; i < ARRAY_SIZE(labels); ++i) {
+		expected_len += strlen(labels[i].value);
+	}
+
+	if (strlen(name) != expected_len) {
+		return false;
+	}
+
+	for (size_t i = first; i < ARRAY_SIZE(labels); ++i) {
+		size_t label_len = strlen(labels[i].value);
+
+		if (strncasecmp(name, labels[i].value, label_len) != 0) {
+			return false;
+		}
+
+		name += label_len;
+		if (i == ARRAY_SIZE(labels) - 1U) {
+			return *name == '\0';
+		}
+
+		if (*name++ != '.') {
+			return false;
+		}
+	}
+
+	return false;
+}
+
+static int dns_sd_ptr_known(const struct dns_sd_rec *record, uint8_t *msg, uint16_t msg_size,
+			    uint16_t answer_offset, uint16_t answer_count, struct net_buf *scratch)
+{
+	uint16_t offset = answer_offset;
+
+	if (dns_header_tc(msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		const uint8_t *owner_end;
+		const uint8_t *rdata_end;
+		uint16_t owner_size;
+		uint16_t rdlength;
+		uint16_t rdata_offset;
+		uint16_t type;
+		uint16_t class_;
+		uint32_t ttl;
+		int ret;
+
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size, msg + offset, scratch, &owner_end);
+		if (ret < 0) {
+			return ret;
+		}
+
+		owner_size = owner_end - (msg + offset);
+		if (owner_size > msg_size - offset ||
+		    sizeof(struct dns_rr) > msg_size - offset - owner_size) {
+			return -EMSGSIZE;
+		}
+
+		type = dns_answer_type(owner_size, msg + offset);
+		class_ = dns_answer_class(owner_size, msg + offset) & ~DNS_CLASS_FLUSH;
+		ttl = dns_answer_ttl(owner_size, msg + offset);
+		rdlength = dns_answer_rdlength(owner_size, msg + offset);
+		rdata_offset = offset + owner_size + sizeof(struct dns_rr);
+
+		if (rdlength > msg_size - rdata_offset) {
+			return -EMSGSIZE;
+		}
+
+		if (type == DNS_RR_TYPE_PTR && class_ == DNS_CLASS_IN &&
+		    ttl >= DNS_SD_PTR_TTL / 2U &&
+		    dns_sd_name_matches(scratch->data, record, false)) {
+			scratch->len = 0U;
+			ret = dns_unpack_name(msg, msg_size, msg + rdata_offset, scratch,
+					      &rdata_end);
+			if (ret < 0) {
+				return ret;
+			}
+
+			if (rdata_end <= msg + rdata_offset + rdlength &&
+			    dns_sd_name_matches(scratch->data, record, true)) {
+				return 1;
+			}
+		}
+
+		offset = rdata_offset + rdlength;
+	}
+
+	return 0;
+}
+
 static void send_sd_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
 			     size_t addrlen, struct net_buf *result, struct net_if *recv_if,
-			     enum dns_rr_type qtype, enum dns_class qclass, uint16_t dns_id)
+			     enum dns_rr_type qtype, enum dns_class qclass, uint16_t dns_id,
+			     uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
+			     uint16_t answer_count)
 {
 	struct net_if *iface;
 	net_socklen_t dst_len;
@@ -861,6 +969,18 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 				continue;
 			}
 
+			if (!query.legacy && !service_type_enum && qtype == DNS_RR_TYPE_PTR &&
+			    answer_count > 0U) {
+				ret = dns_sd_ptr_known(record, query_msg, query_size, answer_offset,
+						       answer_count, result);
+				if (ret != 0) {
+					if (ret < 0) {
+						NET_DBG("invalid known answer (%d)", ret);
+					}
+					continue;
+				}
+			}
+
 			NET_DBG("matched query: %s.%s.%s.%s port: %u",
 				record->instance, record->service,
 				record->proto, record->domain,
@@ -913,6 +1033,8 @@ static int dns_read(int sock,
 	struct net_buf *result;
 	struct dns_msg_t dns_msg;
 	uint16_t dns_id = 0U;
+	uint16_t answer_count;
+	uint16_t answer_offset;
 	int data_len;
 	int queries;
 	int ret;
@@ -937,6 +1059,22 @@ static int dns_read(int sock,
 	}
 
 	queries = ret;
+	answer_count = dns_unpack_header_ancount(dns_msg.msg);
+	answer_offset = dns_msg.query_offset;
+
+	if (answer_count > 0U) {
+		struct dns_msg_t scan = dns_msg;
+
+		for (int i = 0; i < queries; ++i) {
+			result->len = 0U;
+			ret = dns_unpack_query(&scan, result, NULL, NULL);
+			if (ret < 0) {
+				goto quit;
+			}
+		}
+
+		answer_offset = scan.query_offset;
+	}
 
 	NET_DBG("Received %d %s from %s:%u", queries,
 		queries > 1 ? "queries" : "query",
@@ -992,7 +1130,8 @@ static int dns_read(int sock,
 			   (qtype == DNS_RR_TYPE_PTR || qtype == DNS_RR_TYPE_SRV ||
 			    qtype == DNS_RR_TYPE_TXT || qtype == DNS_RR_TYPE_ANY)) {
 			send_sd_response(sock, family, src_addr, addrlen, result, recv_if, qtype,
-					 qclass, dns_id);
+					 qclass, dns_id, dns_msg.msg, dns_msg.msg_size,
+					 answer_offset, answer_count);
 		}
 
 	} while (--queries);
