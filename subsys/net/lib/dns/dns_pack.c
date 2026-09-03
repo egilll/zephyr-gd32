@@ -515,7 +515,8 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 	while ((val = *curr_src++)) {
 		if ((val & NS_CMPRSFLGS) == NS_CMPRSFLGS) {
 			/* Follow pointer */
-			int pos;
+			size_t pointer_offset = curr_src - msg - 1U;
+			size_t pos;
 
 			if (curr_src >= (msg + maxlen)) {
 				return -EMSGSIZE;
@@ -532,6 +533,9 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 
 			/* Strip compress bits from length calculation */
 			pos = ((val & 0x3f) << 8) | (*curr_src & 0xff);
+			if (pos >= pointer_offset) {
+				return -EMSGSIZE;
+			}
 
 			curr_src = msg + pos;
 			if (curr_src >= (msg + maxlen)) {
