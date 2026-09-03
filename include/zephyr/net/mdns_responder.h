@@ -40,7 +40,9 @@ extern "C" {
  *                without copying the content so it must be kept valid. Pass
  *                NULL together with a zero @p count before freeing the array.
  *                A non-empty update is announced when runtime announcements
- *                are enabled and the responder is already running.
+ *                are enabled and the responder is already running. Under the
+ *                same conditions, previously installed records are withdrawn
+ *                before this function returns.
  * @param count The number of elements, or zero when clearing @p records.
  * @return 0 for OK; -EINVAL if exactly one of @p records and @p count is zero.
  */
