@@ -889,6 +889,84 @@ ZTEST(dns_sd, test_dns_sd_handle_goodbye)
 		      -EHOSTDOWN, "Uninitialized service was withdrawn");
 }
 
+static void check_service_instance_nsec(const uint8_t *response, size_t response_len, bool legacy)
+{
+	static const uint8_t expected_bitmap[] = {0U, 0U, 0x80U, 0U, 0x40U};
+	const struct dns_header *header = (const struct dns_header *)response;
+	size_t offset = sizeof(*header);
+	uint16_t value;
+
+	zassert_equal(net_ntohs(header->id), legacy ? 0x1234U : 0U, "Unexpected response ID");
+	zassert_equal(net_ntohs(header->flags), BIT(15) | BIT(10), "Unexpected response flags");
+	zassert_equal(net_ntohs(header->qdcount), legacy ? 1U : 0U, "Unexpected question count");
+	zassert_equal(net_ntohs(header->ancount), 1U, "Unexpected answer count");
+	zassert_equal(net_ntohs(header->arcount), 0U, "Unexpected additional count");
+	offset = skip_uncompressed_name(response, response_len, offset);
+
+	if (legacy) {
+		zassert_equal(sys_get_be16(&response[offset]), DNS_RR_TYPE_A,
+			      "Unexpected repeated question type");
+		offset += DNS_QTYPE_LEN;
+		zassert_equal(sys_get_be16(&response[offset]), DNS_CLASS_IN,
+			      "Unexpected repeated question class");
+		offset += DNS_QCLASS_LEN;
+		zassert_equal(sys_get_be16(&response[offset]),
+			      DNS_SD_PTR_MASK | DNS_MSG_HEADER_SIZE, "Unexpected answer owner");
+		offset += DNS_POINTER_SIZE;
+	}
+
+	zassert_equal(sys_get_be16(&response[offset]), DNS_RR_TYPE_NSEC, "Unexpected answer type");
+	offset += DNS_QTYPE_LEN;
+	zassert_equal(sys_get_be16(&response[offset]),
+		      DNS_CLASS_IN | (legacy ? 0U : DNS_CLASS_FLUSH), "Unexpected answer class");
+	offset += DNS_QCLASS_LEN;
+	zassert_equal(sys_get_be32(&response[offset]), legacy ? DNS_SD_LEGACY_TTL : DNS_SD_SRV_TTL,
+		      "Unexpected answer TTL");
+	offset += DNS_TTL_LEN;
+	zassert_equal(sys_get_be16(&response[offset]),
+		      DNS_POINTER_SIZE + 2U + sizeof(expected_bitmap), "Unexpected NSEC length");
+	offset += DNS_RDLENGTH_LEN;
+	value = sys_get_be16(&response[offset]);
+	zassert_equal(value, DNS_SD_PTR_MASK | DNS_MSG_HEADER_SIZE,
+		      "NSEC next name does not match its owner");
+	offset += DNS_POINTER_SIZE;
+	zassert_equal(response[offset++], 0U, "Unexpected bitmap window");
+	zassert_equal(response[offset++], sizeof(expected_bitmap), "Unexpected bitmap length");
+	zassert_mem_equal(&response[offset], expected_bitmap, sizeof(expected_bitmap),
+			  "Unexpected service type bitmap");
+	offset += sizeof(expected_bitmap);
+	zassert_equal(offset, response_len, "Unexpected trailing response data");
+}
+
+ZTEST(dns_sd, test_dns_sd_handle_query_nsec)
+{
+	struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_A,
+		.class_ = DNS_CLASS_IN,
+	};
+	struct net_in_addr addr = {{{177, 5, 240, 13}}};
+	uint8_t response[BUFSZ];
+	int response_len;
+
+	response_len = dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response,
+					   sizeof(response));
+	zassert_true(response_len > 0, "NSEC response failed (%d)", response_len);
+	check_service_instance_nsec(response, response_len, false);
+	zassert_equal(
+		dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response, response_len),
+		response_len, "Exact-size NSEC response failed");
+	zassert_equal(dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response,
+					  response_len - 1),
+		      -ENOSPC, "One-byte-short NSEC buffer was accepted");
+
+	query.legacy = true;
+	query.id = 0x1234U;
+	response_len = dns_sd_handle_query(NULL, &nasxxxxxx, &addr, NULL, &query, response,
+					   sizeof(response));
+	zassert_true(response_len > 0, "Legacy NSEC response failed (%d)", response_len);
+	check_service_instance_nsec(response, response_len, true);
+}
+
 /** Test for @ref dns_sd_handle_ptr_query */
 ZTEST(dns_sd, test_dns_sd_handle_service_type_enum)
 {
