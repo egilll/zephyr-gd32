@@ -911,6 +911,7 @@ ZTEST(dns_resolve, test_dns_localhost_resolve_ipv6)
 }
 
 NET_BUF_POOL_DEFINE(test_dns_qname_pool, 2, CONFIG_DNS_RESOLVER_MAX_QUERY_LEN, 0, NULL);
+NET_BUF_POOL_DEFINE(test_dns_small_qname_pool, 1, 4, 0, NULL);
 
 ZTEST(dns_resolve, test_dns_unpack_query_classes)
 {
@@ -1038,17 +1039,18 @@ ZTEST(dns_resolve, test_dns_pack_qname)
 
 ZTEST(dns_resolve, test_dns_unpack_name)
 {
+	static const uint8_t exact_record[] = "\003www";
 	/* NULL string terminator serves a role of a final zero-length label */
 	static const uint8_t *test_records[] = {
 		/* example.com */
 		"\007example\003com",
 		/* www.zephyrproject.org */
 		"\003www\015zephyrproject\003org",
-		/* These records should barely fit (fills up the buffer size limit). */
+		/* This record has the maximum 255-byte encoded name length. */
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
-		"\076very_long_record_that_has_a_length_of_62_bytes_xxxxxxxxxxxxxxx",
+		"\075very_long_record_that_has_a_length_of_61_bytes_xxxxxxxxxxxxxx",
 	};
 	static const uint8_t *expected_names[] = {
 		"example.com",
@@ -1056,7 +1058,7 @@ ZTEST(dns_resolve, test_dns_unpack_name)
 		"very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx."
 		"very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx."
 		"very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx."
-		"very_long_record_that_has_a_length_of_62_bytes_xxxxxxxxxxxxxxx",
+		"very_long_record_that_has_a_length_of_61_bytes_xxxxxxxxxxxxxx",
 
 	};
 	struct net_buf *result;
@@ -1082,6 +1084,20 @@ ZTEST(dns_resolve, test_dns_unpack_name)
 
 		net_buf_unref(result);
 	}
+
+	result = net_buf_alloc(&test_dns_small_qname_pool, K_NO_WAIT);
+	zassert_not_null(result, "Failed to allocate exact-size buffer");
+	ret = dns_unpack_name(exact_record, sizeof(exact_record), exact_record, result, NULL);
+	zassert_equal(ret, 3, "Failed to decode into exact-size buffer");
+	zassert_str_equal(result->data, "www", "Decoded wrong exact-size name");
+	net_buf_unref(result);
+
+	result = net_buf_alloc(&test_dns_small_qname_pool, K_NO_WAIT);
+	zassert_not_null(result, "Failed to allocate undersized buffer");
+	net_buf_reserve(result, 1U);
+	ret = dns_unpack_name(exact_record, sizeof(exact_record), exact_record, result, NULL);
+	zassert_equal(ret, -EMSGSIZE, "Decoded into undersized buffer");
+	net_buf_unref(result);
 }
 
 ZTEST(dns_resolve, test_dns_unpack_name_with_pointer)
@@ -1143,13 +1159,13 @@ ZTEST(dns_resolve, test_dns_unpack_name_overflow)
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx",
-		/* 4 records fit (251 bytes), 4 bytes for dot separators, 5th one-byte
-		 * record won't fit.
+		/* A maximum-size name followed by a fifth one-byte label exceeds
+		 * the DNS wire-format limit.
 		 */
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
 		"\077very_long_record_that_has_a_length_of_63_bytes_xxxxxxxxxxxxxxxx"
-		"\076very_long_record_that_has_a_length_of_62_bytes_xxxxxxxxxxxxxxx"
+		"\075very_long_record_that_has_a_length_of_61_bytes_xxxxxxxxxxxxxx"
 		"\001x",
 		/* Single 64 byte record, that's forbidden (max record len is 63). */
 		"\100very_long_record_that_has_a_length_of_64_bytes_that_is_incorrect",
