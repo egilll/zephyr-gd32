@@ -520,6 +520,7 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 {
 	const uint8_t *end_of_label = NULL;
 	const uint8_t *curr_src = src;
+	size_t wire_size = 1U;
 	int loop_check = 0, len = -1;
 	int label_len;
 	int val;
@@ -560,16 +561,20 @@ int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 			}
 		} else {
 			size_t dest_size = net_buf_tailroom(buf);
+			size_t separator_size = buf->len > 0U ? 1U : 0U;
 
-			/* Max label length is 64 bytes (because 2 bits are
-			 * used for pointer)
-			 */
+			/* The top two bits are reserved for compression. */
 			label_len = val;
-			if (label_len > 63) {
+			if (label_len > DNS_LABEL_MAX_SIZE) {
 				return -EMSGSIZE;
 			}
 
-			if ((label_len + 1 >= dest_size) ||
+			wire_size += DNS_LABEL_LEN_SIZE + label_len;
+			if (wire_size > DNS_NAME_MAX_SIZE) {
+				return -EMSGSIZE;
+			}
+
+			if ((separator_size + label_len + 1U > dest_size) ||
 			    ((curr_src + label_len) >= (msg + maxlen))) {
 				return -EMSGSIZE;
 			}
