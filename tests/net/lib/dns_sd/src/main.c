@@ -300,6 +300,14 @@ ZTEST(dns_sd, test_add_ptr_record)
 	memmove(actual_buf, actual_buf + offset, actual_int);
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_ptr_record(&nasxxxxxx, ttl, actual_buf, offset, offset + expected_int,
+				     &service_offset, &instance_offset, &domain_offset),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_ptr_record(&nasxxxxxx, ttl, actual_buf, offset, offset + expected_int - 1,
+				     &service_offset, &instance_offset, &domain_offset),
+		      "one-byte-short buffer was accepted");
 
 	/* dns_sd_rec_is_valid failure */
 	DNS_SD_REGISTER_TCP_SERVICE(null_label,
@@ -367,6 +375,14 @@ ZTEST(dns_sd, test_add_txt_record)
 	zassert_mem_equal(actual_buf, expected_buf, MIN(actual_int,
 							expected_int),
 			  "");
+	zassert_equal(
+		expected_int,
+		add_txt_record(&nasxxxxxx, ttl, instance_offset, actual_buf, offset, expected_int),
+		"exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_txt_record(&nasxxxxxx, ttl, instance_offset, actual_buf, offset,
+				     expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	actual_int = add_txt_record(&empty_txt, ttl, instance_offset, actual_buf, offset,
 				    sizeof(actual_buf));
@@ -415,6 +431,14 @@ ZTEST(dns_sd, test_add_srv_record)
 
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_srv_record(&nasxxxxxx, ttl, instance_offset, domain_offset, actual_buf,
+				     offset, expected_int, &host_offset),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_srv_record(&nasxxxxxx, ttl, instance_offset, domain_offset, actual_buf,
+				     offset, expected_int - 1, &host_offset),
+		      "one-byte-short buffer was accepted");
 
 	/* offset too big for message compression (instance) */
 	zassert_equal(-E2BIG,
@@ -465,6 +489,14 @@ ZTEST(dns_sd, test_add_a_record)
 
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_a_record(&nasxxxxxx, ttl, host_offset, net_ntohl(addr.s_addr), actual_buf,
+				   offset, expected_int),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_a_record(&nasxxxxxx, ttl, host_offset, net_ntohl(addr.s_addr), actual_buf,
+				   offset, expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	/* test offset too large */
 	zassert_equal(-E2BIG,
@@ -507,6 +539,14 @@ ZTEST(dns_sd, test_add_aaaa_record)
 
 	zassert_mem_equal(actual_buf, expected_buf,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      add_aaaa_record(&nasxxxxxx, ttl, host_offset, addr, actual_buf, offset,
+				      expected_int),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      add_aaaa_record(&nasxxxxxx, ttl, host_offset, addr, actual_buf, offset,
+				      expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	/* offset too large for message compression */
 	zassert_equal(-E2BIG,
@@ -560,6 +600,14 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 
 	zassert_mem_equal(actual_rsp, expected_rsp,
 			  MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
+					      expected_int, false),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
+					      expected_int - 1, false),
+		      "one-byte-short buffer was accepted");
 
 	/* show non-advertisement for uninitialized port */
 	nonconst_port = 0;
@@ -648,6 +696,14 @@ ZTEST(dns_sd, test_dns_sd_handle_service_type_enum)
 	zassert_equal(actual_int, expected_int, "act: %d exp: %d", actual_int, expected_int);
 
 	zassert_mem_equal(actual_rsp, expected_rsp, MIN(actual_int, expected_int), "");
+	zassert_equal(expected_int,
+		      dns_sd_handle_service_type_enum(&chromecast, &addr, NULL, &query, actual_rsp,
+						      expected_int),
+		      "exact-size buffer was rejected");
+	zassert_equal(-ENOSPC,
+		      dns_sd_handle_service_type_enum(&chromecast, &addr, NULL, &query, actual_rsp,
+						      expected_int - 1),
+		      "one-byte-short buffer was accepted");
 
 	/* show non-advertisement for uninitialized port */
 	nonconst_port = 0;
