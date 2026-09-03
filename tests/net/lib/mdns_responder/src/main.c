@@ -927,11 +927,15 @@ static void check_single_aaaa_response(struct net_pkt *pkt, const struct net_in6
 	zassert_true(net_ipv6_addr_cmp(&actual, expected), "Unexpected AAAA address");
 }
 
-static void check_basic_query_resp(struct net_pkt *pkt)
+static void check_basic_query_resp(struct net_pkt *pkt, bool expect_nsec)
 {
+	static const uint8_t nsec_bitmap[] = {0x00, 0x00, 0x00, 0x08};
 	struct dns_header resp_header;
 	struct dns_rr resp_record;
 	struct net_in6_addr resp_addr[2];
+	uint8_t bitmap[sizeof(nsec_bitmap)];
+	uint8_t value;
+	uint16_t next_name;
 
 	net_pkt_cursor_init(pkt);
 	net_pkt_set_overwrite(pkt, true);
@@ -942,6 +946,8 @@ static void check_basic_query_resp(struct net_pkt *pkt)
 	/* Header */
 	zassert_ok(net_pkt_read(pkt, &resp_header, sizeof(resp_header)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_header.ancount), 2, "Invalid record count");
+	zassert_equal(net_ntohs(resp_header.arcount), expect_nsec ? 1U : 0U,
+		      "Invalid additional record count");
 
 	validate_label(pkt, "zephyr", false);
 	validate_label(pkt, "local", true);
@@ -969,6 +975,30 @@ static void check_basic_query_resp(struct net_pkt *pkt)
 			 "Address 1 not found");
 	zassert_not_null(net_if_ipv6_addr_lookup_by_iface(iface1, &resp_addr[1]),
 			 "Address 2 not found");
+
+	if (!expect_nsec) {
+		return;
+	}
+
+	/* No IPv4 address exists on the test interface, so RFC 6762 6.2 calls
+	 * for a restricted NSEC record that lists only the existing AAAA type.
+	 */
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &resp_record, sizeof(resp_record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(resp_record.type), DNS_RR_TYPE_NSEC, "Invalid NSEC type");
+	zassert_equal(net_ntohs(resp_record.class_), DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Invalid NSEC class");
+	zassert_equal(net_ntohl(resp_record.ttl), CONFIG_MDNS_RESPONDER_TTL, "Invalid NSEC TTL");
+	zassert_equal(net_ntohs(resp_record.rdlength), DNS_POINTER_SIZE + 2U + sizeof(bitmap),
+		      "Invalid NSEC length");
+	zassert_ok(net_pkt_read_be16(pkt, &next_name), "net_pkt read failed");
+	zassert_equal(next_name, 0xc00c, "NSEC next name does not point to its owner");
+	zassert_ok(net_pkt_read_u8(pkt, &value), "net_pkt read failed");
+	zassert_equal(value, 0U, "Invalid NSEC bitmap window");
+	zassert_ok(net_pkt_read_u8(pkt, &value), "net_pkt read failed");
+	zassert_equal(value, sizeof(bitmap), "Invalid NSEC bitmap length");
+	zassert_ok(net_pkt_read(pkt, bitmap, sizeof(bitmap)), "net_pkt read failed");
+	zassert_mem_equal(bitmap, nsec_bitmap, sizeof(bitmap), "Invalid NSEC bitmap");
 }
 
 static void check_address_record(struct net_pkt *pkt, enum dns_rr_type expected_type,
@@ -1038,7 +1068,7 @@ ZTEST(test_mdns_responder, test_basic_query)
 	res = k_sem_take(&wait_data, RESPONSE_TIMEOUT);
 	zassert_ok(res, "Did not receive a response");
 
-	check_basic_query_resp(response_pkts[0]);
+	check_basic_query_resp(response_pkts[0], true);
 }
 
 ZTEST(test_mdns_responder, test_address_additional_records)
@@ -1149,7 +1179,7 @@ ZTEST(test_mdns_responder, test_hostname_any_query)
 	/* The test interface has two IPv6 addresses. The response must contain
 	 * their actual AAAA type rather than repeating the question's ANY type.
 	 */
-	check_basic_query_resp(response_pkts[0]);
+	check_basic_query_resp(response_pkts[0], false);
 }
 
 ZTEST(test_mdns_responder, test_hostname_known_answer_suppression)
@@ -1168,7 +1198,7 @@ ZTEST(test_mdns_responder, test_hostname_known_answer_suppression)
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Stale address did not receive a response");
-	check_basic_query_resp(response_pkts[1]);
+	check_basic_query_resp(response_pkts[1], true);
 
 	query_size = build_host_known_query(query, DNS_RR_TYPE_ANY, &extra_addr, 600U);
 	send_msg(query, query_size);
@@ -1284,7 +1314,7 @@ ZTEST(test_mdns_responder, test_query_class_any)
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Did not receive a response to class ANY");
 
-	check_basic_query_resp(response_pkts[0]);
+	check_basic_query_resp(response_pkts[0], true);
 }
 
 /* RFC 6762 6.7: a query that did not come from port 5353 is a one-off lookup,
