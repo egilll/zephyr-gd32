@@ -24,6 +24,13 @@ extern "C" {
 #endif
 
 /**
+ * @brief Multicast DNS responder
+ * @defgroup mdns_responder Multicast DNS responder
+ * @ingroup networking
+ * @{
+ */
+
+/**
  * @brief Register continuous memory of @ref dns_sd_rec records.
  *
  * mDNS responder will start with iteration over mDNS records registered using
@@ -89,6 +96,8 @@ static inline int mdns_responder_disable_iface(struct net_if *iface)
 }
 
 #endif /* CONFIG_MDNS_RESPONDER_RUNTIME_IFACE_CONTROL || __DOXYGEN__ */
+
+/** @} */
 
 #ifdef __cplusplus
 }
