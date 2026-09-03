@@ -702,6 +702,29 @@ ZTEST(dns_sd, test_dns_sd_handle_service_type_enum)
 		      "");
 }
 
+ZTEST(dns_sd, test_dns_sd_protocol_is_case_insensitive)
+{
+	static const struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_PTR,
+	};
+	static const char *const protocols[] = {"_TCP", "_UDP"};
+	struct net_in_addr addr = {{{177, 5, 240, 13}}};
+	struct dns_sd_rec record = nasxxxxxx;
+	uint8_t response[512];
+
+	for (size_t i = 0U; i < ARRAY_SIZE(protocols); ++i) {
+		record.proto = protocols[i];
+		zassert_true(dns_sd_rec_is_valid(&record), "%s was rejected as invalid",
+			     protocols[i]);
+		zassert_true(dns_sd_handle_ptr_query(NULL, &record, &addr, NULL, response,
+						     sizeof(response), false) > 0,
+			     "%s was rejected by PTR response handling", protocols[i]);
+		zassert_true(dns_sd_handle_service_type_enum(&record, &addr, NULL, &query, response,
+							     sizeof(response)) > 0,
+			     "%s was rejected by service-type enumeration", protocols[i]);
+	}
+}
+
 /** Test @ref dns_sd_rec_match */
 ZTEST(dns_sd, test_dns_sd_rec_match)
 {
