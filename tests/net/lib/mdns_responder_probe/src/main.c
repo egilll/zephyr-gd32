@@ -564,7 +564,8 @@ ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 		.text_size = sizeof(dns_sd_empty_txt),
 		.port = &svc_port,
 	};
-	bool found_dns_sd_announce = false;
+	size_t dns_sd_announce_count = 0U;
+	size_t checked_count = 0U;
 
 	zassert_true(wait_for_responder(), "Responder did not finish startup");
 	clear_responses();
@@ -573,28 +574,25 @@ ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 		   "Failed to register the external DNS-SD record");
 	net_mgmt_event_notify(NET_EVENT_IF_UP, iface1);
 
-	/* Poll for the announce instead of sleeping the full worst-case
-	 * probe window: this returns as soon as the DNS-SD PTR answer shows
-	 * up, while still bounding the wait at PROBE_SEQUENCE_TIMEOUT_MS.
+	/* Poll for both required announcement rounds instead of sleeping the
+	 * full worst-case probe window.
 	 */
-	for (int poll = 0; poll < PROBE_MAX_POLLS && !found_dns_sd_announce; poll++) {
+	for (int poll = 0; poll < PROBE_MAX_POLLS && dns_sd_announce_count < 2U; poll++) {
 		k_sleep(RESPONSE_TIMEOUT);
 
-		for (size_t i = 0; i < responses_count; i++) {
+		for (size_t i = checked_count; i < responses_count; i++) {
 			if (packet_has_ptr_answer(response_pkts[i], service, proto, domain)) {
-				found_dns_sd_announce = true;
-				break;
+				dns_sd_announce_count++;
 			}
 		}
+
+		checked_count = responses_count;
 	}
 
 	zassert_true(responses_count > 0, "No announce packets were sent at all");
 
-	zassert_true(found_dns_sd_announce,
-		     "None of the %zu announce packets included a PTR answer for the "
-		     "registered DNS-SD service -- RFC 6762 8.3 announce-completeness "
-		     "not honored",
-		     responses_count);
+	zassert_equal(dns_sd_announce_count, 2U, "Expected two DNS-SD announcements, received %zu",
+		      dns_sd_announce_count);
 }
 
 /* Regression test for the "DHCP-bound announce races ahead of the RFC 6762
