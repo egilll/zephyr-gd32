@@ -652,9 +652,64 @@ static int mdns_reverse_name_addr(const char *name, struct net_addr *addr)
 	return -EINVAL;
 }
 
-static int mdns_reverse_answer_known(const char *query_name, const uint8_t *msg, uint16_t msg_size,
-				     uint16_t answer_offset, uint16_t answer_count,
-				     struct net_buf *scratch)
+static int mdns_add_nsec(struct net_buf *query, uint16_t name_offset, uint32_t ttl, bool legacy,
+			 enum dns_rr_type existing_type, bool include_name)
+{
+	uint8_t bitmap[4] = {0};
+	size_t bitmap_len;
+
+	if (existing_type <= DNS_RR_TYPE_INVALID || existing_type > DNS_RR_TYPE_AAAA) {
+		return -EINVAL;
+	}
+
+	bitmap_len = existing_type / 8U + 1U;
+	bitmap[existing_type / 8U] = BIT(7U - existing_type % 8U);
+
+	if (net_buf_tailroom(query) < (include_name ? DNS_POINTER_SIZE : 0U) + DNS_QTYPE_LEN +
+					      DNS_QCLASS_LEN + DNS_TTL_LEN + DNS_RDLENGTH_LEN +
+					      DNS_POINTER_SIZE + 2U + bitmap_len) {
+		return -ENOBUFS;
+	}
+
+	if (include_name) {
+		net_buf_add_u8(query, NS_CMPRSFLGS | ((name_offset >> 8) & 0x3f));
+		net_buf_add_u8(query, name_offset & 0xff);
+	}
+
+	net_buf_add_be16(query, DNS_RR_TYPE_NSEC);
+	net_buf_add_be16(query, legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH);
+	net_buf_add_be32(query, ttl);
+	net_buf_add_be16(query, DNS_POINTER_SIZE + 2U + bitmap_len);
+	net_buf_add_u8(query, NS_CMPRSFLGS | ((name_offset >> 8) & 0x3f));
+	net_buf_add_u8(query, name_offset & 0xff);
+	net_buf_add_u8(query, 0U);
+	net_buf_add_u8(query, bitmap_len);
+	net_buf_add_mem(query, bitmap, bitmap_len);
+
+	return 0;
+}
+
+static bool mdns_reverse_nsec_matches(const char *query_name, const uint8_t *msg, uint16_t msg_size,
+				      const struct mdns_answer *answer, struct net_buf *scratch)
+{
+	static const uint8_t ptr_bitmap[] = {0U, 2U, 0U, BIT(3)};
+	const uint8_t *next_name_end;
+	const uint8_t *rdata_end = answer->rdata + answer->rdlength;
+	int ret;
+
+	scratch->len = 0U;
+	ret = dns_unpack_name(msg, msg_size, answer->rdata, scratch, &next_name_end);
+	if (ret < 0 || strcasecmp(scratch->data, query_name) != 0 || next_name_end > rdata_end) {
+		return false;
+	}
+
+	return rdata_end - next_name_end == sizeof(ptr_bitmap) &&
+	       memcmp(next_name_end, ptr_bitmap, sizeof(ptr_bitmap)) == 0;
+}
+
+static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type expected_type,
+				     const uint8_t *msg, uint16_t msg_size, uint16_t answer_offset,
+				     uint16_t answer_count, struct net_buf *scratch)
 {
 	uint16_t offset = answer_offset;
 
@@ -672,8 +727,16 @@ static int mdns_reverse_answer_known(const char *query_name, const uint8_t *msg,
 			return ret;
 		}
 
-		if (answer.type != DNS_RR_TYPE_PTR || answer.class_ != DNS_CLASS_IN ||
+		if (answer.type != expected_type || answer.class_ != DNS_CLASS_IN ||
 		    answer.ttl < MDNS_TTL / 2U || strcasecmp(answer.owner, query_name) != 0) {
+			continue;
+		}
+
+		if (expected_type == DNS_RR_TYPE_NSEC) {
+			if (mdns_reverse_nsec_matches(query_name, msg, msg_size, &answer,
+						      scratch)) {
+				return 1;
+			}
 			continue;
 		}
 
@@ -699,15 +762,13 @@ static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
 {
 	const char *hostname = net_hostname_get();
 	size_t hostname_len = strlen(hostname);
+	bool negative = qtype != DNS_RR_TYPE_PTR && qtype != DNS_RR_TYPE_ANY;
 	int ret;
 
-	if (qtype != DNS_RR_TYPE_PTR && qtype != DNS_RR_TYPE_ANY) {
-		return -EINVAL;
-	}
-
 	if (!legacy && answer_count > 0U) {
-		ret = mdns_reverse_answer_known(query->data, query_msg, query_size, answer_offset,
-						answer_count, scratch);
+		ret = mdns_reverse_answer_known(
+			query->data, negative ? DNS_RR_TYPE_NSEC : DNS_RR_TYPE_PTR, query_msg,
+			query_size, answer_offset, answer_count, scratch);
 		if (ret != 0) {
 			return ret > 0 ? -EALREADY : ret;
 		}
@@ -718,17 +779,34 @@ static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
 		return ret;
 	}
 
-	if (hostname_len > DNS_LABEL_MAX_SIZE ||
-	    net_buf_tailroom(query) <
-		    (legacy ? DNS_QTYPE_LEN + DNS_QCLASS_LEN + DNS_POINTER_SIZE : 0U) +
-			    DNS_QTYPE_LEN + DNS_QCLASS_LEN + DNS_TTL_LEN + DNS_RDLENGTH_LEN +
-			    hostname_len + sizeof(".local") + 1U) {
+	if (net_buf_tailroom(query) < (legacy ? DNS_QTYPE_LEN + DNS_QCLASS_LEN : 0U)) {
 		return -ENOBUFS;
 	}
 
 	if (legacy) {
 		net_buf_add_be16(query, qtype);
 		net_buf_add_be16(query, DNS_CLASS_IN);
+	}
+
+	if (negative) {
+		ret = mdns_add_nsec(query, DNS_MSG_HEADER_SIZE, legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
+				    legacy, DNS_RR_TYPE_PTR, legacy);
+		if (ret < 0) {
+			return ret;
+		}
+
+		setup_dns_hdr(query->data, 1U, 0U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+		return 0;
+	}
+
+	if (hostname_len > DNS_LABEL_MAX_SIZE ||
+	    net_buf_tailroom(query) < (legacy ? DNS_POINTER_SIZE : 0U) + DNS_QTYPE_LEN +
+					      DNS_QCLASS_LEN + DNS_TTL_LEN + DNS_RDLENGTH_LEN +
+					      hostname_len + sizeof(".local") + 1U) {
+		return -ENOBUFS;
+	}
+
+	if (legacy) {
 		net_buf_add_u8(query, NS_CMPRSFLGS);
 		net_buf_add_u8(query, DNS_MSG_HEADER_SIZE);
 	}
@@ -876,29 +954,10 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 
 static void add_address_nsec(struct answer_ctx *ctx, enum dns_rr_type existing_type)
 {
-	uint8_t bitmap[4] = {0};
-	size_t bitmap_len = existing_type / 8U + 1U;
-
-	bitmap[existing_type / 8U] = BIT(7U - existing_type % 8U);
-
-	if (net_buf_tailroom(ctx->query) < DNS_POINTER_SIZE + DNS_QTYPE_LEN + DNS_QCLASS_LEN +
-						   DNS_TTL_LEN + DNS_RDLENGTH_LEN +
-						   DNS_POINTER_SIZE + 2U + bitmap_len) {
-		return;
+	if (mdns_add_nsec(ctx->query, ctx->name_offset, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
+			  ctx->legacy, existing_type, true) == 0) {
+		ctx->additional_count++;
 	}
-
-	net_buf_add_u8(ctx->query, NS_CMPRSFLGS | ((ctx->name_offset >> 8) & 0x3f));
-	net_buf_add_u8(ctx->query, ctx->name_offset & 0xff);
-	net_buf_add_be16(ctx->query, DNS_RR_TYPE_NSEC);
-	net_buf_add_be16(ctx->query, ctx->legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH);
-	net_buf_add_be32(ctx->query, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL);
-	net_buf_add_be16(ctx->query, DNS_POINTER_SIZE + 2U + bitmap_len);
-	net_buf_add_u8(ctx->query, NS_CMPRSFLGS | ((ctx->name_offset >> 8) & 0x3f));
-	net_buf_add_u8(ctx->query, ctx->name_offset & 0xff);
-	net_buf_add_u8(ctx->query, 0U);
-	net_buf_add_u8(ctx->query, bitmap_len);
-	net_buf_add_mem(ctx->query, bitmap, bitmap_len);
-	ctx->additional_count++;
 }
 
 static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dns_rr_type qtype,
@@ -1640,12 +1699,10 @@ static int dns_read(int sock,
 			result->data, ret);
 
 		if (mdns_reverse_name_addr(result->data, &reverse_addr) == 0) {
-			if (qtype == DNS_RR_TYPE_PTR || qtype == DNS_RR_TYPE_ANY) {
-				send_reverse_response(sock, family, src_addr, addrlen, result,
-						      qtype, qclass, recv_if, dns_id, dns_msg.msg,
-						      dns_msg.msg_size, answer_offset, answer_count,
-						      &reverse_addr);
-			}
+			send_reverse_response(sock, family, src_addr, addrlen, result, qtype,
+					      qclass, recv_if, dns_id, dns_msg.msg,
+					      dns_msg.msg_size, answer_offset, answer_count,
+					      &reverse_addr);
 			continue;
 		}
 
