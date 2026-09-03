@@ -112,7 +112,7 @@ static int build_expected_srv_record(uint8_t *buf, size_t buf_size, uint16_t ins
 static int build_expected_ptr_response(uint8_t *buf, size_t buf_size, bool announce)
 {
 	static const uint8_t prefix[] = {
-		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03,
+		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04,
 		0x05, 0x5f, 0x68, 0x74, 0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
 		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00,
 		0x11, 0x94, 0x00, 0x0c, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58,
@@ -122,10 +122,10 @@ static int build_expected_ptr_response(uint8_t *buf, size_t buf_size, bool annou
 	size_t offset = sizeof(prefix);
 	uint16_t host_offset;
 
-	zassert_true(buf_size >= sizeof(prefix) + 32);
+	zassert_true(buf_size >= sizeof(prefix) + 64);
 	memcpy(buf, prefix, sizeof(prefix));
 	if (announce) {
-		buf[7] = 0x04;
+		buf[7] = 0x05;
 		buf[11] = 0x00;
 	}
 
@@ -147,6 +147,23 @@ static int build_expected_ptr_response(uint8_t *buf, size_t buf_size, bool annou
 	buf[offset++] = 0x05;
 	buf[offset++] = 0xf0;
 	buf[offset++] = 0x0d;
+	buf[offset++] = 0xc0 | (host_offset >> 8);
+	buf[offset++] = host_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x2f;
+	buf[offset++] = 0x80;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x78;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x05;
+	buf[offset++] = 0xc0 | (host_offset >> 8);
+	buf[offset++] = host_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x40;
 
 	return offset;
 }
@@ -733,9 +750,12 @@ ZTEST(dns_sd, test_add_aaaa_record)
 ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 {
 	struct net_in_addr addr = { { { 177, 5, 240, 13 } } };
+	struct net_in6_addr addr6;
 	static uint8_t actual_rsp[512];
 	static uint8_t expected_rsp[512];
+	struct dns_header *header = (struct dns_header *)actual_rsp;
 	int expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), false);
+	int core_size = expected_int - (2U * DNS_POINTER_SIZE + sizeof(struct dns_rr) + 3U);
 	int actual_int = dns_sd_handle_ptr_query(NULL, &nasxxxxxx,
 						 &addr,
 						 NULL,
@@ -755,10 +775,21 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
 					      expected_int, false),
 		      "exact-size buffer was rejected");
-	zassert_equal(-ENOSPC,
+	zassert_equal(core_size,
 		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
 					      expected_int - 1, false),
-		      "one-byte-short buffer was accepted");
+		      "optional NSEC prevented the core response");
+	zassert_equal(-ENOSPC,
+		      dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, actual_rsp,
+					      core_size - 1, false),
+		      "one-byte-short core buffer was accepted");
+
+	net_ipv6_addr_create(&addr6, 0xfe80, 0U, 0U, 0U, 0U, 0U, 0U, 1U);
+	actual_int = dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, &addr6, actual_rsp,
+					     sizeof(actual_rsp), false);
+	zassert_true(actual_int > 0, "Dual-stack response failed (%d)", actual_int);
+	zassert_equal(net_ntohs(header->arcount), 4U,
+		      "Dual-stack response contains negative address information");
 
 	/* show non-advertisement for uninitialized port */
 	nonconst_port = 0;

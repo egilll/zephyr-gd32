@@ -1697,6 +1697,38 @@ ZTEST(test_mdns_responder, test_legacy_unicast_query)
 		     "knows nothing of multicast DNS", net_ntohl(resp_record.ttl));
 }
 
+static void check_ipv6_only_nsec(struct net_pkt *pkt, bool legacy)
+{
+	static const uint8_t expected_bitmap[] = {0U, 0U, 0U, 0x08U};
+	struct dns_rr record;
+	uint8_t bitmap[sizeof(expected_bitmap)];
+	uint16_t next_name;
+	uint16_t owner;
+	uint8_t value;
+
+	zassert_ok(net_pkt_read_be16(pkt, &owner), "Missing NSEC owner");
+	zassert_equal(owner & 0xc000U, 0xc000U, "NSEC owner is not compressed");
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "Missing NSEC record");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_NSEC, "Invalid NSEC type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN | (legacy ? 0U : DNS_CLASS_FLUSH),
+		      "Invalid NSEC class");
+	if (legacy) {
+		zassert_true(net_ntohl(record.ttl) <= 10U, "Legacy NSEC TTL is too long");
+	} else {
+		zassert_equal(net_ntohl(record.ttl), 120U, "Invalid NSEC TTL");
+	}
+	zassert_equal(net_ntohs(record.rdlength), DNS_POINTER_SIZE + 2U + sizeof(bitmap),
+		      "Invalid NSEC length");
+	zassert_ok(net_pkt_read_be16(pkt, &next_name), "Missing NSEC next name");
+	zassert_equal(next_name, owner, "NSEC next name does not match its owner");
+	zassert_ok(net_pkt_read_u8(pkt, &value), "Missing NSEC bitmap window");
+	zassert_equal(value, 0U, "Invalid NSEC bitmap window");
+	zassert_ok(net_pkt_read_u8(pkt, &value), "Missing NSEC bitmap length");
+	zassert_equal(value, sizeof(bitmap), "Invalid NSEC bitmap length");
+	zassert_ok(net_pkt_read(pkt, bitmap, sizeof(bitmap)), "Missing NSEC bitmap");
+	zassert_mem_equal(bitmap, expected_bitmap, sizeof(bitmap), "Invalid NSEC bitmap");
+}
+
 static void check_basic_dns_sd_query_resp(struct net_pkt *pkt)
 {
 	struct dns_header resp_header;
@@ -1712,7 +1744,7 @@ static void check_basic_dns_sd_query_resp(struct net_pkt *pkt)
 	/* Header */
 	zassert_ok(net_pkt_read(pkt, &resp_header, sizeof(resp_header)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_header.ancount), 1, "Invalid record count");
-	zassert_equal(net_ntohs(resp_header.arcount), 4, "Invalid record count");
+	zassert_equal(net_ntohs(resp_header.arcount), 5, "Invalid record count");
 
 	validate_label(pkt, "_foo", false);
 	validate_label(pkt, "_udp", false);
@@ -1769,6 +1801,8 @@ static void check_basic_dns_sd_query_resp(struct net_pkt *pkt)
 			 "Address 1 not found");
 	zassert_not_null(net_if_ipv6_addr_lookup_by_iface(iface1, &resp_addr[1]),
 			 "Address 2 not found");
+
+	check_ipv6_only_nsec(pkt, false);
 }
 
 ZTEST(test_mdns_responder, test_basic_dns_sd_query)
@@ -2036,6 +2070,20 @@ static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type 
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "net_pkt skip failed");
 }
 
+static void check_ipv6_address_additional(struct net_pkt *pkt, bool legacy)
+{
+	struct dns_rr record;
+
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "Missing address record");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_AAAA, "Invalid address type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN | (legacy ? 0U : DNS_CLASS_FLUSH),
+		      "Invalid address class");
+	zassert_equal(net_ntohs(record.rdlength), sizeof(struct net_in6_addr),
+		      "Invalid address length");
+	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "Truncated address record");
+}
+
 ZTEST(test_mdns_responder, test_dns_sd_browse_legacy_query)
 {
 	static uint8_t query[] = {
@@ -2076,10 +2124,8 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_legacy_query)
 		0x01,
 	};
 	static const enum dns_rr_type additional_types[] = {
-		DNS_RR_TYPE_SRV,
-		DNS_RR_TYPE_TXT,
-		DNS_RR_TYPE_AAAA,
-		DNS_RR_TYPE_AAAA,
+		DNS_RR_TYPE_SRV,  DNS_RR_TYPE_TXT,  DNS_RR_TYPE_AAAA,
+		DNS_RR_TYPE_AAAA, DNS_RR_TYPE_NSEC,
 	};
 	struct dns_rr record;
 	uint16_t qclass;
@@ -2168,7 +2214,7 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_any_legacy_query)
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Did not receive a legacy ANY browse response");
 
-	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 4U);
+	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 5U);
 	validate_label(response_pkts[0], "_foo", false);
 	validate_label(response_pkts[0], "_udp", false);
 	validate_label(response_pkts[0], "local", true);
@@ -2436,8 +2482,11 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_query)
 	send_msg(service_instance_srv_query, sizeof(service_instance_srv_query));
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an SRV response");
 
-	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 3U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
+	check_ipv6_address_additional(response_pkts[0], false);
+	check_ipv6_address_additional(response_pkts[0], false);
+	check_ipv6_only_nsec(response_pkts[0], false);
 }
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_txt_query)
@@ -2472,7 +2521,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_batched_query)
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive a TXT response");
 	zassert_equal(responses_count, 2U, "Expected one response per question");
 
-	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 3U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 0U);
 	check_service_instance_answer(response_pkts[1], DNS_RR_TYPE_TXT, false);
@@ -2501,7 +2550,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_mixed_qm_qu_query)
 					   (const uint8_t *)&sender_ll_addr),
 		     "QU response was not unicast to the querier");
 
-	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 3U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 0U);
 	check_service_instance_answer(response_pkts[1], DNS_RR_TYPE_TXT, false);
@@ -2521,7 +2570,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_known_answer_suppres
 	send_msg(query, sizeof(query));
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Different SRV known answer did not receive a response");
-	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 3U);
 }
 
 ZTEST(test_mdns_responder, test_canonical_empty_txt_known_answer_suppression)
@@ -2565,7 +2614,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_query)
 	send_msg(query, sizeof(query));
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an ANY response");
 
-	check_service_instance_header(response_pkts[0], 0U, 0U, 2U, 2U);
+	check_service_instance_header(response_pkts[0], 0U, 0U, 2U, 3U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
 }
@@ -2645,7 +2694,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_known_answer_suppres
 	send_msg(txt_query, sizeof(txt_query));
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Known TXT suppressed the entire ANY response");
-	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 2U);
+	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 3U);
 	check_service_instance_answer(response_pkts[1], DNS_RR_TYPE_SRV, false);
 
 	memcpy(all_query, service_instance_srv_known_answer_query,
@@ -2677,7 +2726,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_qu_query)
 	zassert_true(net_ipv6_addr_cmp_raw(header->dst, (const uint8_t *)&sender_ll_addr),
 		     "QU response was not unicast to the querier");
 	zassert_equal(header->hop_limit, 255U, "QU response used the wrong hop limit");
-	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 3U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 }
 
@@ -2695,7 +2744,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_legacy_query)
 	zassert_equal(NET_IPV6_HDR(response_pkts[0])->hop_limit, 255U,
 		      "Legacy response used the wrong hop limit");
 
-	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 2U);
+	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 3U);
 	check_service_instance_question(response_pkts[0], DNS_RR_TYPE_SRV);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, true);
 
@@ -2709,6 +2758,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_legacy_query)
 		zassert_ok(net_pkt_skip(response_pkts[0], net_ntohs(record.rdlength)),
 			   "net_pkt skip failed");
 	}
+	check_ipv6_only_nsec(response_pkts[0], true);
 }
 
 /* Verify a PTR answer's name is exactly service.proto.domain (three labels,
