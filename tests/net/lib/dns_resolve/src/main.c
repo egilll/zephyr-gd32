@@ -955,6 +955,87 @@ ZTEST(dns_resolve, test_dns_unpack_query_classes)
 	}
 }
 
+ZTEST(dns_resolve, test_dns_pack_qname)
+{
+	static const uint8_t expected[] = {
+		7U, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 5U, 'l', 'o', 'c', 'a', 'l', 0U,
+	};
+	static const char *const invalid_names[] = {
+		"",
+		".local",
+		"foo..local",
+		"foo.local..",
+	};
+	uint8_t output[DNS_NAME_MAX_SIZE];
+	uint8_t unchanged[DNS_NAME_MAX_SIZE];
+	char name[DNS_NAME_MAX_SIZE + 1U];
+	uint16_t len;
+	size_t offset;
+	int ret;
+
+	memset(output, 0xa5, sizeof(output));
+	ret = dns_msg_pack_qname(&len, output, sizeof(expected), "example.local");
+	zassert_ok(ret, "Failed to pack name: %d", ret);
+	zassert_equal(len, sizeof(expected), "Unexpected encoded name length");
+	zassert_mem_equal(output, expected, sizeof(expected), "Unexpected encoded name");
+
+	memset(output, 0xa5, sizeof(output));
+	ret = dns_msg_pack_qname(&len, output, sizeof(expected), "example.local.");
+	zassert_ok(ret, "Failed to pack absolute name: %d", ret);
+	zassert_equal(len, sizeof(expected), "Unexpected absolute name length");
+	zassert_mem_equal(output, expected, sizeof(expected), "Unexpected absolute name");
+
+	ret = dns_msg_pack_qname(&len, output, 1U, ".");
+	zassert_ok(ret, "Failed to pack root name: %d", ret);
+	zassert_equal(len, 1U, "Unexpected root name length");
+	zassert_equal(output[0], 0U, "Unexpected encoded root name");
+
+	memset(output, 0xa5, sizeof(output));
+	memcpy(unchanged, output, sizeof(output));
+	len = UINT16_MAX;
+	ret = dns_msg_pack_qname(&len, output, sizeof(expected) - 1U, "example.local");
+	zassert_equal(ret, -ENOMEM, "Accepted undersized output buffer");
+	zassert_equal(len, UINT16_MAX, "Modified length on failure");
+	zassert_mem_equal(output, unchanged, sizeof(output), "Modified output on failure");
+
+	memset(name, 'a', DNS_LABEL_MAX_SIZE);
+	name[DNS_LABEL_MAX_SIZE] = '\0';
+	ret = dns_msg_pack_qname(&len, output, DNS_LABEL_MAX_SIZE + 2U, name);
+	zassert_ok(ret, "Rejected maximum-size label: %d", ret);
+	zassert_equal(len, DNS_LABEL_MAX_SIZE + 2U, "Unexpected maximum label length");
+
+	name[DNS_LABEL_MAX_SIZE] = 'a';
+	name[DNS_LABEL_MAX_SIZE + 1U] = '\0';
+	ret = dns_msg_pack_qname(&len, output, sizeof(output), name);
+	zassert_equal(ret, -EINVAL, "Accepted oversized label");
+
+	for (size_t i = 0U; i < ARRAY_SIZE(invalid_names); i++) {
+		ret = dns_msg_pack_qname(&len, output, sizeof(output), invalid_names[i]);
+		zassert_equal(ret, -EINVAL, "Accepted invalid name %s", invalid_names[i]);
+	}
+
+	offset = 0U;
+	for (size_t i = 0U; i < 4U; i++) {
+		size_t label_size = i == 3U ? 61U : DNS_LABEL_MAX_SIZE;
+
+		memset(&name[offset], 'a', label_size);
+		offset += label_size;
+		if (i != 3U) {
+			name[offset++] = '.';
+		}
+	}
+	name[offset] = '\0';
+
+	ret = dns_msg_pack_qname(&len, output, sizeof(output), name);
+	zassert_ok(ret, "Rejected maximum-size name: %d", ret);
+	zassert_equal(len, DNS_NAME_MAX_SIZE, "Unexpected maximum name length");
+
+	name[offset++] = 'a';
+	name[offset] = '\0';
+	ret = dns_msg_pack_qname(&len, output, sizeof(output), name);
+	zassert_equal(ret, -EINVAL, "Accepted oversized name");
+}
+
 ZTEST(dns_resolve, test_dns_unpack_name)
 {
 	/* NULL string terminator serves a role of a final zero-length label */
