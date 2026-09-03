@@ -344,6 +344,7 @@ config MDNS_RESPONDER_DNS_SD_SERVICE_TYPE_ENUMERATION
 
 config MDNS_RESPONDER_ANNOUNCE_DNS_SD
 	bool "Include DNS-SD service records in mDNS announcements"
+	default y
 	depends on MDNS_RESPONDER_PROBE
 	help
 	  RFC 6762 Section 8.3 requires the startup announcement to contain
@@ -353,12 +354,9 @@ config MDNS_RESPONDER_ANNOUNCE_DNS_SD
 	  DNS_SD_REGISTER_SERVICE() (and any records set through
 	  mdns_responder_set_ext_records()).
 
-	  Enable this for full RFC 6762 compliance. Leave disabled to keep
-	  announcements limited to address records only (smaller, less
-	  frequent traffic on startup) -- clients that actively query for
-	  services (e.g. avahi-browse) are unaffected either way, since
-	  normal query/response handling already answers DNS-SD queries
-	  regardless of this option.
+	  Disable this only when smaller, less frequent startup traffic is
+	  preferred over complete RFC 6762 announcements. Normal queries still
+	  receive DNS-SD responses when this option is disabled.
 endif # MDNS_RESPONDER_DNS_SD
 
 module = MDNS_RESPONDER
