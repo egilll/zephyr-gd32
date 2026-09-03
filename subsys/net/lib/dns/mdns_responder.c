@@ -3644,6 +3644,12 @@ int mdns_responder_set_ext_records(const struct dns_sd_rec *records, size_t coun
 	external_records_count = count;
 	k_mutex_unlock(&external_records_lock);
 
+#if defined(CONFIG_MDNS_RESPONDER_PROBE) && defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
+	if (count > 0U) {
+		start_announce(NULL);
+	}
+#endif
+
 	return 0;
 }
 
