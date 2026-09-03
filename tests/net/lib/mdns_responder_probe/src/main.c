@@ -11,6 +11,7 @@ LOG_MODULE_REGISTER(mdns_resp_probe_test);
 #include <stdint.h>
 #include <string.h>
 
+#include <ipv4.h>
 #include <ipv6.h>
 
 #include <zephyr/net/dns_sd.h>
@@ -81,6 +82,7 @@ static const uint8_t ipv6_hdr_rest[] = {0x11, 0xff, 0xfe, 0x80, 0x00, 0x00, 0x00
 					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb};
 
 static uint8_t mdns_server_ipv6_addr[] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb};
+static uint8_t mdns_server_ipv4_addr[] = {224, 0, 0, 251};
 
 static struct net_in6_addr ll_addr = {
 	{{0xfe, 0x80, 0x43, 0xb8, 0, 0, 0, 0, 0x9f, 0x74, 0x88, 0x9c, 0x1b, 0x44, 0x72, 0x39}}};
@@ -89,6 +91,7 @@ static struct net_in6_addr sender_ll_addr = {
 	{{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x9f, 0x74, 0x88, 0x9c, 0x1b, 0x44, 0x72, 0x39}}};
 
 static bool test_started;
+static bool capture_ipv4;
 static struct k_sem wait_data;
 static struct net_pkt *response_pkts[8];
 static size_t responses_count;
@@ -123,16 +126,23 @@ static void net_iface_init(struct net_if *iface)
 
 static int sender_iface(const struct device *dev, struct net_pkt *pkt)
 {
-	struct net_ipv6_hdr *hdr;
-
 	if (!pkt->buffer) {
 		return -ENODATA;
 	}
 
 	if (test_started && net_pkt_family(pkt) == NET_AF_INET6) {
-		hdr = NET_IPV6_HDR(pkt);
+		struct net_ipv6_hdr *hdr = NET_IPV6_HDR(pkt);
 
 		if (net_ipv6_addr_cmp_raw(hdr->dst, mdns_server_ipv6_addr) &&
+		    responses_count < ARRAY_SIZE(response_pkts)) {
+			net_pkt_ref(pkt);
+			response_pkts[responses_count++] = pkt;
+			k_sem_give(&wait_data);
+		}
+	} else if (test_started && capture_ipv4 && net_pkt_family(pkt) == NET_AF_INET) {
+		struct net_ipv4_hdr *hdr = NET_IPV4_HDR(pkt);
+
+		if (net_ipv4_addr_cmp_raw(hdr->dst, mdns_server_ipv4_addr) &&
 		    responses_count < ARRAY_SIZE(response_pkts)) {
 			net_pkt_ref(pkt);
 			response_pkts[responses_count++] = pkt;
@@ -197,6 +207,7 @@ static void before(void *d)
 
 	responses_count = 0;
 	test_started = true;
+	capture_ipv4 = false;
 }
 
 static void cleanup(void *d)
@@ -204,6 +215,7 @@ static void cleanup(void *d)
 	ARG_UNUSED(d);
 
 	test_started = false;
+	capture_ipv4 = false;
 
 	for (size_t i = 0; i < responses_count; ++i) {
 		if (response_pkts[i]) {
@@ -480,13 +492,21 @@ static bool packet_has_address_answer(struct net_pkt *pkt, uint16_t expected_typ
 				      const void *expected_addr, size_t addr_len, uint32_t ttl)
 {
 	struct dns_header header;
+	size_t header_len;
 	uint16_t answer_count;
+
+	if (net_pkt_family(pkt) == NET_AF_INET) {
+		header_len = NET_IPV4UDPH_LEN;
+	} else if (net_pkt_family(pkt) == NET_AF_INET6) {
+		header_len = NET_IPV6UDPH_LEN;
+	} else {
+		return false;
+	}
 
 	net_pkt_cursor_init(pkt);
 	net_pkt_set_overwrite(pkt, true);
 
-	if (net_pkt_skip(pkt, NET_IPV6UDPH_LEN) != 0 ||
-	    net_pkt_read(pkt, &header, sizeof(header)) != 0 ||
+	if (net_pkt_skip(pkt, header_len) != 0 || net_pkt_read(pkt, &header, sizeof(header)) != 0 ||
 	    (net_ntohs(header.flags) & BIT(15)) == 0 || net_ntohs(header.qdcount) != 0U) {
 		return false;
 	}
@@ -664,12 +684,16 @@ ZTEST(test_mdns_responder_probe, test_tentative_ipv6_waits_for_dad)
 	net_if_flag_clear(iface1, NET_IF_IPV6_NO_ND);
 	ifaddr->addr_state = NET_ADDR_TENTATIVE;
 	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_ADD, iface1, &ll_addr, sizeof(ll_addr));
+	/* A different lifecycle event must not expose the address while DAD is pending. */
+	capture_ipv4 = true;
+	net_mgmt_event_notify(NET_EVENT_IF_UP, iface1);
 	k_sleep(RESPONSE_TIMEOUT);
 	for (size_t i = 0; i < responses_count; ++i) {
 		zassert_false(packet_has_aaaa_answer(response_pkts[i], &ll_addr,
 						     CONFIG_MDNS_RESPONDER_TTL),
 			      "Tentative IPv6 address was announced before DAD completed");
 	}
+	capture_ipv4 = false;
 	clear_responses();
 	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_DEL, iface1, &ll_addr, sizeof(ll_addr));
 	k_sleep(RESPONSE_TIMEOUT);
