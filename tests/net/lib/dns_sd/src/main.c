@@ -325,6 +325,38 @@ ZTEST(dns_sd, test_dns_sd_rec_is_valid)
 	zassert_equal(true, rec_is_valid(&nasxxxxxx), "");
 }
 
+ZTEST(dns_sd, test_dns_sd_txt_is_valid)
+{
+	static const uint8_t valid_txt[] = {
+		3, 'f', 'o', 'o', 5, 'b', 'a', 'r', '=', '1',
+	};
+	static const uint8_t truncated_txt[] = {4, 'f', 'o', 'o'};
+	static const uint8_t empty_txt[] = {0};
+	struct dns_sd_rec record = nasxxxxxx;
+	uint8_t output[BUFSZ] = {0xa5};
+
+	record.text = (const char *)valid_txt;
+	record.text_size = sizeof(valid_txt);
+	zassert_true(rec_is_valid(&record), "valid TXT strings were rejected");
+
+	record.text = (const char *)empty_txt;
+	record.text_size = 0U;
+	zassert_true(rec_is_valid(&record), "canonical empty TXT was rejected");
+	record.text_size = sizeof(empty_txt);
+	zassert_true(rec_is_valid(&record), "encoded empty TXT string was rejected");
+
+	record.text = (const char *)truncated_txt;
+	record.text_size = sizeof(truncated_txt);
+	zassert_false(rec_is_valid(&record), "truncated TXT string was accepted");
+	zassert_equal(add_txt_record(&record, DNS_SD_TXT_TTL, 0U, output, 0U, sizeof(output)),
+		      -EINVAL, "malformed TXT data reached the encoder");
+	zassert_equal(output[0], 0xa5, "malformed TXT data modified the output buffer");
+
+	record.text = (const char *)valid_txt;
+	record.text_size = (size_t)UINT16_MAX + 1U;
+	zassert_false(rec_is_valid(&record), "oversized TXT data was accepted");
+}
+
 /** Test for @ref creqte_query */
 ZTEST(dns_sd, test_create_query)
 {
