@@ -1591,6 +1591,52 @@ ZTEST(test_mdns_responder, test_basic_dns_sd_query)
 	check_basic_dns_sd_query_resp(response_pkts[0]);
 }
 
+ZTEST(test_mdns_responder, test_dns_sd_browse_any_query)
+{
+	static const uint8_t query[] = {
+		/* Header */
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* _foo._udp.local, ANY, class IN */
+		0x04,
+		0x5f,
+		0x66,
+		0x6f,
+		0x6f,
+		0x04,
+		0x5f,
+		0x75,
+		0x64,
+		0x70,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0xff,
+		0x00,
+		0x01,
+	};
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive an ANY browse response");
+	check_basic_dns_sd_query_resp(response_pkts[0]);
+}
+
 ZTEST(test_mdns_responder, test_dns_sd_browse_qu_query)
 {
 	static uint8_t query[] = {
@@ -1872,6 +1918,69 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_legacy_query)
 	}
 }
 
+ZTEST(test_mdns_responder, test_dns_sd_browse_any_legacy_query)
+{
+	static const uint8_t query[] = {
+		/* Header with an identifier the response must repeat */
+		0x12,
+		0x34,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* _foo._udp.local, ANY, class IN */
+		0x04,
+		0x5f,
+		0x66,
+		0x6f,
+		0x6f,
+		0x04,
+		0x5f,
+		0x75,
+		0x64,
+		0x70,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0xff,
+		0x00,
+		0x01,
+	};
+	struct dns_rr record;
+	uint16_t qclass;
+	uint16_t qtype;
+
+	send_msg_from_port(query, sizeof(query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a legacy ANY browse response");
+
+	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 4U);
+	validate_label(response_pkts[0], "_foo", false);
+	validate_label(response_pkts[0], "_udp", false);
+	validate_label(response_pkts[0], "local", true);
+	zassert_ok(net_pkt_read_be16(response_pkts[0], &qtype), "net_pkt read failed");
+	zassert_equal(qtype, DNS_RR_TYPE_ANY, "Legacy response did not repeat ANY question");
+	zassert_ok(net_pkt_read_be16(response_pkts[0], &qclass), "net_pkt read failed");
+	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
+
+	skip_labels(response_pkts[0]);
+	zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_PTR, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN, "Unexpected answer class");
+	zassert_equal(net_ntohl(record.ttl), 10U, "Unexpected answer TTL");
+}
+
 ZTEST(test_mdns_responder, test_service_type_legacy_query)
 {
 	struct dns_rr record;
@@ -1901,6 +2010,37 @@ ZTEST(test_mdns_responder, test_service_type_legacy_query)
 	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_PTR, "Unexpected answer type");
 	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN, "Unexpected answer class");
 	zassert_equal(net_ntohl(record.ttl), 10U, "Unexpected answer TTL");
+}
+
+ZTEST(test_mdns_responder, test_service_type_any_queries)
+{
+	uint8_t query[sizeof(dns_sd_service_enumeration_query)];
+	uint16_t qclass;
+	uint16_t qtype;
+
+	memcpy(query, dns_sd_service_enumeration_query, sizeof(query));
+	query[sizeof(query) - 4U] = 0x00;
+	query[sizeof(query) - 3U] = DNS_RR_TYPE_ANY;
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive an ANY service-type response");
+	check_service_type_enum_resp(response_pkts[0], payload_foo_udp_local,
+				     sizeof(payload_foo_udp_local));
+
+	query[0] = 0x12;
+	query[1] = 0x34;
+	send_msg_from_port(query, sizeof(query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a legacy ANY service-type response");
+	check_service_instance_header(response_pkts[1], 0x1234U, 1U, 1U, 0U);
+	validate_label(response_pkts[1], "_services", false);
+	validate_label(response_pkts[1], "_dns-sd", false);
+	validate_label(response_pkts[1], "_udp", false);
+	validate_label(response_pkts[1], "local", true);
+	zassert_ok(net_pkt_read_be16(response_pkts[1], &qtype), "net_pkt read failed");
+	zassert_equal(qtype, DNS_RR_TYPE_ANY, "Legacy response did not repeat ANY question");
+	zassert_ok(net_pkt_read_be16(response_pkts[1], &qclass), "net_pkt read failed");
+	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
 }
 
 static const uint8_t service_instance_srv_query[] = {
@@ -2159,6 +2299,60 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_query)
 	check_service_instance_header(response_pkts[0], 0U, 0U, 2U, 2U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_owner_type_mismatch)
+{
+	static const uint8_t service_owner_srv_query[] = {
+		/* Header */
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* _foo._udp.local, SRV, class IN */
+		0x04,
+		0x5f,
+		0x66,
+		0x6f,
+		0x6f,
+		0x04,
+		0x5f,
+		0x75,
+		0x64,
+		0x70,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0x21,
+		0x00,
+		0x01,
+	};
+	uint8_t instance_ptr_query[sizeof(service_instance_srv_query)];
+
+	send_msg(service_owner_srv_query, sizeof(service_owner_srv_query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "SRV question at service owner received an answer");
+
+	memcpy(instance_ptr_query, service_instance_srv_query, sizeof(instance_ptr_query));
+	instance_ptr_query[sizeof(instance_ptr_query) - 4U] = 0x00;
+	instance_ptr_query[sizeof(instance_ptr_query) - 3U] = DNS_RR_TYPE_PTR;
+	send_msg(instance_ptr_query, sizeof(instance_ptr_query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "PTR question at instance owner received an answer");
+	zassert_equal(responses_count, 0U, "Mismatched owner types produced a response");
 }
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_known_answer_suppression)
