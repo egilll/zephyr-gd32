@@ -185,6 +185,62 @@ static size_t skip_uncompressed_name(const uint8_t *buf, size_t buf_size, size_t
 	}
 }
 
+static size_t skip_name(const uint8_t *buf, size_t buf_size, size_t offset)
+{
+	while (true) {
+		uint8_t label_len;
+
+		zassert_true(offset < buf_size, "Truncated DNS name");
+		label_len = buf[offset++];
+		if ((label_len & 0xc0U) == 0xc0U) {
+			zassert_true(offset < buf_size, "Truncated DNS name pointer");
+			return offset + 1U;
+		}
+
+		zassert_equal(label_len & 0xc0U, 0U, "Invalid DNS label");
+		if (label_len == 0U) {
+			return offset;
+		}
+
+		zassert_true(label_len <= buf_size - offset, "Truncated DNS label");
+		offset += label_len;
+	}
+}
+
+static size_t count_records(const uint8_t *buf, size_t buf_size, enum dns_rr_type type)
+{
+	const struct dns_header *header = (const struct dns_header *)buf;
+	size_t question_count = net_ntohs(header->qdcount);
+	size_t record_count = net_ntohs(header->ancount) + net_ntohs(header->nscount) +
+			      net_ntohs(header->arcount);
+	size_t matches = 0U;
+	size_t offset = sizeof(*header);
+
+	for (size_t i = 0U; i < question_count; ++i) {
+		offset = skip_name(buf, buf_size, offset);
+		zassert_true(DNS_QTYPE_LEN + DNS_QCLASS_LEN <= buf_size - offset,
+			     "Truncated DNS question");
+		offset += DNS_QTYPE_LEN + DNS_QCLASS_LEN;
+	}
+
+	for (size_t i = 0U; i < record_count; ++i) {
+		uint16_t rdlength;
+
+		offset = skip_name(buf, buf_size, offset);
+		zassert_true(sizeof(struct dns_rr) <= buf_size - offset,
+			     "Truncated resource record");
+		matches += sys_get_be16(&buf[offset]) == type;
+		rdlength = sys_get_be16(&buf[offset + 8U]);
+		offset += sizeof(struct dns_rr);
+		zassert_true(rdlength <= buf_size - offset, "Truncated RDATA");
+		offset += rdlength;
+	}
+
+	zassert_equal(offset, buf_size, "Unexpected trailing response data");
+
+	return matches;
+}
+
 /**
  * @brief Create a DNS query
  *
@@ -809,6 +865,71 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 		NULL, &invalid_dns_sd_record,
 		&addr, NULL, &actual_rsp[0], sizeof(actual_rsp) -
 		sizeof(struct dns_header), false), "");
+}
+
+ZTEST(dns_sd, test_dns_sd_address_rrsets_are_atomic)
+{
+	Z_TEST_SKIP_IFNDEF(CONFIG_NET_IPV6);
+
+	static uint8_t response[512];
+	struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_SRV,
+		.class_ = DNS_CLASS_IN,
+	};
+	struct net_in6_addr addr1;
+	struct net_in6_addr addr2;
+	struct net_if_addr *ifaddr1;
+	struct net_if_addr *ifaddr2;
+	struct net_if *iface = net_if_get_first_by_type(&NET_L2_GET_NAME(DUMMY));
+	const size_t compressed_a_size =
+		DNS_POINTER_SIZE + sizeof(struct dns_rr) + sizeof(struct net_in_addr);
+	const size_t host_name_size = DNS_LABEL_LEN_SIZE + strlen(net_hostname_get()) +
+				      DNS_LABEL_LEN_SIZE + strlen(nasxxxxxx.domain) +
+				      DNS_LABEL_LEN_SIZE;
+	const size_t uncompressed_a_size =
+		host_name_size + sizeof(struct dns_rr) + sizeof(struct net_in_addr);
+	int full_len;
+	int response_len;
+
+	zassert_not_null(iface, "Interface not available");
+	net_ipv6_addr_create(&addr1, 0x2001, 0xdb8, 0U, 0U, 0U, 0U, 0U, 1U);
+	net_ipv6_addr_create(&addr2, 0x2001, 0xdb8, 0U, 0U, 0U, 0U, 0U, 2U);
+	ifaddr1 = net_if_ipv6_addr_add(iface, &addr1, NET_ADDR_MANUAL, 0U);
+	ifaddr2 = net_if_ipv6_addr_add(iface, &addr2, NET_ADDR_MANUAL, 0U);
+	zassert_not_null(ifaddr1, "Could not add first IPv6 address");
+	zassert_not_null(ifaddr2, "Could not add second IPv6 address");
+	ifaddr1->addr_state = NET_ADDR_PREFERRED;
+	ifaddr2->addr_state = NET_ADDR_PREFERRED;
+
+	full_len = dns_sd_handle_ptr_query(iface, &nasxxxxxx, NULL, NULL, response,
+					   sizeof(response), false);
+	zassert_true(full_len > (int)compressed_a_size, "Full PTR response failed (%d)", full_len);
+	zassert_true(count_records(response, full_len, DNS_RR_TYPE_AAAA) >= 2U,
+		     "Full PTR response lacks the test AAAA RRset");
+	zassert_equal(count_records(response, full_len, DNS_RR_TYPE_A), 1U,
+		      "Full PTR response has an unexpected A RRset");
+	response_len = dns_sd_handle_ptr_query(iface, &nasxxxxxx, NULL, NULL, response,
+					       full_len - compressed_a_size - 1U, false);
+	zassert_true(response_len > 0, "Tight PTR response failed (%d)", response_len);
+	zassert_equal(count_records(response, response_len, DNS_RR_TYPE_AAAA), 0U,
+		      "PTR response contains a partial AAAA RRset");
+
+	full_len = dns_sd_handle_query(iface, &nasxxxxxx, NULL, NULL, &query, response,
+				       sizeof(response));
+	zassert_true(full_len > (int)uncompressed_a_size, "Full SRV response failed (%d)",
+		     full_len);
+	zassert_true(count_records(response, full_len, DNS_RR_TYPE_AAAA) >= 2U,
+		     "Full SRV response lacks the test AAAA RRset");
+	zassert_equal(count_records(response, full_len, DNS_RR_TYPE_A), 1U,
+		      "Full SRV response has an unexpected A RRset");
+	response_len = dns_sd_handle_query(iface, &nasxxxxxx, NULL, NULL, &query, response,
+					   full_len - uncompressed_a_size - 1U);
+	zassert_true(response_len > 0, "Tight SRV response failed (%d)", response_len);
+	zassert_equal(count_records(response, response_len, DNS_RR_TYPE_AAAA), 0U,
+		      "SRV response contains a partial AAAA RRset");
+
+	zassert_true(net_if_ipv6_addr_rm(iface, &addr1), "Could not remove first IPv6 address");
+	zassert_true(net_if_ipv6_addr_rm(iface, &addr2), "Could not remove second IPv6 address");
 }
 
 /* RFC 6762 Section 8.3: unsolicited announcements must place every record in the
