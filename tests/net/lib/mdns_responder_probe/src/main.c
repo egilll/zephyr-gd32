@@ -712,14 +712,10 @@ ZTEST(test_mdns_responder_probe, test_tentative_ipv6_waits_for_dad)
 	net_if_flag_set(iface1, NET_IF_IPV6_NO_ND);
 }
 
-/* Regression test for the RFC 6762 8.3 announce-completeness feature:
- * send_announce() used to only ever announce address (A/AAAA) records on
- * startup/re-announce, never a registered DNS-SD service's PTR/SRV/TXT
- * records, even though RFC 6762 8.3 requires announcing *all* of a
- * responder's newly registered records. This registers one external DNS-SD
- * record, drives the responder through a normal (non-racing) bring-up, and
- * checks that at least one of the announce packets sent to the mDNS group
- * is a PTR answer for that service -- not just the address-only announce.
+/* Regression test for RFC 6762 8.3 announcement completeness and runtime
+ * registration. A newly installed external service must itself schedule both
+ * announcement rounds, with PTR/SRV/TXT records rather than address-only
+ * packets, without relying on an unrelated interface event.
  */
 ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 {
@@ -745,7 +741,6 @@ ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 
 	zassert_ok(mdns_responder_set_ext_records(&record, 1),
 		   "Failed to register the external DNS-SD record");
-	net_mgmt_event_notify(NET_EVENT_IF_UP, iface1);
 
 	/* Poll for both required announcement rounds instead of sleeping the
 	 * full worst-case probe window.
