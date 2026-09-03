@@ -826,7 +826,7 @@ static size_t append_reverse_known_nsec(uint8_t *query, size_t offset, uint32_t 
 }
 
 static void check_reverse_response(struct net_pkt *pkt, bool legacy, enum dns_rr_type qtype,
-				   uint16_t id)
+				   enum dns_class qclass, uint16_t id)
 {
 	struct dns_header header;
 	struct dns_rr record;
@@ -845,7 +845,7 @@ static void check_reverse_response(struct net_pkt *pkt, bool legacy, enum dns_rr
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
 		zassert_equal(value, qtype, "Repeated question has the wrong type");
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
-		zassert_equal(value, DNS_CLASS_IN, "Repeated question has the wrong class");
+		zassert_equal(value, qclass, "Repeated question has the wrong class");
 	}
 
 	skip_labels(pkt);
@@ -863,7 +863,7 @@ static void check_reverse_response(struct net_pkt *pkt, bool legacy, enum dns_rr
 }
 
 static void check_reverse_nsec_response(struct net_pkt *pkt, bool legacy, enum dns_rr_type qtype,
-					uint16_t id)
+					enum dns_class qclass, uint16_t id)
 {
 	static const uint8_t expected_bitmap[] = {0U, 2U, 0U, BIT(3)};
 	struct dns_header header;
@@ -885,7 +885,7 @@ static void check_reverse_nsec_response(struct net_pkt *pkt, bool legacy, enum d
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
 		zassert_equal(value, qtype, "Repeated question has the wrong type");
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
-		zassert_equal(value, DNS_CLASS_IN, "Repeated question has the wrong class");
+		zassert_equal(value, qclass, "Repeated question has the wrong class");
 	}
 
 	skip_labels(pkt);
@@ -1291,13 +1291,13 @@ ZTEST(test_mdns_responder, test_reverse_ptr_queries)
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No IPv6 reverse PTR response");
-	check_reverse_response(response_pkts[0], false, DNS_RR_TYPE_PTR, 0U);
+	check_reverse_response(response_pkts[0], false, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
 
 	addr.in6_addr = extra_addr;
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_ANY, DNS_CLASS_ANY, 0U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No IPv6 reverse ANY response");
-	check_reverse_response(response_pkts[1], false, DNS_RR_TYPE_ANY, 0U);
+	check_reverse_response(response_pkts[1], false, DNS_RR_TYPE_ANY, DNS_CLASS_ANY, 0U);
 
 	addr.family = NET_AF_INET;
 	zassert_ok(net_addr_pton(NET_AF_INET, "192.0.2.42", &addr.in_addr),
@@ -1309,7 +1309,7 @@ ZTEST(test_mdns_responder, test_reverse_ptr_queries)
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No IPv4 reverse PTR response");
-	check_reverse_response(response_pkts[2], false, DNS_RR_TYPE_PTR, 0U);
+	check_reverse_response(response_pkts[2], false, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
 	zassert_true(net_if_ipv4_addr_rm(iface1, &addr.in_addr), "Cannot remove IPv4 test address");
 
 	addr.family = NET_AF_INET6;
@@ -1344,7 +1344,7 @@ ZTEST(test_mdns_responder, test_reverse_ptr_known_answer_suppression)
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Stale reverse PTR did not receive a response");
-	check_reverse_response(response_pkts[0], false, DNS_RR_TYPE_PTR, 0U);
+	check_reverse_response(response_pkts[0], false, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
 }
 
 ZTEST(test_mdns_responder, test_reverse_nsec_queries)
@@ -1360,18 +1360,19 @@ ZTEST(test_mdns_responder, test_reverse_nsec_queries)
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No reverse NSEC response");
-	check_reverse_nsec_response(response_pkts[0], false, DNS_RR_TYPE_A, 0U);
+	check_reverse_nsec_response(response_pkts[0], false, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_NSEC, DNS_CLASS_ANY, 0U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No direct NSEC response");
-	check_reverse_nsec_response(response_pkts[1], false, DNS_RR_TYPE_NSEC, 0U);
+	check_reverse_nsec_response(response_pkts[1], false, DNS_RR_TYPE_NSEC, DNS_CLASS_ANY, 0U);
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_AAAA,
 					 DNS_CLASS_IN | DNS_CLASS_FLUSH, query_id);
 	send_msg_from_port(query, query_size, 45678U);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No legacy reverse NSEC response");
-	check_reverse_nsec_response(response_pkts[2], true, DNS_RR_TYPE_AAAA, query_id);
+	check_reverse_nsec_response(response_pkts[2], true, DNS_RR_TYPE_AAAA, DNS_CLASS_IN,
+				    query_id);
 }
 
 ZTEST(test_mdns_responder, test_reverse_nsec_known_answer_suppression)
@@ -1396,7 +1397,7 @@ ZTEST(test_mdns_responder, test_reverse_nsec_known_answer_suppression)
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Stale reverse NSEC did not receive a response");
-	check_reverse_nsec_response(response_pkts[0], false, DNS_RR_TYPE_A, 0U);
+	check_reverse_nsec_response(response_pkts[0], false, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
 }
 
 ZTEST(test_mdns_responder, test_legacy_reverse_ptr_query)
@@ -1410,10 +1411,10 @@ ZTEST(test_mdns_responder, test_legacy_reverse_ptr_query)
 	size_t query_size;
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR,
-					 DNS_CLASS_IN | DNS_CLASS_FLUSH, query_id);
+					 DNS_CLASS_ANY | DNS_CLASS_FLUSH, query_id);
 	send_msg_from_port(query, query_size, 45678U);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No legacy reverse PTR response");
-	check_reverse_response(response_pkts[0], true, DNS_RR_TYPE_PTR, query_id);
+	check_reverse_response(response_pkts[0], true, DNS_RR_TYPE_PTR, DNS_CLASS_ANY, query_id);
 }
 
 ZTEST(test_mdns_responder, test_query_class_any)
@@ -1447,9 +1448,8 @@ ZTEST(test_mdns_responder, test_legacy_unicast_query)
 		0x12, 0x34, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		/* zephyr.local */
 		0x06, 0x7a, 0x65, 0x70, 0x68, 0x79, 0x72, 0x05, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00,
-		/* AAAA record */
-		0x00, 0x1c, 0x00, 0x01
-	};
+		/* AAAA record, class ANY */
+		0x00, 0x1c, 0x00, 0xff};
 	struct dns_header resp_header;
 	struct dns_rr resp_record;
 	uint16_t qtype;
@@ -1480,7 +1480,7 @@ ZTEST(test_mdns_responder, test_legacy_unicast_query)
 	zassert_ok(net_pkt_read_be16(pkt, &qtype), "net_pkt read failed");
 	zassert_equal(qtype, DNS_RR_TYPE_AAAA, "Repeated question has the wrong type");
 	zassert_ok(net_pkt_read_be16(pkt, &qclass), "net_pkt read failed");
-	zassert_equal(qclass, DNS_CLASS_IN, "Repeated question has the wrong class");
+	zassert_equal(qclass, DNS_CLASS_ANY, "Repeated question has the wrong class");
 
 	/* The first answer, which names the question rather than repeating it */
 	skip_labels(pkt);
@@ -1607,7 +1607,7 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_any_query)
 		0x00,
 		0x00,
 		0x00,
-		/* _foo._udp.local, ANY, class IN */
+		/* _foo._udp.local, ANY, class ANY */
 		0x04,
 		0x5f,
 		0x66,
@@ -1628,7 +1628,7 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_any_query)
 		0x00,
 		0xff,
 		0x00,
-		0x01,
+		0xff,
 	};
 
 	send_msg(query, sizeof(query));
@@ -1934,7 +1934,7 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_any_legacy_query)
 		0x00,
 		0x00,
 		0x00,
-		/* _foo._udp.local, ANY, class IN */
+		/* _foo._udp.local, ANY, class ANY */
 		0x04,
 		0x5f,
 		0x66,
@@ -1955,7 +1955,7 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_any_legacy_query)
 		0x00,
 		0xff,
 		0x00,
-		0x01,
+		0xff,
 	};
 	struct dns_rr record;
 	uint16_t qclass;
@@ -1972,7 +1972,7 @@ ZTEST(test_mdns_responder, test_dns_sd_browse_any_legacy_query)
 	zassert_ok(net_pkt_read_be16(response_pkts[0], &qtype), "net_pkt read failed");
 	zassert_equal(qtype, DNS_RR_TYPE_ANY, "Legacy response did not repeat ANY question");
 	zassert_ok(net_pkt_read_be16(response_pkts[0], &qclass), "net_pkt read failed");
-	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
+	zassert_equal(qclass, DNS_CLASS_ANY, "Unexpected question class");
 
 	skip_labels(response_pkts[0]);
 	zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)), "net_pkt read failed");
@@ -1991,6 +1991,8 @@ ZTEST(test_mdns_responder, test_service_type_legacy_query)
 	memcpy(query, dns_sd_service_enumeration_query, sizeof(query));
 	query[0] = 0x12;
 	query[1] = 0x34;
+	query[sizeof(query) - 2U] = 0x00;
+	query[sizeof(query) - 1U] = DNS_CLASS_ANY;
 	send_msg_from_port(query, sizeof(query), 45678U);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Did not receive a legacy service type response");
@@ -2003,7 +2005,7 @@ ZTEST(test_mdns_responder, test_service_type_legacy_query)
 	zassert_ok(net_pkt_read_be16(response_pkts[0], &qtype), "net_pkt read failed");
 	zassert_equal(qtype, DNS_RR_TYPE_PTR, "Unexpected question type");
 	zassert_ok(net_pkt_read_be16(response_pkts[0], &qclass), "net_pkt read failed");
-	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
+	zassert_equal(qclass, DNS_CLASS_ANY, "Unexpected question class");
 
 	skip_labels(response_pkts[0]);
 	zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)), "net_pkt read failed");
