@@ -1310,6 +1310,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	uint32_t ptr_ttl;
 	uint16_t answer_count = 0U;
 	uint16_t additional_count = 0U;
+	bool include_srv;
+	bool include_txt;
 	int ret;
 
 	if (query == NULL || buf_size < sizeof(*header)) {
@@ -1327,6 +1329,12 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	srv_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_SRV_TTL;
 	txt_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_TXT_TTL;
 	ptr_ttl = query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_PTR_TTL;
+	include_srv = (query->type == DNS_RR_TYPE_SRV || query->type == DNS_RR_TYPE_ANY ||
+		       query->type == DNS_RR_TYPE_PTR) &&
+		      !query->suppress_srv;
+	include_txt = (query->type == DNS_RR_TYPE_TXT || query->type == DNS_RR_TYPE_ANY ||
+		       query->type == DNS_RR_TYPE_PTR) &&
+		      !query->suppress_txt;
 
 	if (!query->legacy && query->type == DNS_RR_TYPE_PTR) {
 		return dns_sd_handle_ptr_query(iface, inst, addr4, addr6, buf, buf_size, false);
@@ -1368,8 +1376,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		answer_count++;
 	}
 
-	if (query->type == DNS_RR_TYPE_SRV || query->type == DNS_RR_TYPE_ANY ||
-	    query->type == DNS_RR_TYPE_PTR) {
+	if (include_srv) {
 		ret = dns_sd_buf_add_srv(&output, inst, srv_ttl, query->legacy);
 		if (ret < 0) {
 			return ret;
@@ -1381,8 +1388,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		}
 	}
 
-	if (query->type == DNS_RR_TYPE_TXT || query->type == DNS_RR_TYPE_ANY ||
-	    query->type == DNS_RR_TYPE_PTR) {
+	if (include_txt) {
 		ret = dns_sd_buf_add_txt(&output, inst, txt_ttl, query->legacy);
 		if (ret < 0) {
 			return ret;
@@ -1394,8 +1400,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		}
 	}
 
-	if (query->type == DNS_RR_TYPE_SRV || query->type == DNS_RR_TYPE_ANY ||
-	    query->type == DNS_RR_TYPE_PTR) {
+	if (include_srv) {
 		if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
 			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_AAAA, addr6->s6_addr,
 						  sizeof(*addr6));
