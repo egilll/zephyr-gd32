@@ -769,9 +769,17 @@ static bool dns_sd_host_name_matches(const char *name, const struct dns_sd_rec *
 	       strcasecmp(name + hostname_len + 1U, record->domain) == 0;
 }
 
+static bool dns_sd_service_enum_name_matches(const char *name, const struct dns_sd_rec *record)
+{
+	static const char prefix[] = "_services._dns-sd._udp.";
+
+	return strncasecmp(name, prefix, sizeof(prefix) - 1U) == 0 &&
+	       strcasecmp(name + sizeof(prefix) - 1U, record->domain) == 0;
+}
+
 static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type type, uint8_t *msg,
 			      uint16_t msg_size, uint16_t rdata_offset, uint16_t rdlength,
-			      struct net_buf *scratch)
+			      bool service_type_enum, struct net_buf *scratch)
 {
 	const uint8_t *rdata_end;
 	int ret;
@@ -782,7 +790,8 @@ static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type 
 		ret = dns_unpack_name(msg, msg_size, msg + rdata_offset, scratch, &rdata_end);
 		return ret < 0 ? ret
 			       : rdata_end == msg + rdata_offset + rdlength &&
-					 dns_sd_name_matches(scratch->data, record, true);
+					 dns_sd_name_matches(scratch->data, record,
+							     !service_type_enum);
 	case DNS_RR_TYPE_TXT:
 		return rdlength == dns_sd_txt_size(record) &&
 		       memcmp(msg + rdata_offset, record->text, rdlength) == 0;
@@ -812,7 +821,8 @@ static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type 
 
 static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type query_type,
 			       uint8_t *msg, uint16_t msg_size, uint16_t answer_offset,
-			       uint16_t answer_count, struct net_buf *scratch)
+			       uint16_t answer_count, bool service_type_enum,
+			       struct net_buf *scratch)
 {
 	uint16_t offset = answer_offset;
 	uint32_t minimum_ttl;
@@ -868,9 +878,11 @@ static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type
 		}
 
 		if (type == query_type && class_ == DNS_CLASS_IN && ttl >= minimum_ttl &&
-		    dns_sd_name_matches(scratch->data, record, query_type != DNS_RR_TYPE_PTR)) {
+		    (service_type_enum ? dns_sd_service_enum_name_matches(scratch->data, record)
+				       : dns_sd_name_matches(scratch->data, record,
+							     query_type != DNS_RR_TYPE_PTR))) {
 			ret = dns_sd_rdata_known(record, type, msg, msg_size, rdata_offset,
-						 rdlength, scratch);
+						 rdlength, service_type_enum, scratch);
 			if (ret != 0) {
 				return ret;
 			}
@@ -1029,9 +1041,10 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 				continue;
 			}
 
-			if (!query.legacy && !service_type_enum && answer_count > 0U) {
+			if (!query.legacy && answer_count > 0U) {
 				ret = dns_sd_answer_known(record, qtype, query_msg, query_size,
-							  answer_offset, answer_count, result);
+							  answer_offset, answer_count,
+							  service_type_enum, result);
 				if (ret != 0) {
 					if (ret < 0) {
 						NET_DBG("invalid known answer (%d)", ret);
