@@ -185,6 +185,8 @@ static bool instance_is_valid(const char *instance)
 
 static bool service_is_valid(const char *service)
 {
+	bool previous_hyphen = false;
+	bool has_letter = false;
 	size_t service_size;
 
 	if (service == NULL) {
@@ -211,13 +213,23 @@ static bool service_is_valid(const char *service)
 		return false;
 	}
 
-	if (!label_is_valid(&service[1], service_size - 1)) {
-		NET_DBG("service '%s' contains invalid characters",
-			service);
-		return false;
+	for (size_t i = 1U; i < service_size; ++i) {
+		unsigned char byte = service[i];
+
+		if (isalpha(byte) != 0) {
+			has_letter = true;
+			previous_hyphen = false;
+		} else if (isdigit(byte) != 0) {
+			previous_hyphen = false;
+		} else if (byte == '-' && i > 1U && i + 1U < service_size && !previous_hyphen) {
+			previous_hyphen = true;
+		} else {
+			NET_DBG("service '%s' contains invalid characters", service);
+			return false;
+		}
 	}
 
-	return service_size;
+	return has_letter;
 }
 
 static bool proto_is_valid(const char *proto)
