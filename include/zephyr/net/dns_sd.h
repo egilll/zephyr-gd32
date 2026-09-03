@@ -250,11 +250,14 @@ extern const uint16_t dns_sd_port_zero;
  * @brief Obtain the size of DNS-SD TXT data
  *
  * @param rec the record to in question
- * @return the size of the text field
+ * An empty attribute set is encoded as a single zero-length character-string,
+ * as required by RFC 6763.
+ *
+ * @return the encoded size of the text field
  */
 static inline size_t dns_sd_txt_size(const struct dns_sd_rec *rec)
 {
-	return rec->text_size;
+	return rec->text_size == 0U ? 1U : rec->text_size;
 }
 
 /**
