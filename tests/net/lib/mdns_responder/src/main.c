@@ -1116,6 +1116,37 @@ static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type 
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "net_pkt skip failed");
 }
 
+ZTEST(test_mdns_responder, test_service_type_legacy_query)
+{
+	struct dns_rr record;
+	uint16_t qclass;
+	uint16_t qtype;
+	uint8_t query[sizeof(dns_sd_service_enumeration_query)];
+
+	memcpy(query, dns_sd_service_enumeration_query, sizeof(query));
+	query[0] = 0x12;
+	query[1] = 0x34;
+	send_msg_from_port(query, sizeof(query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a legacy service type response");
+
+	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 0U);
+	validate_label(response_pkts[0], "_services", false);
+	validate_label(response_pkts[0], "_dns-sd", false);
+	validate_label(response_pkts[0], "_udp", false);
+	validate_label(response_pkts[0], "local", true);
+	zassert_ok(net_pkt_read_be16(response_pkts[0], &qtype), "net_pkt read failed");
+	zassert_equal(qtype, DNS_RR_TYPE_PTR, "Unexpected question type");
+	zassert_ok(net_pkt_read_be16(response_pkts[0], &qclass), "net_pkt read failed");
+	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
+
+	skip_labels(response_pkts[0]);
+	zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_PTR, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN, "Unexpected answer class");
+	zassert_equal(net_ntohl(record.ttl), 10U, "Unexpected answer TTL");
+}
+
 static const uint8_t service_instance_srv_query[] = {
 	/* Header */
 	0x00,
