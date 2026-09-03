@@ -3411,6 +3411,79 @@ static void send_dns_sd_announce(struct net_if *iface, int sock, net_sa_family_t
 	k_mutex_unlock(&external_records_lock);
 	net_buf_unref(answer);
 }
+
+static void send_dns_sd_goodbyes_on_transport(struct net_if *iface, int sock,
+					      net_sa_family_t family,
+					      const struct dns_sd_rec *records, size_t count)
+{
+	struct net_buf *answer;
+	int ret;
+
+	answer = net_buf_alloc(&mdns_msg_pool, BUF_ALLOC_TIMEOUT);
+	if (answer == NULL) {
+		return;
+	}
+
+	for (size_t i = 0U; i < count; ++i) {
+		ret = dns_sd_handle_goodbye(&records[i], answer->data, net_buf_max_len(answer));
+		if (ret < 0) {
+			continue;
+		}
+
+		answer->len = ret;
+		ret = send_unsolicited_response(iface, sock, family, NULL, 0U, answer);
+		if (ret < 0) {
+			NET_DBG("Cannot send %s DNS-SD goodbye for %s.%s.%s.%s (%d)", "mDNS",
+				records[i].instance, records[i].service, records[i].proto,
+				records[i].domain, ret);
+		}
+	}
+
+	net_buf_unref(answer);
+}
+
+static void send_dns_sd_goodbyes(const struct dns_sd_rec *records, size_t count)
+{
+	if (!init_listener_done || records == NULL || count == 0U) {
+		return;
+	}
+
+#if defined(CONFIG_NET_IPV4)
+	struct net_sockaddr_in dst_addr4;
+
+	create_ipv4_addr(&dst_addr4);
+
+	ARRAY_FOR_EACH(v4_ctx, i) {
+		if (v4_ctx[i].sock < 0 || v4_ctx[i].iface == NULL ||
+		    !net_if_is_up(v4_ctx[i].iface) ||
+		    net_ipv4_is_addr_unspecified(
+			    net_if_ipv4_select_src_addr(v4_ctx[i].iface, &dst_addr4.sin_addr))) {
+			continue;
+		}
+
+		send_dns_sd_goodbyes_on_transport(v4_ctx[i].iface, v4_ctx[i].sock, NET_AF_INET,
+						  records, count);
+	}
+#endif /* CONFIG_NET_IPV4 */
+
+#if defined(CONFIG_NET_IPV6)
+	struct net_sockaddr_in6 dst_addr6;
+
+	create_ipv6_addr(&dst_addr6);
+
+	ARRAY_FOR_EACH(v6_ctx, i) {
+		if (v6_ctx[i].sock < 0 || v6_ctx[i].iface == NULL ||
+		    !net_if_is_up(v6_ctx[i].iface) ||
+		    net_ipv6_is_addr_unspecified(
+			    net_if_ipv6_select_src_addr(v6_ctx[i].iface, &dst_addr6.sin6_addr))) {
+			continue;
+		}
+
+		send_dns_sd_goodbyes_on_transport(v6_ctx[i].iface, v6_ctx[i].sock, NET_AF_INET6,
+						  records, count);
+	}
+#endif /* CONFIG_NET_IPV6 */
+}
 #endif /* CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD */
 
 static int send_announce(const char *name)
@@ -3640,6 +3713,9 @@ int mdns_responder_set_ext_records(const struct dns_sd_rec *records, size_t coun
 	}
 
 	k_mutex_lock(&external_records_lock, K_FOREVER);
+#if defined(CONFIG_MDNS_RESPONDER_PROBE) && defined(CONFIG_MDNS_RESPONDER_ANNOUNCE_DNS_SD)
+	send_dns_sd_goodbyes(external_records, external_records_count);
+#endif
 	external_records = records;
 	external_records_count = count;
 	k_mutex_unlock(&external_records_lock);

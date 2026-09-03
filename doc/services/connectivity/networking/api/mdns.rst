@@ -60,7 +60,9 @@ Applications can replace the externally supplied service-record array with
 pointers rather than copying their contents, so the array, its strings, TXT
 data, and port values must remain valid until the records are removed. A
 non-empty update made after startup schedules the standard two announcement
-rounds when probing and DNS-SD announcements are enabled.
+rounds when probing and DNS-SD announcements are enabled. Replacing or clearing
+the array sends TTL-zero PTR, SRV, and TXT records for the previous services
+before returning; host address records remain valid and are not withdrawn.
 
 Probing and announcements
 *************************
