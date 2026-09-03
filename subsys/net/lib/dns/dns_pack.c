@@ -599,6 +599,8 @@ const char *dns_qtype_to_str(enum dns_rr_type qtype)
 		return "AAAA";
 	case DNS_RR_TYPE_SRV:
 		return "SRV";
+	case DNS_RR_TYPE_NSEC:
+		return "NSEC";
 	case DNS_RR_TYPE_ANY:
 		return "ANY";
 	default:

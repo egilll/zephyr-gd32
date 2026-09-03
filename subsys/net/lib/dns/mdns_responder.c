@@ -874,6 +874,33 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 			  include_name_ptr);
 }
 
+static void add_address_nsec(struct answer_ctx *ctx, enum dns_rr_type existing_type)
+{
+	uint8_t bitmap[4] = {0};
+	size_t bitmap_len = existing_type / 8U + 1U;
+
+	bitmap[existing_type / 8U] = BIT(7U - existing_type % 8U);
+
+	if (net_buf_tailroom(ctx->query) < DNS_POINTER_SIZE + DNS_QTYPE_LEN + DNS_QCLASS_LEN +
+						   DNS_TTL_LEN + DNS_RDLENGTH_LEN +
+						   DNS_POINTER_SIZE + 2U + bitmap_len) {
+		return;
+	}
+
+	net_buf_add_u8(ctx->query, NS_CMPRSFLGS | ((ctx->name_offset >> 8) & 0x3f));
+	net_buf_add_u8(ctx->query, ctx->name_offset & 0xff);
+	net_buf_add_be16(ctx->query, DNS_RR_TYPE_NSEC);
+	net_buf_add_be16(ctx->query, ctx->legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH);
+	net_buf_add_be32(ctx->query, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL);
+	net_buf_add_be16(ctx->query, DNS_POINTER_SIZE + 2U + bitmap_len);
+	net_buf_add_u8(ctx->query, NS_CMPRSFLGS | ((ctx->name_offset >> 8) & 0x3f));
+	net_buf_add_u8(ctx->query, ctx->name_offset & 0xff);
+	net_buf_add_u8(ctx->query, 0U);
+	net_buf_add_u8(ctx->query, bitmap_len);
+	net_buf_add_mem(ctx->query, bitmap, bitmap_len);
+	ctx->additional_count++;
+}
+
 static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dns_rr_type qtype,
 			 struct net_if *iface, bool legacy, uint16_t dns_id,
 			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
@@ -890,6 +917,7 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 		.known_answer_count = answer_count,
 		.legacy = legacy,
 	};
+	int candidate_count;
 	int ret;
 
 	ret = init_name_labels(query);
@@ -932,6 +960,7 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 	}
 
 	ctx.additional = true;
+	candidate_count = ctx.candidate_count;
 	if (qtype == DNS_RR_TYPE_A && IS_ENABLED(CONFIG_NET_IPV6)) {
 		net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
 	} else if (qtype == DNS_RR_TYPE_AAAA && IS_ENABLED(CONFIG_NET_IPV4)) {
@@ -940,6 +969,10 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 
 	if (ctx.error < 0) {
 		return ctx.error;
+	}
+
+	if (qtype != DNS_RR_TYPE_ANY && ctx.candidate_count == candidate_count) {
+		add_address_nsec(&ctx, qtype);
 	}
 
 	/* A multicast answer carries neither an identifier nor the question:

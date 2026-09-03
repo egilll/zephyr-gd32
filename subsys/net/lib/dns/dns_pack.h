@@ -93,6 +93,7 @@ enum dns_rr_type {
 	DNS_RR_TYPE_TXT = 16,			/* TXT   */
 	DNS_RR_TYPE_AAAA = 28,			/* IPv6  */
 	DNS_RR_TYPE_SRV = 33,			/* SRV   */
+	DNS_RR_TYPE_NSEC = 47,                  /* NSEC  */
 	DNS_RR_TYPE_HTTPS = 65,			/* HTTPS */
 	DNS_RR_TYPE_ANY = 0xff,			/* ANY (all records)   */
 	DNS_RR_TYPE_PRIVATE_START = 65280,	/* Private use start */
