@@ -693,9 +693,8 @@ static int mdns_add_nsec(struct net_buf *query, uint16_t name_offset, uint32_t t
 	return 0;
 }
 
-static bool mdns_nsec_matches(const char *query_name, uint32_t existing_types, const uint8_t *msg,
-			      uint16_t msg_size, const struct mdns_answer *answer,
-			      struct net_buf *scratch)
+static bool mdns_nsec_matches(uint32_t existing_types, const uint8_t *msg, uint16_t msg_size,
+			      const struct mdns_answer *answer, struct net_buf *scratch)
 {
 	uint8_t expected[2U + sizeof(uint32_t)] = {0};
 	const uint8_t *next_name_end;
@@ -716,11 +715,12 @@ static bool mdns_nsec_matches(const char *query_name, uint32_t existing_types, c
 
 	expected[1] = bitmap_len;
 
+	/* RFC 6762 Section 6.1 requires processing the bitmap even when the
+	 * Next Domain Name does not match the owner.
+	 */
 	scratch->len = 0U;
 	ret = dns_unpack_name(msg, msg_size, answer->rdata, scratch, &next_name_end);
-	if (ret < 0 || next_name_end > rdata_end ||
-	    (query_name != NULL ? strcasecmp(scratch->data, query_name) != 0
-				: !mdns_host_name_matches(scratch->data))) {
+	if (ret < 0 || next_name_end > rdata_end) {
 		return false;
 	}
 
@@ -754,8 +754,8 @@ static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type ex
 		}
 
 		if (expected_type == DNS_RR_TYPE_NSEC) {
-			if (mdns_nsec_matches(query_name, BIT(DNS_RR_TYPE_PTR), msg, msg_size,
-					      &answer, scratch)) {
+			if (mdns_nsec_matches(BIT(DNS_RR_TYPE_PTR), msg, msg_size, &answer,
+					      scratch)) {
 				return 1;
 			}
 			continue;
@@ -897,8 +897,8 @@ static int mdns_host_nsec_known(struct answer_ctx *ctx, uint32_t existing_types)
 
 		if (answer.type == DNS_RR_TYPE_NSEC && answer.class_ == DNS_CLASS_IN &&
 		    answer.ttl >= MDNS_TTL / 2U && mdns_host_name_matches(answer.owner) &&
-		    mdns_nsec_matches(NULL, existing_types, ctx->query_msg, ctx->query_size,
-				      &answer, ctx->scratch)) {
+		    mdns_nsec_matches(existing_types, ctx->query_msg, ctx->query_size, &answer,
+				      ctx->scratch)) {
 			return 1;
 		}
 	}
