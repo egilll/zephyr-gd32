@@ -438,7 +438,7 @@ static int get_socket(net_sa_family_t family)
  * an identifier nor the question, RFC 6762 18.1. An answer to a legacy unicast
  * query carries both, RFC 6762 6.7.
  */
-static void setup_dns_hdr(uint8_t *buf, uint16_t answers, uint16_t dns_id,
+static void setup_dns_hdr(uint8_t *buf, uint16_t answers, uint16_t additionals, uint16_t dns_id,
 			  uint16_t questions)
 {
 	struct dns_header *hdr = (struct dns_header *)buf;
@@ -454,7 +454,7 @@ static void setup_dns_hdr(uint8_t *buf, uint16_t answers, uint16_t dns_id,
 	UNALIGNED_PUT(net_htons(questions), UNALIGNED_MEMBER_ADDR(hdr, qdcount));
 	UNALIGNED_PUT(net_htons(answers), UNALIGNED_MEMBER_ADDR(hdr, ancount));
 	UNALIGNED_PUT(0, UNALIGNED_MEMBER_ADDR(hdr, nscount));
-	UNALIGNED_PUT(0, UNALIGNED_MEMBER_ADDR(hdr, arcount));
+	UNALIGNED_PUT(net_htons(additionals), UNALIGNED_MEMBER_ADDR(hdr, arcount));
 }
 
 static int init_name_labels(struct net_buf *query)
@@ -550,6 +550,7 @@ struct answer_ctx {
 	const uint8_t *query_msg;
 	enum dns_rr_type qtype;
 	int answer_count;
+	int additional_count;
 	int candidate_count;
 	int error;
 	uint16_t name_offset;
@@ -557,6 +558,7 @@ struct answer_ctx {
 	uint16_t answer_offset;
 	uint16_t known_answer_count;
 	bool legacy;
+	bool additional;
 };
 
 static bool mdns_host_name_matches(const char *name)
@@ -741,7 +743,7 @@ static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
 	net_buf_add_mem(query, "local", sizeof("local") - 1U);
 	net_buf_add_u8(query, 0U);
 
-	setup_dns_hdr(query->data, 1U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+	setup_dns_hdr(query->data, 1U, 0U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
 
 	return 0;
 }
@@ -811,7 +813,11 @@ static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uin
 	net_buf_add_be16(ctx->query, addr_len);
 	net_buf_add_mem(ctx->query, addr, addr_len);
 
-	ctx->answer_count++;
+	if (ctx->additional) {
+		ctx->additional_count++;
+	} else {
+		ctx->answer_count++;
+	}
 }
 
 static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
@@ -925,11 +931,22 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 		return ctx.candidate_count > 0 ? -EALREADY : -ENOMEM;
 	}
 
+	ctx.additional = true;
+	if (qtype == DNS_RR_TYPE_A && IS_ENABLED(CONFIG_NET_IPV6)) {
+		net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
+	} else if (qtype == DNS_RR_TYPE_AAAA && IS_ENABLED(CONFIG_NET_IPV4)) {
+		net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
+	}
+
+	if (ctx.error < 0) {
+		return ctx.error;
+	}
+
 	/* A multicast answer carries neither an identifier nor the question:
 	 * RFC 6762 18.1 has the identifier zero on transmission and ignored on
 	 * reception, because there is no one querier it belongs to.
 	 */
-	setup_dns_hdr(query->data, ctx.answer_count, legacy ? dns_id : 0U,
+	setup_dns_hdr(query->data, ctx.answer_count, ctx.additional_count, legacy ? dns_id : 0U,
 		      legacy ? 1U : 0U);
 
 	return 0;
@@ -2911,7 +2928,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		return NULL;
 	}
 
-	setup_dns_hdr(answer->data, 1, 0, 0);
+	setup_dns_hdr(answer->data, 1, 0, 0, 0);
 	net_buf_add(answer, DNS_MSG_HEADER_SIZE);
 
 	answer_count = 0U;
