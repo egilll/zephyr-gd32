@@ -910,8 +910,50 @@ ZTEST(dns_resolve, test_dns_localhost_resolve_ipv6)
 		      0, "not loopback address");
 }
 
-NET_BUF_POOL_DEFINE(test_dns_qname_pool, 2, CONFIG_DNS_RESOLVER_MAX_QUERY_LEN,
-		    0, NULL);
+NET_BUF_POOL_DEFINE(test_dns_qname_pool, 2, CONFIG_DNS_RESOLVER_MAX_QUERY_LEN, 0, NULL);
+
+ZTEST(dns_resolve, test_dns_unpack_query_classes)
+{
+	static const struct {
+		uint16_t class_;
+		bool valid;
+	} cases[] = {
+		{DNS_CLASS_IN, true},  {DNS_CLASS_IN | DNS_CLASS_FLUSH, true},
+		{DNS_CLASS_ANY, true}, {DNS_CLASS_ANY | DNS_CLASS_FLUSH, true},
+		{0U, false},           {2U, false},
+		{3U, false},           {254U, false},
+		{256U, false},         {0x7fffU, false},
+	};
+	uint8_t query[] = {
+		0U, 0U, 0U, 0U, 0U, 1U, 0U, 0U, 0U, 0U, 0U, 0U, 1U, 'a', 0U, 0U, DNS_RR_TYPE_A,
+		0U, 0U,
+	};
+
+	for (size_t i = 0U; i < ARRAY_SIZE(cases); ++i) {
+		struct dns_msg_t msg = {
+			.msg = query,
+			.msg_size = sizeof(query),
+			.query_offset = DNS_MSG_HEADER_SIZE,
+		};
+		enum dns_class class_;
+		struct net_buf *result;
+		int ret;
+
+		sys_put_be16(cases[i].class_, &query[sizeof(query) - DNS_QCLASS_LEN]);
+		result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+		zassert_not_null(result, "Failed to allocate query-name buffer");
+
+		ret = dns_unpack_query(&msg, result, NULL, &class_);
+		if (cases[i].valid) {
+			zassert_equal(ret, 1, "Class 0x%04x was rejected", cases[i].class_);
+			zassert_equal(class_, cases[i].class_, "Wrong parsed query class");
+		} else {
+			zassert_equal(ret, -EINVAL, "Class 0x%04x was accepted", cases[i].class_);
+		}
+
+		net_buf_unref(result);
+	}
+}
 
 ZTEST(dns_resolve, test_dns_unpack_name)
 {
