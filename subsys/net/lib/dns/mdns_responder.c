@@ -3373,12 +3373,13 @@ static void announce_start(struct k_work *work)
 	do_announce = true;
 	announce_count++;
 
-	/* Address-change announces need only one packet. */
-	if (&announce_timer != dwork && announce_count < ANNOUNCE_COUNT) {
+	if (announce_count < ANNOUNCE_COUNT) {
 		ret = k_work_reschedule_for_queue(&mdns_work_q, dwork, K_SECONDS(ANNOUNCE_TIMEOUT));
 		if (ret < 0) {
 			NET_DBG("Cannot schedule %s work (%d)", "announce", ret);
 		}
+	} else {
+		mark_needs_announce(NULL, false);
 	}
 }
 
