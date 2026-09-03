@@ -110,6 +110,7 @@ enum dns_response_type {
 enum dns_class {
 	DNS_CLASS_INVALID = 0,
 	DNS_CLASS_IN,
+	DNS_CLASS_ANY = 255,
 	DNS_CLASS_FLUSH = BIT(15)
 };
 

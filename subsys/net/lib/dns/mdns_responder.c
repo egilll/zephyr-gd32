@@ -500,9 +500,8 @@ struct answer_ctx {
 	bool legacy;
 };
 
-static void add_a_aaaa_answer(struct answer_ctx *ctx, uint32_t ttl,
-			      uint16_t addr_len, const uint8_t *addr,
-			      bool include_name_ptr)
+static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uint32_t ttl,
+			      uint16_t addr_len, const uint8_t *addr, bool include_name_ptr)
 {
 	uint16_t name_len = 0;
 
@@ -521,7 +520,7 @@ static void add_a_aaaa_answer(struct answer_ctx *ctx, uint32_t ttl,
 		net_buf_add_u8(ctx->query, ctx->name_offset & 0xff);
 	}
 
-	net_buf_add_be16(ctx->query, ctx->qtype);
+	net_buf_add_be16(ctx->query, type);
 
 	/* The cache flush bit tells a multicast DNS cache to drop what it
 	 * held for this name. It must not be set in an answer to a legacy
@@ -543,6 +542,7 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 			   void *user_data)
 {
 	struct answer_ctx *ctx = (struct answer_ctx *)user_data;
+	enum dns_rr_type type;
 	bool include_name_ptr = true;
 	const uint8_t *addr;
 	uint16_t addr_len;
@@ -553,9 +553,11 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 	}
 
 	if (ifaddr->address.family == NET_AF_INET6) {
+		type = DNS_RR_TYPE_AAAA;
 		addr_len = sizeof(struct net_in6_addr);
 		addr = ifaddr->address.in6_addr.s6_addr;
 	} else {
+		type = DNS_RR_TYPE_A;
 		addr_len = sizeof(struct net_in_addr);
 		addr = ifaddr->address.in_addr.s4_addr;
 	}
@@ -571,8 +573,8 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 		include_name_ptr = false;
 	}
 
-	add_a_aaaa_answer(ctx, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
-			  addr_len, addr, include_name_ptr);
+	add_a_aaaa_answer(ctx, type, ctx->legacy ? MDNS_LEGACY_TTL : MDNS_TTL, addr_len, addr,
+			  include_name_ptr);
 }
 
 static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
@@ -606,6 +608,13 @@ static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
 		net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
 	} else if ((qtype == DNS_RR_TYPE_AAAA) && IS_ENABLED(CONFIG_NET_IPV6)) {
 		net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
+	} else if (qtype == DNS_RR_TYPE_ANY) {
+		if (IS_ENABLED(CONFIG_NET_IPV4)) {
+			net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
+		}
+		if (IS_ENABLED(CONFIG_NET_IPV6)) {
+			net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
+		}
 	} else {
 		return -EINVAL;
 	}
@@ -655,7 +664,8 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 	}
 
 	if ((qtype == DNS_RR_TYPE_A && !IS_ENABLED(CONFIG_NET_IPV4)) ||
-	    (qtype == DNS_RR_TYPE_AAAA && !IS_ENABLED(CONFIG_NET_IPV6))) {
+	    (qtype == DNS_RR_TYPE_AAAA && !IS_ENABLED(CONFIG_NET_IPV6)) ||
+	    (qtype != DNS_RR_TYPE_A && qtype != DNS_RR_TYPE_AAAA && qtype != DNS_RR_TYPE_ANY)) {
 		return -EINVAL;
 	}
 
@@ -918,7 +928,8 @@ static int dns_read(int sock,
 			continue;
 		}
 
-		if ((qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_IN) {
+		if ((qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_IN &&
+		    (qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_ANY) {
 			continue;
 		}
 
