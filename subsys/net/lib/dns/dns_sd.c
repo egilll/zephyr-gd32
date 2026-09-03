@@ -1438,14 +1438,15 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	return output.offset;
 }
 
-int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
-				    const struct net_in_addr *addr4,
+int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst, const struct net_in_addr *addr4,
 				    const struct net_in6_addr *addr6,
-				    uint8_t *buf, uint16_t buf_size)
+				    const struct dns_sd_query *request, uint8_t *buf,
+				    uint16_t buf_size)
 {
-	static const char query[] = { "\x09_services\x07_dns-sd\x04_udp\x05local" };
+	static const char query_name[] = {"\x09_services\x07_dns-sd\x04_udp\x05local"};
 	/* offset of '.local' in the above */
 	uint16_t domain_offset = DNS_SD_PTR_MASK | 35;
+	uint16_t owner_offset;
 	uint16_t proto;
 	int name_size;
 	uint16_t service_size;
@@ -1453,7 +1454,7 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
 	struct dns_rr *rr;
 	struct dns_header *const rsp = (struct dns_header *)buf;
 
-	if (!rec_is_valid(inst)) {
+	if (!rec_is_valid(inst) || request == NULL || request->type != DNS_RR_TYPE_PTR) {
 		return -EINVAL;
 	}
 
@@ -1482,13 +1483,13 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
 
 	service_size = strlen(inst->service);
 	name_size =
-		/* uncompressed. e.g. "._foo._tcp.local." */
-		sizeof(query)
-		+ sizeof(*rr)
+		/* Question name for legacy replies, answer name otherwise. */
+		sizeof(query_name) +
+		(request->legacy ? DNS_QTYPE_LEN + DNS_QCLASS_LEN + DNS_POINTER_SIZE : 0U) +
+		sizeof(*rr)
 		/* compressed e.g. ._googlecast._tcp" followed by (DNS_SD_PTR_MASK | 0x0abc) */
-		+ DNS_LABEL_LEN_SIZE + service_size
-		+ DNS_LABEL_LEN_SIZE + DNS_SD_PROTO_SIZE
-		+ DNS_POINTER_SIZE;
+		+ DNS_LABEL_LEN_SIZE + service_size + DNS_LABEL_LEN_SIZE + DNS_SD_PROTO_SIZE +
+		DNS_POINTER_SIZE;
 
 	if (offset > buf_size || name_size >= buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d", name_size,
@@ -1497,13 +1498,24 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
 	}
 
 	memset(rsp, 0, sizeof(*rsp));
-	memcpy(&buf[offset], query, sizeof(query));
-	offset += sizeof(query);
+	memcpy(&buf[offset], query_name, sizeof(query_name));
+	offset += sizeof(query_name);
+
+	if (request->legacy) {
+		sys_put_be16(DNS_RR_TYPE_PTR, &buf[offset]);
+		offset += DNS_QTYPE_LEN;
+		sys_put_be16(DNS_CLASS_IN, &buf[offset]);
+		offset += DNS_QCLASS_LEN;
+
+		owner_offset = net_htons(DNS_SD_PTR_MASK | sizeof(struct dns_header));
+		memcpy(&buf[offset], &owner_offset, sizeof(owner_offset));
+		offset += sizeof(owner_offset);
+	}
 
 	rr = (struct dns_rr *)&buf[offset];
 	rr->type = net_htons(DNS_RR_TYPE_PTR);
 	rr->class_ = net_htons(DNS_CLASS_IN);
-	rr->ttl = net_htonl(DNS_SD_PTR_TTL);
+	rr->ttl = net_htonl(request->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_PTR_TTL);
 	rr->rdlength = net_htons(0
 		+ DNS_LABEL_LEN_SIZE + service_size
 		+ DNS_LABEL_LEN_SIZE + DNS_SD_PROTO_SIZE
@@ -1521,7 +1533,9 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst,
 	offset += sizeof(domain_offset);
 
 	/* Set the Response and AA bits */
+	rsp->id = net_htons(request->legacy ? request->id : 0U);
 	rsp->flags = net_htons(BIT(15) | BIT(10));
+	rsp->qdcount = net_htons(request->legacy ? 1U : 0U);
 	rsp->ancount = net_htons(1);
 
 	return offset;

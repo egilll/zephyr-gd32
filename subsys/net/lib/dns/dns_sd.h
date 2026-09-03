@@ -164,7 +164,7 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
  * @param inst the matching DNS-SD record
  * @param addr4 pointer to the IPv4 address, or NULL
  * @param addr6 pointer to the IPv6 address, or NULL
- * @param query metadata from the received question
+ * @param request metadata from the received question
  * @param buf output buffer
  * @param buf_size size of the output buffer
  *
@@ -183,6 +183,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
  * @param service the DNS-SD service to advertise
  * @param addr4 pointer to the IPv4 address
  * @param addr6 pointer to the IPv6 address
+ * @param query metadata from the received question
  * @param buf output buffer
  * @param buf_size size of the output buffer
  *
@@ -190,8 +191,10 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
  * @return on failure, a negative errno value
  */
 int dns_sd_handle_service_type_enum(const struct dns_sd_rec *service,
-	const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
-	uint8_t *buf, uint16_t buf_size);
+				    const struct net_in_addr *addr4,
+				    const struct net_in6_addr *addr6,
+				    const struct dns_sd_query *query, uint8_t *buf,
+				    uint16_t buf_size);
 
 /**
  * @brief Check if DNS-SD record is a valid one.
