@@ -1389,6 +1389,11 @@ static int dns_sd_suppress_known_answers(const struct dns_sd_rec *record,
 	query->suppress_srv = false;
 	query->suppress_txt = false;
 
+	if (query->browse) {
+		return dns_sd_answer_known(record, DNS_RR_TYPE_PTR, msg, msg_size, answer_offset,
+					   answer_count, service_type_enum, scratch);
+	}
+
 	if (query->type != DNS_RR_TYPE_ANY) {
 		return dns_sd_answer_known(record, query->type, msg, msg_size, answer_offset,
 					   answer_count, service_type_enum, scratch);
@@ -1532,6 +1537,14 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 		dns_sd_create_wildcard_filter(&filter);
 		service_type_enum = true;
 	}
+
+	if ((!service_type_enum && filter.instance == NULL && qtype != DNS_RR_TYPE_PTR &&
+	     qtype != DNS_RR_TYPE_ANY) ||
+	    (filter.instance != NULL && qtype == DNS_RR_TYPE_PTR)) {
+		return;
+	}
+
+	query.browse = filter.instance == NULL;
 
 	DNS_SD_COUNT(&rec_num);
 	rec_count = rec_num;
