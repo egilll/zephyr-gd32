@@ -707,6 +707,7 @@ struct answer_addr_ctx {
 	const struct dns_sd_rec *inst;
 	uint16_t host_offset;
 	enum dns_rr_type qtype;
+	int error;
 };
 
 static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
@@ -714,6 +715,10 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 {
 	struct answer_addr_ctx *ctx = (struct answer_addr_ctx *)user_data;
 	int ret;
+
+	if (ctx->error < 0) {
+		return;
+	}
 
 	if (ifaddr->addr_state != NET_ADDR_PREFERRED &&
 	    ifaddr->addr_state != NET_ADDR_DEPRECATED) {
@@ -747,6 +752,7 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 		ctx->answer_count++;
 	} else {
 		NET_DBG("Not enough buffer space to include additional A/AAAA record");
+		ctx->error = ret;
 	}
 }
 
@@ -771,6 +777,9 @@ int add_remaining_a_records(struct net_if *iface, const struct dns_sd_rec *inst,
 	}
 
 	net_if_ipv4_addr_foreach(iface, answer_addr_cb, &ctx);
+	if (ctx.error < 0) {
+		return ctx.error;
+	}
 
 	*buf_offset = ctx.buf_offset;
 
@@ -797,6 +806,9 @@ int add_remaining_aaaa_records(struct net_if *iface, const struct dns_sd_rec *in
 	}
 
 	net_if_ipv6_addr_foreach(iface, answer_addr_cb, &ctx);
+	if (ctx.error < 0) {
+		return ctx.error;
+	}
 
 	*buf_offset = ctx.buf_offset;
 
@@ -992,6 +1004,8 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	uint16_t host_offset;
 	uint16_t proto;
 	uint16_t offset = sizeof(struct dns_header);
+	uint16_t rrset_count;
+	uint16_t rrset_offset;
 	struct dns_header *rsp = (struct dns_header *)buf;
 	/* Additional records for a direct query response; part of the Answer
 	 * section instead when this packet is an unsolicited announcement.
@@ -1072,47 +1086,60 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	extra_count++;
 	offset += r;
 
+	rrset_offset = offset;
+	rrset_count = extra_count;
 	if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
 		r = add_aaaa_record(inst, DNS_SD_AAAA_TTL, host_offset, addr6->s6_addr, buf, offset,
-				    buf_size); /* LCOV_EXCL_LINE */
-		if (r < 0) {
-			return r; /* LCOV_EXCL_LINE */
+				    buf_size);
+		if (r >= 0) {
+			extra_count++;
+			offset += r;
+		}
+	} else {
+		r = 0;
+	}
+	if (r >= 0 && IS_ENABLED(CONFIG_NET_IPV6)) {
+		r = add_remaining_aaaa_records(iface, inst, host_offset, addr6, buf, &offset,
+					       buf_size);
+		if (r >= 0) {
+			extra_count += r;
+		}
+	}
+	if (r < 0) {
+		if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
+			return r;
 		}
 
-		extra_count++;
-		offset += r;
+		offset = rrset_offset;
+		extra_count = rrset_count;
 	}
 
+	rrset_offset = offset;
+	rrset_count = extra_count;
 	if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
 		tmp = net_htonl(*(addr4->s4_addr32));
-		r = add_a_record(inst, DNS_SD_A_TTL, host_offset, tmp, buf, offset,
-				 buf_size);
-		if (r < 0) {
-			return r; /* LCOV_EXCL_LINE */
+		r = add_a_record(inst, DNS_SD_A_TTL, host_offset, tmp, buf, offset, buf_size);
+		if (r >= 0) {
+			extra_count++;
+			offset += r;
+		}
+	} else {
+		r = 0;
+	}
+	if (r >= 0 && IS_ENABLED(CONFIG_NET_IPV4)) {
+		r = add_remaining_a_records(iface, inst, host_offset, addr4, buf, &offset,
+					    buf_size);
+		if (r >= 0) {
+			extra_count += r;
+		}
+	}
+	if (r < 0) {
+		if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
+			return r;
 		}
 
-		extra_count++;
-		offset += r;
-	}
-
-	if (IS_ENABLED(CONFIG_NET_IPV6)) {
-		/* Best effort here, include AAAA records for the remaining IPv6
-		 * addresses if they fit.
-		 */
-		r = add_remaining_aaaa_records(iface, inst, host_offset, addr6,
-					       buf, &offset, buf_size);
-		/* offset was updated inside the function */
-		extra_count += r;
-	}
-
-	if (IS_ENABLED(CONFIG_NET_IPV4)) {
-		/* Best effort here, include A records for the remaining IPv4
-		 * addresses if they fit.
-		 */
-		r = add_remaining_a_records(iface, inst, host_offset, addr4,
-					    buf, &offset, buf_size);
-		/* offset was updated inside the function */
-		extra_count += r;
+		offset = rrset_offset;
+		extra_count = rrset_count;
 	}
 
 	if (address_types != 0U &&
@@ -1354,6 +1381,7 @@ struct dns_sd_addr_ctx {
 	uint32_t ttl;
 	uint64_t types;
 	uint16_t count;
+	int error;
 	bool legacy;
 };
 
@@ -1388,6 +1416,11 @@ static int dns_sd_buf_add_addr(struct dns_sd_addr_ctx *ctx, enum dns_rr_type typ
 static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, void *user_data)
 {
 	struct dns_sd_addr_ctx *ctx = user_data;
+	int ret;
+
+	if (ctx->error < 0) {
+		return;
+	}
 
 	if (ifaddr->addr_state != NET_ADDR_PREFERRED && ifaddr->addr_state != NET_ADDR_DEPRECATED) {
 		return;
@@ -1399,7 +1432,7 @@ static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, voi
 			return;
 		}
 
-		(void)dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_AAAA, ifaddr->address.in6_addr.s6_addr,
+		ret = dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_AAAA, ifaddr->address.in6_addr.s6_addr,
 					  sizeof(ifaddr->address.in6_addr));
 	} else {
 		if (ctx->skip_addr4 != NULL &&
@@ -1407,8 +1440,12 @@ static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, voi
 			return;
 		}
 
-		(void)dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_A, ifaddr->address.in_addr.s4_addr,
+		ret = dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_A, ifaddr->address.in_addr.s4_addr,
 					  sizeof(ifaddr->address.in_addr));
+	}
+
+	if (ret < 0) {
+		ctx->error = ret;
 	}
 }
 
@@ -1494,6 +1531,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	uint16_t answer_count = 0U;
 	uint16_t additional_count = 0U;
 	uint16_t host_offset = 0U;
+	uint16_t rrset_count;
+	uint16_t rrset_offset;
 	bool include_srv;
 	bool include_txt;
 	bool negative;
@@ -1625,29 +1664,44 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	}
 
 	if (include_srv) {
+		rrset_offset = output.offset;
+		rrset_count = addr_ctx.count;
 		if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
 			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_AAAA, addr6->s6_addr,
 						  sizeof(*addr6));
-			if (ret < 0) {
-				return ret;
+			addr_ctx.error = ret;
+		}
+		if (addr_ctx.error >= 0 && iface != NULL && IS_ENABLED(CONFIG_NET_IPV6)) {
+			net_if_ipv6_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
+		}
+		if (addr_ctx.error < 0) {
+			if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
+				return addr_ctx.error;
 			}
+
+			output.offset = rrset_offset;
+			addr_ctx.count = rrset_count;
+			addr_ctx.error = 0;
 		}
 
+		rrset_offset = output.offset;
+		rrset_count = addr_ctx.count;
 		if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
 			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_A, addr4->s4_addr,
 						  sizeof(*addr4));
-			if (ret < 0) {
-				return ret;
-			}
+			addr_ctx.error = ret;
 		}
+		if (addr_ctx.error >= 0 && iface != NULL && IS_ENABLED(CONFIG_NET_IPV4)) {
+			net_if_ipv4_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
+		}
+		if (addr_ctx.error < 0) {
+			if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
+				return addr_ctx.error;
+			}
 
-		if (iface != NULL) {
-			if (IS_ENABLED(CONFIG_NET_IPV6)) {
-				net_if_ipv6_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
-			}
-			if (IS_ENABLED(CONFIG_NET_IPV4)) {
-				net_if_ipv4_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
-			}
+			output.offset = rrset_offset;
+			addr_ctx.count = rrset_count;
+			addr_ctx.error = 0;
 		}
 
 		additional_count += addr_ctx.count;
