@@ -465,6 +465,7 @@ ZTEST(dns_sd, test_add_txt_record)
 	const uint32_t ttl = DNS_SD_TXT_TTL;
 	const uint32_t offset = 0;
 	const uint16_t instance_offset = 0x28;
+	static const char nonzero_txt[] = {0x5a};
 
 	DNS_SD_REGISTER_TCP_SERVICE(empty_txt, "x", "_x", "local", DNS_SD_EMPTY_TXT, CONST_PORT);
 
@@ -477,6 +478,12 @@ ZTEST(dns_sd, test_add_txt_record)
 	static const uint8_t expected_empty_txt[] = {
 		0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x01, 0x00,
 	};
+	const struct dns_sd_query query = {
+		.type = DNS_RR_TYPE_TXT,
+		.class_ = DNS_CLASS_IN,
+	};
+	struct net_in_addr addr = {{{177, 5, 240, 13}}};
+	struct dns_sd_rec zero_size_txt = empty_txt;
 	int expected_int = sizeof(expected_buf);
 
 	int actual_int = add_txt_record(&nasxxxxxx, ttl,
@@ -502,6 +509,20 @@ ZTEST(dns_sd, test_add_txt_record)
 				    sizeof(actual_buf));
 	zassert_equal(actual_int, sizeof(expected_empty_txt), "");
 	zassert_mem_equal(actual_buf, expected_empty_txt, sizeof(expected_empty_txt), "");
+
+	zero_size_txt.text = nonzero_txt;
+	zero_size_txt.text_size = 0U;
+	actual_int = add_txt_record(&zero_size_txt, ttl, instance_offset, actual_buf, offset,
+				    sizeof(actual_buf));
+	zassert_equal(actual_int, sizeof(expected_empty_txt), "");
+	zassert_mem_equal(actual_buf, expected_empty_txt, sizeof(expected_empty_txt),
+			  "Zero-size TXT used the caller's backing byte");
+
+	actual_int = dns_sd_handle_query(NULL, &zero_size_txt, &addr, NULL, &query, actual_buf,
+					 sizeof(actual_buf));
+	zassert_true(actual_int > 0, "Direct TXT response failed (%d)", actual_int);
+	zassert_equal(actual_buf[actual_int - 1], 0U,
+		      "Direct TXT response used the caller's backing byte");
 
 	/* too big for message compression */
 	zassert_equal(-E2BIG,
