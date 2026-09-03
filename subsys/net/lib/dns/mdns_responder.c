@@ -686,6 +686,36 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 	return ret;
 }
 
+static bool same_dns_sd_service_type(const struct dns_sd_rec *a, const struct dns_sd_rec *b)
+{
+	return dns_sd_rec_is_valid(a) && dns_sd_rec_is_valid(b) &&
+	       strcasecmp(a->service, b->service) == 0 && strcasecmp(a->proto, b->proto) == 0 &&
+	       strcasecmp(a->domain, b->domain) == 0;
+}
+
+static bool dns_sd_service_type_was_sent(const struct dns_sd_rec *record, size_t static_start,
+					 size_t static_count, size_t external_start,
+					 size_t external_count)
+{
+	const struct dns_sd_rec *sent;
+
+	for (size_t i = static_start; i < static_count; ++i) {
+		DNS_SD_GET(i, &sent);
+		if (sent != record && same_dns_sd_service_type(record, sent)) {
+			return true;
+		}
+	}
+
+	for (size_t i = external_start; i < external_count; ++i) {
+		sent = &external_records[i];
+		if (sent != record && same_dns_sd_service_type(record, sent)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static void send_sd_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
 			     size_t addrlen, struct net_buf *result, struct net_if *recv_if,
 			     enum dns_rr_type qtype, enum dns_class qclass, uint16_t dns_id)
@@ -715,7 +745,9 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 	};
 	size_t n = ARRAY_SIZE(label);
 	size_t rec_num;
+	size_t rec_count;
 	size_t ext_rec_num = external_records_count;
+	size_t ext_rec_count = external_records_count;
 	struct dns_sd_query query = {
 		.type = qtype,
 		.id = dns_id,
@@ -806,6 +838,7 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 	}
 
 	DNS_SD_COUNT(&rec_num);
+	rec_count = rec_num;
 
 	while (rec_num > 0 || ext_rec_num > 0) {
 		/*
@@ -822,6 +855,12 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 
 		/* Checks validity and then compare */
 		if (dns_sd_rec_match(record, &filter)) {
+			if (service_type_enum &&
+			    dns_sd_service_type_was_sent(record, rec_num, rec_count, ext_rec_num,
+							 ext_rec_count)) {
+				continue;
+			}
+
 			NET_DBG("matched query: %s.%s.%s.%s port: %u",
 				record->instance, record->service,
 				record->proto, record->domain,
