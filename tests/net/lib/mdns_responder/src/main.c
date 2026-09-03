@@ -695,6 +695,42 @@ ZTEST(test_mdns_responder, test_basic_query)
 	check_basic_query_resp(response_pkts[0]);
 }
 
+ZTEST(test_mdns_responder, test_hostname_any_query)
+{
+	static const uint8_t query[] = {
+		/* Header */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* zephyr.local */
+		0x06, 0x7a, 0x65, 0x70, 0x68, 0x79, 0x72, 0x05, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00,
+		/* ANY record, class IN */
+		0x00, 0xff, 0x00, 0x01};
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an ANY response");
+
+	/* The test interface has two IPv6 addresses. The response must contain
+	 * their actual AAAA type rather than repeating the question's ANY type.
+	 */
+	check_basic_query_resp(response_pkts[0]);
+}
+
+ZTEST(test_mdns_responder, test_query_class_any)
+{
+	static const uint8_t query[] = {
+		/* Header */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* zephyr.local */
+		0x06, 0x7a, 0x65, 0x70, 0x68, 0x79, 0x72, 0x05, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00,
+		/* AAAA record, class ANY */
+		0x00, 0x1c, 0x00, 0xff};
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a response to class ANY");
+
+	check_basic_query_resp(response_pkts[0]);
+}
+
 /* RFC 6762 6.7: a query that did not come from port 5353 is a one-off lookup,
  * and the answer to it has to be one a conventional resolver understands. It
  * repeats the identifier and the question, leaves the cache flush bit clear,
