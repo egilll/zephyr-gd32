@@ -689,22 +689,34 @@ static int mdns_add_nsec(struct net_buf *query, uint16_t name_offset, uint32_t t
 	return 0;
 }
 
-static bool mdns_reverse_nsec_matches(const char *query_name, const uint8_t *msg, uint16_t msg_size,
-				      const struct mdns_answer *answer, struct net_buf *scratch)
+static bool mdns_nsec_matches(const char *query_name, enum dns_rr_type existing_type,
+			      const uint8_t *msg, uint16_t msg_size,
+			      const struct mdns_answer *answer, struct net_buf *scratch)
 {
-	static const uint8_t ptr_bitmap[] = {0U, 2U, 0U, BIT(3)};
+	uint8_t expected[2U + sizeof(uint32_t)] = {0};
 	const uint8_t *next_name_end;
 	const uint8_t *rdata_end = answer->rdata + answer->rdlength;
+	size_t bitmap_len;
 	int ret;
 
-	scratch->len = 0U;
-	ret = dns_unpack_name(msg, msg_size, answer->rdata, scratch, &next_name_end);
-	if (ret < 0 || strcasecmp(scratch->data, query_name) != 0 || next_name_end > rdata_end) {
+	if (existing_type <= DNS_RR_TYPE_INVALID || existing_type > DNS_RR_TYPE_AAAA) {
 		return false;
 	}
 
-	return rdata_end - next_name_end == sizeof(ptr_bitmap) &&
-	       memcmp(next_name_end, ptr_bitmap, sizeof(ptr_bitmap)) == 0;
+	bitmap_len = existing_type / 8U + 1U;
+	expected[1] = bitmap_len;
+	expected[2U + existing_type / 8U] = BIT(7U - existing_type % 8U);
+
+	scratch->len = 0U;
+	ret = dns_unpack_name(msg, msg_size, answer->rdata, scratch, &next_name_end);
+	if (ret < 0 || next_name_end > rdata_end ||
+	    (query_name != NULL ? strcasecmp(scratch->data, query_name) != 0
+				: !mdns_host_name_matches(scratch->data))) {
+		return false;
+	}
+
+	return rdata_end - next_name_end == 2U + bitmap_len &&
+	       memcmp(next_name_end, expected, 2U + bitmap_len) == 0;
 }
 
 static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type expected_type,
@@ -733,8 +745,8 @@ static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type ex
 		}
 
 		if (expected_type == DNS_RR_TYPE_NSEC) {
-			if (mdns_reverse_nsec_matches(query_name, msg, msg_size, &answer,
-						      scratch)) {
+			if (mdns_nsec_matches(query_name, DNS_RR_TYPE_PTR, msg, msg_size, &answer,
+					      scratch)) {
 				return 1;
 			}
 			continue;
@@ -854,6 +866,46 @@ static int mdns_addr_known(struct answer_ctx *ctx, enum dns_rr_type type, const 
 	}
 
 	return 0;
+}
+
+static int mdns_host_nsec_known(struct answer_ctx *ctx, enum dns_rr_type existing_type)
+{
+	uint16_t offset = ctx->answer_offset;
+
+	if (ctx->scratch == NULL || dns_header_tc(ctx->query_msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < ctx->known_answer_count; ++i) {
+		struct mdns_answer answer;
+		int ret;
+
+		ret = mdns_unpack_answer(ctx->query_msg, ctx->query_size, &offset, ctx->scratch,
+					 &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type == DNS_RR_TYPE_NSEC && answer.class_ == DNS_CLASS_IN &&
+		    answer.ttl >= MDNS_TTL / 2U && mdns_host_name_matches(answer.owner) &&
+		    mdns_nsec_matches(NULL, existing_type, ctx->query_msg, ctx->query_size, &answer,
+				      ctx->scratch)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void address_available_cb(struct net_if *iface, struct net_if_addr *ifaddr, void *user_data)
+{
+	bool *available = user_data;
+
+	ARG_UNUSED(iface);
+
+	if (ifaddr->addr_state == NET_ADDR_PREFERRED || ifaddr->addr_state == NET_ADDR_DEPRECATED) {
+		*available = true;
+	}
 }
 
 static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uint32_t ttl,
@@ -976,6 +1028,8 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 		.known_answer_count = answer_count,
 		.legacy = legacy,
 	};
+	enum dns_rr_type existing_type = DNS_RR_TYPE_INVALID;
+	bool address_available = false;
 	int candidate_count;
 	int ret;
 
@@ -1015,7 +1069,37 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 	}
 
 	if (ctx.answer_count == 0) {
-		return ctx.candidate_count > 0 ? -EALREADY : -ENOMEM;
+		if (ctx.candidate_count > 0) {
+			return -EALREADY;
+		}
+
+		if (qtype == DNS_RR_TYPE_A && IS_ENABLED(CONFIG_NET_IPV6)) {
+			existing_type = DNS_RR_TYPE_AAAA;
+			net_if_ipv6_addr_foreach(iface, address_available_cb, &address_available);
+		} else if (qtype == DNS_RR_TYPE_AAAA && IS_ENABLED(CONFIG_NET_IPV4)) {
+			existing_type = DNS_RR_TYPE_A;
+			net_if_ipv4_addr_foreach(iface, address_available_cb, &address_available);
+		}
+
+		if (!address_available) {
+			return -ENOMEM;
+		}
+
+		if (!legacy) {
+			ret = mdns_host_nsec_known(&ctx, existing_type);
+			if (ret != 0) {
+				return ret > 0 ? -EALREADY : ret;
+			}
+		}
+
+		ret = mdns_add_nsec(query, ctx.name_offset, legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
+				    legacy, existing_type, legacy);
+		if (ret < 0) {
+			return ret;
+		}
+
+		setup_dns_hdr(query->data, 1U, 0U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+		return 0;
 	}
 
 	ctx.additional = true;
