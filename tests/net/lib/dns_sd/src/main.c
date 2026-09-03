@@ -344,11 +344,16 @@ ZTEST(dns_sd, test_add_txt_record)
 	const uint32_t offset = 0;
 	const uint16_t instance_offset = 0x28;
 
+	DNS_SD_REGISTER_TCP_SERVICE(empty_txt, "x", "_x", "local", DNS_SD_EMPTY_TXT, CONST_PORT);
+
 	static uint8_t actual_buf[BUFSZ];
 	static const uint8_t expected_buf[] = {
 		0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00,
 		0x11, 0x94, 0x00, 0x07, 0x06, 0x70, 0x61, 0x74,
 		0x68, 0x3d, 0x2f
+	};
+	static const uint8_t expected_empty_txt[] = {
+		0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x01, 0x00,
 	};
 	int expected_int = sizeof(expected_buf);
 
@@ -362,6 +367,11 @@ ZTEST(dns_sd, test_add_txt_record)
 	zassert_mem_equal(actual_buf, expected_buf, MIN(actual_int,
 							expected_int),
 			  "");
+
+	actual_int = add_txt_record(&empty_txt, ttl, instance_offset, actual_buf, offset,
+				    sizeof(actual_buf));
+	zassert_equal(actual_int, sizeof(expected_empty_txt), "");
+	zassert_mem_equal(actual_buf, expected_empty_txt, sizeof(expected_empty_txt), "");
 
 	/* too big for message compression */
 	zassert_equal(-E2BIG,

@@ -1768,6 +1768,7 @@ static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type 
 					  bool legacy)
 {
 	struct dns_rr record;
+	uint8_t txt;
 
 	skip_labels(pkt);
 	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
@@ -1776,6 +1777,12 @@ static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type 
 		      "Unexpected answer class");
 	if (legacy) {
 		zassert_true(net_ntohl(record.ttl) <= 10U, "Legacy response TTL is too long");
+	}
+	if (expected_type == DNS_RR_TYPE_TXT) {
+		zassert_equal(net_ntohs(record.rdlength), 1U, "Empty TXT has invalid length");
+		zassert_ok(net_pkt_read_u8(pkt, &txt), "net_pkt read failed");
+		zassert_equal(txt, 0U, "Empty TXT is not a zero-length character-string");
+		return;
 	}
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "net_pkt skip failed");
 }
@@ -2058,7 +2065,7 @@ static const uint8_t service_instance_txt_known_answer_query[] = {
 	0x10,
 	0x00,
 	0x01,
-	/* Known empty TXT */
+	/* Known TXT containing one zero-length character-string */
 	0xc0,
 	0x0c,
 	0x00,
@@ -2070,12 +2077,13 @@ static const uint8_t service_instance_txt_known_answer_query[] = {
 	0x11,
 	0x94,
 	0x00,
+	0x01,
 	0x00,
 };
 
 static const uint8_t service_instance_empty_txt_known_answer[] = {
-	/* zephyr._foo._udp.local, TXT, class IN, TTL 4500, empty rdata */
-	0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x00,
+	/* zephyr._foo._udp.local, TXT, class IN, TTL 4500, one empty string */
+	0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x01, 0x00,
 };
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_query)
