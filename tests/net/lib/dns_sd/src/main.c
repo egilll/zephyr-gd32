@@ -10,6 +10,7 @@
 #include <zephyr/ztest.h>
 
 #include <zephyr/net/dns_sd.h>
+#include <zephyr/net/hostname.h>
 #include <zephyr/net/net_context.h>
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/socket.h>
@@ -69,6 +70,104 @@ DNS_SD_REGISTER_TCP_SERVICE(nasxxxxxx, "NASXXXXXX", "_http",
 /** Buffer for  DNS queries */
 static uint8_t create_query_buf[BUFSZ];
 
+static int build_expected_srv_record(uint8_t *buf, size_t buf_size, uint16_t instance_offset,
+				     uint16_t domain_offset)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+	size_t offset = 0;
+	uint16_t rdlength;
+
+	rdlength = sizeof(struct dns_srv_rdata) + DNS_LABEL_LEN_SIZE + hostname_len +
+		   DNS_POINTER_SIZE;
+	zassert_true(buf_size >= sizeof(uint16_t) + sizeof(struct dns_rr) + rdlength);
+
+	buf[offset++] = 0xc0 | (instance_offset >> 8);
+	buf[offset++] = instance_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x21;
+	buf[offset++] = 0x80;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x78;
+	buf[offset++] = rdlength >> 8;
+	buf[offset++] = rdlength & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x1f;
+	buf[offset++] = 0x90;
+	buf[offset++] = hostname_len;
+	memcpy(&buf[offset], hostname, hostname_len);
+	offset += hostname_len;
+	buf[offset++] = 0xc0 | (domain_offset >> 8);
+	buf[offset++] = domain_offset & 0xff;
+
+	return offset;
+}
+
+static int build_expected_ptr_response(uint8_t *buf, size_t buf_size, bool announce)
+{
+	static const uint8_t prefix[] = {
+		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03,
+		0x05, 0x5f, 0x68, 0x74, 0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
+		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00,
+		0x11, 0x94, 0x00, 0x0c, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58,
+		0x58, 0x58, 0xc0, 0x0c, 0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00,
+		0x11, 0x94, 0x00, 0x07, 0x06, 0x70, 0x61, 0x74, 0x68, 0x3d, 0x2f,
+	};
+	size_t offset = sizeof(prefix);
+	uint16_t host_offset;
+
+	zassert_true(buf_size >= sizeof(prefix) + 32);
+	memcpy(buf, prefix, sizeof(prefix));
+	if (announce) {
+		buf[7] = 0x04;
+		buf[11] = 0x00;
+	}
+
+	host_offset = offset + 18;
+	offset += build_expected_srv_record(&buf[offset], buf_size - offset, 0x28, 0x17);
+	buf[offset++] = 0xc0 | (host_offset >> 8);
+	buf[offset++] = host_offset & 0xff;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x80;
+	buf[offset++] = 0x01;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x78;
+	buf[offset++] = 0x00;
+	buf[offset++] = 0x04;
+	buf[offset++] = 0xb1;
+	buf[offset++] = 0x05;
+	buf[offset++] = 0xf0;
+	buf[offset++] = 0x0d;
+
+	return offset;
+}
+
+static size_t skip_uncompressed_name(const uint8_t *buf, size_t buf_size, size_t offset)
+{
+	while (true) {
+		uint8_t label_len;
+
+		zassert_true(offset < buf_size, "Truncated DNS name");
+		label_len = buf[offset++];
+		zassert_equal(label_len & 0xc0, 0U, "Unexpected compressed name");
+		if (label_len == 0U) {
+			return offset;
+		}
+
+		zassert_true(label_len <= buf_size - offset, "Truncated DNS label");
+		offset += label_len;
+	}
+}
+
 /**
  * @brief Create a DNS query
  *
@@ -122,7 +221,7 @@ static uint8_t *create_query(const struct dns_sd_rec *inst,
 	offs += sizeof(struct dns_query);
 
 	zassert_equal(expected_req_buf_size, offs,
-		      "sz: %zu offs: %u", expected_req_buf_size, offs);
+		      "sz: %u offs: %u", expected_req_buf_size, offs);
 
 	*size = offs;
 
@@ -464,14 +563,10 @@ ZTEST(dns_sd, test_add_srv_record)
 
 	uint16_t host_offset = -1;
 	static uint8_t actual_buf[BUFSZ];
-	static const uint8_t expected_buf[] = {
-		0xc0, 0x28, 0x00, 0x21, 0x80, 0x01, 0x00, 0x00,
-		0x00, 0x78, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00,
-		0x1f, 0x90, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58,
-		0x58, 0x58, 0x58, 0x58, 0xc0, 0x17
-	};
+	static uint8_t expected_buf[BUFSZ];
 
-	int expected_int = sizeof(expected_buf);
+	int expected_int = build_expected_srv_record(expected_buf, sizeof(expected_buf),
+					     instance_offset, domain_offset);
 	int actual_int = add_srv_record(&nasxxxxxx, ttl,
 					instance_offset, domain_offset,
 					actual_buf,
@@ -620,24 +715,8 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 {
 	struct net_in_addr addr = { { { 177, 5, 240, 13 } } };
 	static uint8_t actual_rsp[512];
-	static uint8_t expected_rsp[] = {
-		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01,
-		0x00, 0x00, 0x00, 0x03, 0x05, 0x5f, 0x68, 0x74,
-		0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
-		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c,
-		0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x0c,
-		0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58,
-		0x58, 0x58, 0xc0, 0x0c, 0xc0, 0x28, 0x00, 0x10,
-		0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x07,
-		0x06, 0x70, 0x61, 0x74, 0x68, 0x3d, 0x2f, 0xc0,
-		0x28, 0x00, 0x21, 0x80, 0x01, 0x00, 0x00, 0x00,
-		0x78, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x1f,
-		0x90, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58,
-		0x58, 0x58, 0x58, 0xc0, 0x17, 0xc0, 0x59, 0x00,
-		0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00,
-		0x04, 0xb1, 0x05, 0xf0, 0x0d,
-	};
-	int expected_int = sizeof(expected_rsp);
+	static uint8_t expected_rsp[512];
+	int expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), false);
 	int actual_int = dns_sd_handle_ptr_query(NULL, &nasxxxxxx,
 						 &addr,
 						 NULL,
@@ -671,7 +750,7 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query)
 
 	/* show advertisement for initialized port */
 	nonconst_port = CONST_PORT;
-	expected_int = sizeof(expected_rsp);
+	expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), false);
 	zassert_equal(expected_int, dns_sd_handle_ptr_query(NULL, &nasxxxxxx_ephemeral,
 		&addr, NULL, &actual_rsp[0], sizeof(actual_rsp) -
 		sizeof(struct dns_header), false), "");
@@ -691,18 +770,8 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query_announce)
 {
 	struct net_in_addr addr = {{{177, 5, 240, 13}}};
 	static uint8_t actual_rsp[512];
-	static uint8_t expected_rsp[] = {
-		0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x05,
-		0x5f, 0x68, 0x74, 0x74, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05, 0x6c, 0x6f,
-		0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00,
-		0x0c, 0x09, 0x4e, 0x41, 0x53, 0x58, 0x58, 0x58, 0x58, 0x58, 0x58, 0xc0, 0x0c,
-		0xc0, 0x28, 0x00, 0x10, 0x80, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x07, 0x06,
-		0x70, 0x61, 0x74, 0x68, 0x3d, 0x2f, 0xc0, 0x28, 0x00, 0x21, 0x80, 0x01, 0x00,
-		0x00, 0x00, 0x78, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x90, 0x09, 0x4e,
-		0x41, 0x53, 0x58, 0x58, 0x58, 0x58, 0x58, 0x58, 0xc0, 0x17, 0xc0, 0x59, 0x00,
-		0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 0xb1, 0x05, 0xf0, 0x0d,
-	};
-	int expected_int = sizeof(expected_rsp);
+	static uint8_t expected_rsp[512];
+	int expected_int = build_expected_ptr_response(expected_rsp, sizeof(expected_rsp), true);
 	int actual_int =
 		dns_sd_handle_ptr_query(NULL, &nasxxxxxx, &addr, NULL, &actual_rsp[0],
 					sizeof(actual_rsp) - sizeof(struct dns_header), true);
@@ -712,6 +781,62 @@ ZTEST(dns_sd, test_dns_sd_handle_ptr_query_announce)
 	zassert_equal(actual_int, expected_int, "act: %d exp: %d", actual_int, expected_int);
 
 	zassert_mem_equal(actual_rsp, expected_rsp, MIN(actual_int, expected_int), "");
+}
+
+ZTEST(dns_sd, test_dns_sd_handle_goodbye)
+{
+	static const uint16_t expected_types[] = {
+		DNS_RR_TYPE_PTR,
+		DNS_RR_TYPE_SRV,
+		DNS_RR_TYPE_TXT,
+	};
+	static const uint16_t expected_classes[] = {
+		DNS_CLASS_IN,
+		DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		DNS_CLASS_IN | DNS_CLASS_FLUSH,
+	};
+	static uint8_t response[BUFSZ];
+	struct dns_header *header = (struct dns_header *)response;
+	size_t offset = sizeof(*header);
+	int response_len;
+
+	response_len = dns_sd_handle_goodbye(&nasxxxxxx, response, sizeof(response));
+	zassert_true(response_len > 0, "Goodbye encoding failed (%d)", response_len);
+	zassert_equal(net_ntohs(header->flags), BIT(15) | BIT(10), "Unexpected flags");
+	zassert_equal(net_ntohs(header->qdcount), 0U, "Goodbye contains a question");
+	zassert_equal(net_ntohs(header->ancount), ARRAY_SIZE(expected_types),
+		      "Unexpected answer count");
+	zassert_equal(net_ntohs(header->nscount), 0U, "Goodbye contains authority records");
+	zassert_equal(net_ntohs(header->arcount), 0U, "Goodbye contains additional records");
+
+	for (size_t i = 0U; i < ARRAY_SIZE(expected_types); ++i) {
+		uint16_t rdlength;
+
+		offset = skip_uncompressed_name(response, response_len, offset);
+		zassert_true(sizeof(struct dns_rr) <= response_len - offset,
+			     "Truncated resource record");
+		zassert_equal(sys_get_be16(&response[offset]), expected_types[i],
+			      "Unexpected record type");
+		zassert_equal(sys_get_be16(&response[offset + 2U]), expected_classes[i],
+			      "Unexpected record class");
+		zassert_equal(sys_get_be32(&response[offset + 4U]), 0U,
+			      "Goodbye record has a nonzero TTL");
+		rdlength = sys_get_be16(&response[offset + 8U]);
+		offset += sizeof(struct dns_rr);
+		zassert_true(rdlength <= response_len - offset, "Truncated RDATA");
+		offset += rdlength;
+	}
+
+	zassert_equal(offset, response_len, "Goodbye contains unexpected records");
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx, response, response_len), response_len,
+		      "Exact-size buffer was rejected");
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx, response, response_len - 1U), -ENOSPC,
+		      "One-byte-short buffer was accepted");
+	zassert_equal(dns_sd_handle_goodbye(&invalid_dns_sd_record, response, sizeof(response)),
+		      -EINVAL, "Invalid record was accepted");
+	nonconst_port = 0U;
+	zassert_equal(dns_sd_handle_goodbye(&nasxxxxxx_ephemeral, response, sizeof(response)),
+		      -EHOSTDOWN, "Uninitialized service was withdrawn");
 }
 
 /** Test for @ref dns_sd_handle_ptr_query */
