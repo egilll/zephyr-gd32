@@ -1073,26 +1073,6 @@ static size_t build_host_known_query(uint8_t *query, enum dns_rr_type qtype,
 	return append_known_aaaa(query, offset, addr, ttl);
 }
 
-static void check_single_aaaa_response(struct net_pkt *pkt, const struct net_in6_addr *expected)
-{
-	struct net_in6_addr actual;
-	struct dns_header header;
-	struct dns_rr record;
-
-	net_pkt_cursor_init(pkt);
-	net_pkt_set_overwrite(pkt, true);
-	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "net_pkt skip failed");
-	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "net_pkt read failed");
-	zassert_equal(net_ntohs(header.ancount), 1U, "Unexpected answer count");
-	validate_label(pkt, "zephyr", false);
-	validate_label(pkt, "local", true);
-	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
-	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_AAAA, "Unexpected answer type");
-	zassert_equal(net_ntohs(record.rdlength), sizeof(actual), "Unexpected address length");
-	zassert_ok(net_pkt_read(pkt, &actual, sizeof(actual)), "net_pkt read failed");
-	zassert_true(net_ipv6_addr_cmp(&actual, expected), "Unexpected AAAA address");
-}
-
 static void check_basic_query_resp(struct net_pkt *pkt, bool expect_nsec)
 {
 	static const uint8_t nsec_bitmap[] = {0x00, 0x00, 0x00, 0x08};
@@ -1357,8 +1337,8 @@ ZTEST(test_mdns_responder, test_hostname_known_answer_suppression)
 	zassert_equal(query_size, HOST_KNOWN_QUERY_SIZE, "Unexpected query size");
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
-		   "Known address suppressed the entire AAAA response");
-	check_single_aaaa_response(response_pkts[0], &extra_addr);
+		   "Partial known answers suppressed the entire AAAA RRset");
+	check_basic_query_resp(response_pkts[0], true);
 
 	query_size = build_host_known_query(query, DNS_RR_TYPE_AAAA, &ll_addr, 299U);
 	send_msg(query, query_size);
@@ -1369,8 +1349,8 @@ ZTEST(test_mdns_responder, test_hostname_known_answer_suppression)
 	query_size = build_host_known_query(query, DNS_RR_TYPE_ANY, &extra_addr, 600U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
-		   "Known address suppressed the entire ANY response");
-	check_single_aaaa_response(response_pkts[2], &ll_addr);
+		   "Partial known answers suppressed the entire ANY response");
+	check_basic_query_resp(response_pkts[2], false);
 
 	query_size = build_host_known_query(query, DNS_RR_TYPE_ANY, &ll_addr, 600U);
 	query_size = append_known_aaaa(query, query_size, &extra_addr, 600U);
