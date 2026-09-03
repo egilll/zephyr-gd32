@@ -1772,6 +1772,7 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_qu_query)
 	header = NET_IPV6_HDR(response_pkts[0]);
 	zassert_true(net_ipv6_addr_cmp_raw(header->dst, (const uint8_t *)&sender_ll_addr),
 		     "QU response was not unicast to the querier");
+	zassert_equal(header->hop_limit, 255U, "QU response used the wrong hop limit");
 	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 }
@@ -1787,6 +1788,8 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_legacy_query)
 
 	send_msg_from_port(query, sizeof(query), 45678U);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive a legacy response");
+	zassert_equal(NET_IPV6_HDR(response_pkts[0])->hop_limit, 255U,
+		      "Legacy response used the wrong hop limit");
 
 	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 2U);
 	check_service_instance_question(response_pkts[0], DNS_RR_TYPE_SRV);
