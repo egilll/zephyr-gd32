@@ -58,7 +58,9 @@ matching host, browse, and service-instance answers.
 Applications can replace the externally supplied service-record array with
 :c:func:`mdns_responder_set_ext_records`. The responder stores the supplied
 pointers rather than copying their contents, so the array, its strings, TXT
-data, and port values must remain valid until the records are removed.
+data, and port values must remain valid until the records are removed. A
+non-empty update made after startup schedules the standard two announcement
+rounds when probing and DNS-SD announcements are enabled.
 
 Probing and announcements
 *************************

@@ -39,6 +39,8 @@ extern "C" {
  * @param records A pointer to an array of mDNS records. It is stored internally
  *                without copying the content so it must be kept valid. Pass
  *                NULL together with a zero @p count before freeing the array.
+ *                A non-empty update is announced when runtime announcements
+ *                are enabled and the responder is already running.
  * @param count The number of elements, or zero when clearing @p records.
  * @return 0 for OK; -EINVAL if exactly one of @p records and @p count is zero.
  */
