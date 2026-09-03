@@ -69,6 +69,82 @@ static const uint8_t dns_sd_service_enumeration_query[] = {
 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x00, 0x01
 };
 
+static const uint8_t dns_sd_service_enumeration_known_answer_query[] = {
+	/* Header: one question and one known answer */
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x01,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	/* _services._dns-sd._udp.local, PTR, class IN */
+	0x09,
+	0x5f,
+	0x73,
+	0x65,
+	0x72,
+	0x76,
+	0x69,
+	0x63,
+	0x65,
+	0x73,
+	0x07,
+	0x5f,
+	0x64,
+	0x6e,
+	0x73,
+	0x2d,
+	0x73,
+	0x64,
+	0x04,
+	0x5f,
+	0x75,
+	0x64,
+	0x70,
+	0x05,
+	0x6c,
+	0x6f,
+	0x63,
+	0x61,
+	0x6c,
+	0x00,
+	0x00,
+	0x0c,
+	0x00,
+	0x01,
+	/* Known PTR: _services._dns-sd._udp.local -> _foo._udp.local */
+	0xc0,
+	0x0c,
+	0x00,
+	0x0c,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x11,
+	0x94,
+	0x00,
+	0x0c,
+	0x04,
+	0x5f,
+	0x66,
+	0x6f,
+	0x6f,
+	0x04,
+	0x5f,
+	0x75,
+	0x64,
+	0x70,
+	0xc0,
+	0x23,
+};
+
 static const uint8_t service_enum_start[] = {
 0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x09,
 0x5f, 0x73, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x07, 0x5f, 0x64, 0x6e,
@@ -536,6 +612,24 @@ static void check_service_type_enum_resp(struct net_pkt *pkt, const uint8_t *pay
 
 /* mDNS responder can advertise only ports that are bound - reuse its own port */
 DNS_SD_REGISTER_UDP_SERVICE(foo, "zephyr", "_foo", "local", DNS_SD_EMPTY_TXT, 5353);
+
+ZTEST(test_mdns_responder, test_service_type_known_answer_suppression)
+{
+	uint8_t query[sizeof(dns_sd_service_enumeration_known_answer_query)];
+
+	memcpy(query, dns_sd_service_enumeration_known_answer_query, sizeof(query));
+	send_msg(query, sizeof(query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Fresh service type known answer was not suppressed");
+	zassert_equal(responses_count, 0U, "Fresh service type known answer produced a response");
+
+	query[60] = 'b';
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Different service type known answer did not receive a response");
+	check_service_type_enum_resp(response_pkts[0], payload_foo_udp_local,
+				     sizeof(payload_foo_udp_local));
+}
 
 ZTEST(test_mdns_responder, test_external_records)
 {
