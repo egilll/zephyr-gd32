@@ -1402,24 +1402,32 @@ static void check_basic_dns_sd_query_resp(struct net_pkt *pkt)
 	/* PTR answer record */
 	zassert_ok(net_pkt_read(pkt, &resp_record, sizeof(resp_record)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_record.type), DNS_RR_TYPE_PTR, "Invalid record type");
+	zassert_equal(net_ntohs(resp_record.class_), DNS_CLASS_IN,
+		      "Shared PTR record has cache-flush set");
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(resp_record.rdlength)), "net_pkt skip failed");
 
 	/* TXT additional record */
 	skip_labels(pkt);
 	zassert_ok(net_pkt_read(pkt, &resp_record, sizeof(resp_record)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_record.type), DNS_RR_TYPE_TXT, "Invalid record type");
+	zassert_equal(net_ntohs(resp_record.class_), DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Unique TXT record lacks cache-flush");
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(resp_record.rdlength)), "net_pkt skip failed");
 
 	/* SRV additional record */
 	skip_labels(pkt);
 	zassert_ok(net_pkt_read(pkt, &resp_record, sizeof(resp_record)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_record.type), DNS_RR_TYPE_SRV, "Invalid record type");
+	zassert_equal(net_ntohs(resp_record.class_), DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Unique SRV record lacks cache-flush");
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(resp_record.rdlength)), "net_pkt skip failed");
 
 	/* First AAAA additional record */
 	skip_labels(pkt);
 	zassert_ok(net_pkt_read(pkt, &resp_record, sizeof(resp_record)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_record.type), DNS_RR_TYPE_AAAA, "Invalid record type");
+	zassert_equal(net_ntohs(resp_record.class_), DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Unique AAAA record lacks cache-flush");
 	zassert_equal(net_ntohs(resp_record.rdlength), sizeof(struct net_in6_addr),
 		      "Invalid record len");
 	zassert_ok(net_pkt_read(pkt, &resp_addr[0], sizeof(struct net_in6_addr)),
@@ -1429,6 +1437,8 @@ static void check_basic_dns_sd_query_resp(struct net_pkt *pkt)
 	skip_labels(pkt);
 	zassert_ok(net_pkt_read(pkt, &resp_record, sizeof(resp_record)), "net_pkt read failed");
 	zassert_equal(net_ntohs(resp_record.type), DNS_RR_TYPE_AAAA, "Invalid record type");
+	zassert_equal(net_ntohs(resp_record.class_), DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Unique AAAA record lacks cache-flush");
 	zassert_equal(net_ntohs(resp_record.rdlength), sizeof(struct net_in6_addr),
 		      "Invalid record len");
 	zassert_ok(net_pkt_read(pkt, &resp_addr[1], sizeof(struct net_in6_addr)),
@@ -1462,6 +1472,58 @@ ZTEST(test_mdns_responder, test_basic_dns_sd_query)
 	res = k_sem_take(&wait_data, RESPONSE_TIMEOUT);
 	zassert_ok(res, "Did not receive a response");
 
+	check_basic_dns_sd_query_resp(response_pkts[0]);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_browse_qu_query)
+{
+	static uint8_t query[] = {
+		/* Header */
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* _foo._udp.local, PTR, class IN with the QU bit */
+		0x04,
+		0x5f,
+		0x66,
+		0x6f,
+		0x6f,
+		0x04,
+		0x5f,
+		0x75,
+		0x64,
+		0x70,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0x0c,
+		0x80,
+		0x01,
+	};
+	struct net_ipv6_hdr *header;
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a QU browse response");
+
+	header = NET_IPV6_HDR(response_pkts[0]);
+	zassert_true(net_ipv6_addr_cmp_raw(header->dst, (const uint8_t *)&sender_ll_addr),
+		     "QU browse response was not unicast to the querier");
+	zassert_equal(header->hop_limit, 255U, "QU browse response used the wrong hop limit");
 	check_basic_dns_sd_query_resp(response_pkts[0]);
 }
 
@@ -1600,6 +1662,91 @@ static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type 
 		zassert_true(net_ntohl(record.ttl) <= 10U, "Legacy response TTL is too long");
 	}
 	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "net_pkt skip failed");
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_browse_legacy_query)
+{
+	static uint8_t query[] = {
+		/* Header with an identifier the response must repeat */
+		0x12,
+		0x34,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* _foo._udp.local, PTR, class IN */
+		0x04,
+		0x5f,
+		0x66,
+		0x6f,
+		0x6f,
+		0x04,
+		0x5f,
+		0x75,
+		0x64,
+		0x70,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0x0c,
+		0x00,
+		0x01,
+	};
+	static const enum dns_rr_type additional_types[] = {
+		DNS_RR_TYPE_SRV,
+		DNS_RR_TYPE_TXT,
+		DNS_RR_TYPE_AAAA,
+		DNS_RR_TYPE_AAAA,
+	};
+	struct dns_rr record;
+	uint16_t qclass;
+	uint16_t qtype;
+
+	send_msg_from_port(query, sizeof(query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Did not receive a legacy browse response");
+
+	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U,
+				      ARRAY_SIZE(additional_types));
+	validate_label(response_pkts[0], "_foo", false);
+	validate_label(response_pkts[0], "_udp", false);
+	validate_label(response_pkts[0], "local", true);
+	zassert_ok(net_pkt_read_be16(response_pkts[0], &qtype), "net_pkt read failed");
+	zassert_equal(qtype, DNS_RR_TYPE_PTR, "Unexpected question type");
+	zassert_ok(net_pkt_read_be16(response_pkts[0], &qclass), "net_pkt read failed");
+	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
+
+	skip_labels(response_pkts[0]);
+	zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_PTR, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN, "Unexpected answer class");
+	zassert_equal(net_ntohl(record.ttl), 10U, "Unexpected answer TTL");
+	zassert_ok(net_pkt_skip(response_pkts[0], net_ntohs(record.rdlength)),
+		   "net_pkt skip failed");
+
+	ARRAY_FOR_EACH(additional_types, i) {
+		skip_labels(response_pkts[0]);
+		zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)),
+			   "net_pkt read failed");
+		zassert_equal(net_ntohs(record.type), additional_types[i],
+			      "Unexpected additional type");
+		zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN,
+			      "Additional record has cache-flush set");
+		zassert_equal(net_ntohl(record.ttl), 10U, "Unexpected additional TTL");
+		zassert_ok(net_pkt_skip(response_pkts[0], net_ntohs(record.rdlength)),
+			   "net_pkt skip failed");
+	}
 }
 
 ZTEST(test_mdns_responder, test_service_type_legacy_query)
