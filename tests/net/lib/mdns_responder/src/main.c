@@ -2252,6 +2252,29 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_txt_query)
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
 }
 
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_batched_query)
+{
+	static const uint8_t compressed_txt_question[] = {
+		0xc0, 0x0c, 0x00, DNS_RR_TYPE_TXT, 0x00, DNS_CLASS_IN,
+	};
+	uint8_t query[sizeof(service_instance_srv_query) + sizeof(compressed_txt_question)];
+
+	memcpy(query, service_instance_srv_query, sizeof(service_instance_srv_query));
+	query[5] = 2U;
+	memcpy(query + sizeof(service_instance_srv_query), compressed_txt_question,
+	       sizeof(compressed_txt_question));
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an SRV response");
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive a TXT response");
+	zassert_equal(responses_count, 2U, "Expected one response per question");
+
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
+	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 0U);
+	check_service_instance_answer(response_pkts[1], DNS_RR_TYPE_TXT, false);
+}
+
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_known_answer_suppression)
 {
 	uint8_t query[sizeof(service_instance_srv_known_answer_query)];
