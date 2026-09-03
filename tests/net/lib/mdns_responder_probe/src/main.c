@@ -457,15 +457,23 @@ static void clear_responses(void)
 	}
 }
 
-static bool wait_for_aaaa_answer(const struct net_in6_addr *addr, uint32_t ttl)
+static bool wait_for_aaaa_answers(const struct net_in6_addr *addr, uint32_t ttl,
+				  size_t expected_count)
 {
+	size_t answer_count = 0U;
+	size_t checked_count = 0U;
+
 	for (int poll = 0; poll < PROBE_MAX_POLLS; ++poll) {
-		for (size_t i = 0; i < responses_count; ++i) {
+		for (size_t i = checked_count; i < responses_count; ++i) {
 			if (packet_has_aaaa_answer(response_pkts[i], addr, ttl)) {
-				return true;
+				answer_count++;
 			}
 		}
+		if (answer_count >= expected_count) {
+			return true;
+		}
 
+		checked_count = responses_count;
 		(void)k_sem_take(&wait_data, RESPONSE_TIMEOUT);
 	}
 
@@ -486,13 +494,13 @@ ZTEST(test_mdns_responder_probe, test_address_change_announce_and_goodbye)
 	ifaddr = net_if_ipv6_addr_add(iface1, &changed_addr, NET_ADDR_MANUAL, 0);
 	zassert_not_null(ifaddr, "Failed to add changed address");
 	ifaddr->addr_state = NET_ADDR_PREFERRED;
-	zassert_true(wait_for_aaaa_answer(&changed_addr, CONFIG_MDNS_RESPONDER_TTL),
-		     "Added address was not announced");
+	zassert_true(wait_for_aaaa_answers(&changed_addr, CONFIG_MDNS_RESPONDER_TTL, 2U),
+		     "Added address was not announced twice");
 
 	clear_responses();
 	zassert_true(net_if_ipv6_addr_rm(iface1, &changed_addr),
 		     "Failed to remove changed address");
-	zassert_true(wait_for_aaaa_answer(&changed_addr, 0U),
+	zassert_true(wait_for_aaaa_answers(&changed_addr, 0U, 1U),
 		     "Removed address was not sent with TTL zero");
 
 	clear_responses();
@@ -534,8 +542,8 @@ ZTEST(test_mdns_responder_probe, test_tentative_ipv6_waits_for_dad)
 	ifaddr->addr_state = NET_ADDR_PREFERRED;
 	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_DAD_SUCCEED, iface1, &ll_addr,
 					sizeof(ll_addr));
-	zassert_true(wait_for_aaaa_answer(&ll_addr, CONFIG_MDNS_RESPONDER_TTL),
-		     "Validated IPv6 address was not announced after DAD");
+	zassert_true(wait_for_aaaa_answers(&ll_addr, CONFIG_MDNS_RESPONDER_TTL, 2U),
+		     "Validated IPv6 address was not announced twice after DAD");
 	net_if_flag_set(iface1, NET_IF_IPV6_NO_ND);
 }
 
