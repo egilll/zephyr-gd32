@@ -143,7 +143,7 @@ static int recv_data(struct net_socket_service_event *pev)
 	struct dns_socket_dispatcher *dispatcher;
 	net_socklen_t optlen = sizeof(int);
 	struct net_buf *dns_data = NULL;
-	struct net_sockaddr_storage addr;
+	struct net_sockaddr_storage addr = {0};
 	net_socklen_t addrlen;
 	int family, sock_error;
 	int ret = 0, len;
