@@ -843,6 +843,187 @@ ZTEST(test_mdns_responder, test_basic_dns_sd_query)
 	check_basic_dns_sd_query_resp(response_pkts[0]);
 }
 
+static void check_service_instance_header(struct net_pkt *pkt, uint16_t expected_id,
+					  uint16_t expected_questions, uint16_t expected_answers,
+					  uint16_t expected_additional)
+{
+	struct dns_header header;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "net_pkt skip failed");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "net_pkt read failed");
+	zassert_equal(net_ntohs(header.id), expected_id, "Unexpected response ID");
+	zassert_equal(net_ntohs(header.qdcount), expected_questions, "Unexpected question count");
+	zassert_equal(net_ntohs(header.ancount), expected_answers, "Unexpected answer count");
+	zassert_equal(net_ntohs(header.arcount), expected_additional,
+		      "Unexpected additional record count");
+}
+
+static void check_service_instance_question(struct net_pkt *pkt, enum dns_rr_type expected_type)
+{
+	uint16_t qclass;
+	uint16_t qtype;
+
+	validate_label(pkt, "zephyr", false);
+	validate_label(pkt, "_foo", false);
+	validate_label(pkt, "_udp", false);
+	validate_label(pkt, "local", true);
+	zassert_ok(net_pkt_read_be16(pkt, &qtype), "net_pkt read failed");
+	zassert_equal(qtype, expected_type, "Unexpected question type");
+	zassert_ok(net_pkt_read_be16(pkt, &qclass), "net_pkt read failed");
+	zassert_equal(qclass, DNS_CLASS_IN, "Unexpected question class");
+}
+
+static void check_service_instance_answer(struct net_pkt *pkt, enum dns_rr_type expected_type,
+					  bool legacy)
+{
+	struct dns_rr record;
+
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), expected_type, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN | (legacy ? 0 : DNS_CLASS_FLUSH),
+		      "Unexpected answer class");
+	if (legacy) {
+		zassert_true(net_ntohl(record.ttl) <= 10U, "Legacy response TTL is too long");
+	}
+	zassert_ok(net_pkt_skip(pkt, net_ntohs(record.rdlength)), "net_pkt skip failed");
+}
+
+static const uint8_t service_instance_srv_query[] = {
+	/* Header */
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x01,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	/* zephyr._foo._udp.local */
+	0x06,
+	0x7a,
+	0x65,
+	0x70,
+	0x68,
+	0x79,
+	0x72,
+	0x04,
+	0x5f,
+	0x66,
+	0x6f,
+	0x6f,
+	0x04,
+	0x5f,
+	0x75,
+	0x64,
+	0x70,
+	0x05,
+	0x6c,
+	0x6f,
+	0x63,
+	0x61,
+	0x6c,
+	0x00,
+	/* SRV, class IN */
+	0x00,
+	0x21,
+	0x00,
+	0x01,
+};
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_query)
+{
+	send_msg(service_instance_srv_query, sizeof(service_instance_srv_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an SRV response");
+
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_txt_query)
+{
+	uint8_t query[sizeof(service_instance_srv_query)];
+
+	memcpy(query, service_instance_srv_query, sizeof(query));
+	query[sizeof(query) - 4] = 0x00;
+	query[sizeof(query) - 3] = 0x10;
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive a TXT response");
+
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_query)
+{
+	uint8_t query[sizeof(service_instance_srv_query)];
+
+	memcpy(query, service_instance_srv_query, sizeof(query));
+	query[sizeof(query) - 4] = 0x00;
+	query[sizeof(query) - 3] = 0xff;
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive an ANY response");
+
+	check_service_instance_header(response_pkts[0], 0U, 0U, 2U, 2U);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_qu_query)
+{
+	struct net_ipv6_hdr *header;
+	uint8_t query[sizeof(service_instance_srv_query)];
+
+	memcpy(query, service_instance_srv_query, sizeof(query));
+	query[sizeof(query) - 2] = 0x80;
+	query[sizeof(query) - 1] = 0x01;
+
+	send_msg(query, sizeof(query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive a QU response");
+
+	header = NET_IPV6_HDR(response_pkts[0]);
+	zassert_true(net_ipv6_addr_cmp_raw(header->dst, (const uint8_t *)&sender_ll_addr),
+		     "QU response was not unicast to the querier");
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_legacy_query)
+{
+	struct dns_rr record;
+	uint8_t query[sizeof(service_instance_srv_query)];
+
+	memcpy(query, service_instance_srv_query, sizeof(query));
+	query[0] = 0x12;
+	query[1] = 0x34;
+
+	send_msg_from_port(query, sizeof(query), 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "Did not receive a legacy response");
+
+	check_service_instance_header(response_pkts[0], 0x1234U, 1U, 1U, 2U);
+	check_service_instance_question(response_pkts[0], DNS_RR_TYPE_SRV);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, true);
+
+	for (int i = 0; i < 2; ++i) {
+		skip_labels(response_pkts[0]);
+		zassert_ok(net_pkt_read(response_pkts[0], &record, sizeof(record)),
+			   "net_pkt read failed");
+		zassert_equal(net_ntohs(record.class_), DNS_CLASS_IN,
+			      "Legacy additional record has cache-flush set");
+		zassert_true(net_ntohl(record.ttl) <= 10U, "Legacy response TTL is too long");
+		zassert_ok(net_pkt_skip(response_pkts[0], net_ntohs(record.rdlength)),
+			   "net_pkt skip failed");
+	}
+}
+
 /* Verify a PTR answer's name is exactly service.proto.domain (three labels,
  * uncompressed) -- used to confirm which service a response packet answers.
  */
