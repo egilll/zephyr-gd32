@@ -415,17 +415,19 @@ static bool packet_has_aaaa_answer(struct net_pkt *pkt, const struct net_in6_add
 	for (uint16_t i = 0U; i < answer_count; ++i) {
 		struct net_in6_addr answer_addr;
 		uint32_t answer_ttl;
+		uint16_t class_;
 		uint16_t type;
 		uint16_t rdlength;
 
 		if (!skip_dns_name(pkt) || net_pkt_read_be16(pkt, &type) != 0 ||
-		    net_pkt_skip(pkt, DNS_QCLASS_LEN) != 0 ||
+		    net_pkt_read_be16(pkt, &class_) != 0 ||
 		    net_pkt_read_be32(pkt, &answer_ttl) != 0 ||
 		    net_pkt_read_be16(pkt, &rdlength) != 0) {
 			return false;
 		}
 
-		if (type == DNS_RR_TYPE_AAAA && rdlength == sizeof(answer_addr)) {
+		if (type == DNS_RR_TYPE_AAAA && class_ == (DNS_CLASS_IN | DNS_CLASS_FLUSH) &&
+		    rdlength == sizeof(answer_addr)) {
 			if (net_pkt_read(pkt, &answer_addr, sizeof(answer_addr)) != 0) {
 				return false;
 			}
