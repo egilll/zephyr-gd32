@@ -1361,7 +1361,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 			return ret;
 		}
 
-		ret = dns_sd_buf_add_be16(&output, DNS_CLASS_IN);
+		ret = dns_sd_buf_add_be16(&output, query->class_);
 		if (ret < 0) {
 			return ret;
 		}
@@ -1504,7 +1504,7 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst, const struct 
 	if (request->legacy) {
 		sys_put_be16(request->type, &buf[offset]);
 		offset += DNS_QTYPE_LEN;
-		sys_put_be16(DNS_CLASS_IN, &buf[offset]);
+		sys_put_be16(request->class_, &buf[offset]);
 		offset += DNS_QCLASS_LEN;
 
 		owner_offset = net_htons(DNS_SD_PTR_MASK | sizeof(struct dns_header));
