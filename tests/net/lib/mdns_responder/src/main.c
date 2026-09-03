@@ -28,7 +28,7 @@ LOG_MODULE_REGISTER(mdns_resp_test);
 #include "dns_pack.h"
 
 #define NULL_CHAR_SIZE 1
-#define EXT_RECORDS_NUM 3
+#define EXT_RECORDS_NUM  4
 #define MAX_RESP_PKTS 8
 #define MAX_TXT_SIZE 128
 #define RESPONSE_TIMEOUT (K_MSEC(250))
@@ -550,6 +550,12 @@ ZTEST(test_mdns_responder, test_external_records)
 
 	records[2] = alloc_ext_record("bar", "_foo", "_tcp", "local", NULL, 0, 5353);
 	zassert_not_null(records[2], "Failed to alloc the record");
+
+	/* A second instance of the statically registered _foo._udp service
+	 * must not produce a duplicate service-type enumeration answer.
+	 */
+	records[3] = alloc_ext_record("duplicate", "_foo", "_udp", "local", NULL, 0, 5353);
+	zassert_not_null(records[3], "Failed to alloc the duplicate record");
 
 	/* Request service type enumeration */
 	send_msg(dns_sd_service_enumeration_query, sizeof(dns_sd_service_enumeration_query));
