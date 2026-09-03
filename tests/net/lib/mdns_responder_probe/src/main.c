@@ -414,6 +414,7 @@ static void check_complete_dns_sd_announce(struct net_pkt *pkt)
 	struct dns_header header;
 	uint16_t answer_count;
 	bool found_address = false;
+	bool found_nsec = false;
 	bool found_ptr = false;
 	bool found_srv = false;
 	bool found_txt = false;
@@ -430,7 +431,7 @@ static void check_complete_dns_sd_announce(struct net_pkt *pkt)
 		      "Announcement placed records in the Additional section");
 
 	answer_count = net_ntohs(header.ancount);
-	zassert_true(answer_count >= 4U, "Incomplete DNS-SD announcement");
+	zassert_true(answer_count >= 5U, "Incomplete DNS-SD announcement");
 
 	for (uint16_t i = 0U; i < answer_count; ++i) {
 		uint32_t expected_ttl;
@@ -472,6 +473,11 @@ static void check_complete_dns_sd_announce(struct net_pkt *pkt)
 			expected_ttl = DNS_SD_AAAA_TTL;
 			found_address = true;
 			break;
+		case DNS_RR_TYPE_NSEC:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			expected_ttl = DNS_SD_A_TTL;
+			found_nsec = true;
+			break;
 		default:
 			zassert_unreachable("Unexpected DNS-SD announcement record type");
 			return;
@@ -486,6 +492,7 @@ static void check_complete_dns_sd_announce(struct net_pkt *pkt)
 	zassert_true(found_srv, "Announcement is missing its SRV record");
 	zassert_true(found_txt, "Announcement is missing its TXT record");
 	zassert_true(found_address, "Announcement is missing its address record");
+	zassert_true(found_nsec, "Announcement is missing its negative address record");
 }
 
 static void check_complete_dns_sd_goodbye(struct net_pkt *pkt)
