@@ -1424,6 +1424,20 @@ static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type 
 		return ret < 0 ? ret
 			       : rdata_end == msg + rdata_offset + rdlength &&
 					 dns_sd_host_name_matches(scratch->data, record);
+	case DNS_RR_TYPE_NSEC: {
+		static const uint8_t expected_bitmap[] = {0U, 5U, 0U, 0U, 0x80U, 0U, 0x40U};
+
+		rdata_end = msg + rdata_offset + rdlength;
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size, msg + rdata_offset, scratch, &rdata_end);
+		if (ret < 0) {
+			return ret;
+		}
+
+		return rdata_end <= msg + rdata_offset + rdlength &&
+		       msg + rdata_offset + rdlength - rdata_end == sizeof(expected_bitmap) &&
+		       memcmp(rdata_end, expected_bitmap, sizeof(expected_bitmap)) == 0;
+	}
 	default:
 		return false;
 	}
@@ -1450,6 +1464,9 @@ static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type
 		break;
 	case DNS_RR_TYPE_TXT:
 		minimum_ttl = DNS_SD_TXT_TTL / 2U;
+		break;
+	case DNS_RR_TYPE_NSEC:
+		minimum_ttl = DNS_SD_SRV_TTL / 2U;
 		break;
 	default:
 		return 0;
@@ -1495,6 +1512,11 @@ static int dns_sd_suppress_known_answers(const struct dns_sd_rec *record,
 	if (query->browse) {
 		return dns_sd_answer_known(record, DNS_RR_TYPE_PTR, msg, msg_size, answer_offset,
 					   answer_count, service_type_enum, scratch);
+	}
+	if (query->type != DNS_RR_TYPE_SRV && query->type != DNS_RR_TYPE_TXT &&
+	    query->type != DNS_RR_TYPE_ANY) {
+		return dns_sd_answer_known(record, DNS_RR_TYPE_NSEC, msg, msg_size, answer_offset,
+					   answer_count, false, scratch);
 	}
 
 	if (query->type != DNS_RR_TYPE_ANY) {
@@ -1642,9 +1664,8 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 		service_type_enum = true;
 	}
 
-	if ((!service_type_enum && filter.instance == NULL && qtype != DNS_RR_TYPE_PTR &&
-	     qtype != DNS_RR_TYPE_ANY) ||
-	    (filter.instance != NULL && qtype == DNS_RR_TYPE_PTR)) {
+	if ((service_type_enum || filter.instance == NULL) && qtype != DNS_RR_TYPE_PTR &&
+	    qtype != DNS_RR_TYPE_ANY) {
 		return;
 	}
 
@@ -1848,9 +1869,7 @@ static int dns_read(int sock,
 			send_response(sock, family, src_addr, addrlen, result, qtype, qclass,
 				      recv_if, dns_id, dns_msg.msg, dns_msg.msg_size, answer_offset,
 				      answer_count);
-		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD) &&
-			   (qtype == DNS_RR_TYPE_PTR || qtype == DNS_RR_TYPE_SRV ||
-			    qtype == DNS_RR_TYPE_TXT || qtype == DNS_RR_TYPE_ANY)) {
+		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD)) {
 			send_sd_response(sock, family, src_addr, addrlen, result, recv_if, qtype,
 					 qclass, dns_id, dns_msg.msg, dns_msg.msg_size,
 					 answer_offset, answer_count);
