@@ -971,6 +971,54 @@ static void check_basic_query_resp(struct net_pkt *pkt)
 			 "Address 2 not found");
 }
 
+static void check_address_record(struct net_pkt *pkt, enum dns_rr_type expected_type,
+				 const struct net_in_addr *expected_v4)
+{
+	struct dns_rr record;
+
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), expected_type, "Unexpected address record type");
+
+	if (expected_type == DNS_RR_TYPE_A) {
+		struct net_in_addr addr;
+
+		zassert_equal(net_ntohs(record.rdlength), sizeof(addr), "Invalid IPv4 length");
+		zassert_ok(net_pkt_read(pkt, &addr, sizeof(addr)), "net_pkt read failed");
+		zassert_true(net_ipv4_addr_cmp(&addr, expected_v4), "Unexpected IPv4 address");
+	} else {
+		struct net_in6_addr addr;
+
+		zassert_equal(net_ntohs(record.rdlength), sizeof(addr), "Invalid IPv6 length");
+		zassert_ok(net_pkt_read(pkt, &addr, sizeof(addr)), "net_pkt read failed");
+		zassert_not_null(net_if_ipv6_addr_lookup_by_iface(iface1, &addr),
+				 "IPv6 address not found on query interface");
+	}
+}
+
+static void check_address_response_sections(struct net_pkt *pkt, enum dns_rr_type answer_type,
+					    uint16_t answer_count, enum dns_rr_type additional_type,
+					    uint16_t additional_count,
+					    const struct net_in_addr *expected_v4)
+{
+	struct dns_header header;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "net_pkt skip failed");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "net_pkt read failed");
+	zassert_equal(net_ntohs(header.ancount), answer_count, "Unexpected answer count");
+	zassert_equal(net_ntohs(header.arcount), additional_count, "Unexpected additional count");
+
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		check_address_record(pkt, answer_type, expected_v4);
+	}
+
+	for (uint16_t i = 0U; i < additional_count; ++i) {
+		check_address_record(pkt, additional_type, expected_v4);
+	}
+}
+
 ZTEST(test_mdns_responder, test_basic_query)
 {
 	static uint8_t zephyr_local_query[] = {
@@ -991,6 +1039,98 @@ ZTEST(test_mdns_responder, test_basic_query)
 	zassert_ok(res, "Did not receive a response");
 
 	check_basic_query_resp(response_pkts[0]);
+}
+
+ZTEST(test_mdns_responder, test_address_additional_records)
+{
+	static uint8_t a_query[] = {
+		/* Header */
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* zephyr.local, A, class IN */
+		0x06,
+		0x7a,
+		0x65,
+		0x70,
+		0x68,
+		0x79,
+		0x72,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x01,
+	};
+	static uint8_t aaaa_query[] = {
+		/* Header */
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		/* zephyr.local, AAAA, class IN */
+		0x06,
+		0x7a,
+		0x65,
+		0x70,
+		0x68,
+		0x79,
+		0x72,
+		0x05,
+		0x6c,
+		0x6f,
+		0x63,
+		0x61,
+		0x6c,
+		0x00,
+		0x00,
+		0x1c,
+		0x00,
+		0x01,
+	};
+	struct net_in_addr addr;
+	struct net_if_addr *ifaddr;
+
+	zassert_ok(net_addr_pton(NET_AF_INET, "192.0.2.43", &addr),
+		   "Cannot parse IPv4 test address");
+	ifaddr = net_if_ipv4_addr_add(iface1, &addr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "Cannot add IPv4 test address");
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+
+	send_msg(a_query, sizeof(a_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No A response");
+	check_address_response_sections(response_pkts[0], DNS_RR_TYPE_A, 1U, DNS_RR_TYPE_AAAA, 2U,
+					&addr);
+
+	send_msg(aaaa_query, sizeof(aaaa_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No AAAA response");
+	check_address_response_sections(response_pkts[1], DNS_RR_TYPE_AAAA, 2U, DNS_RR_TYPE_A, 1U,
+					&addr);
+
+	zassert_true(net_if_ipv4_addr_rm(iface1, &addr), "Cannot remove IPv4 test address");
 }
 
 ZTEST(test_mdns_responder, test_hostname_any_query)
