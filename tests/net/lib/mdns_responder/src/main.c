@@ -803,15 +803,22 @@ static size_t append_reverse_known_answer(uint8_t *query, size_t offset, uint32_
 	return offset;
 }
 
-static size_t append_known_nsec(uint8_t *query, size_t offset, enum dns_rr_type existing_type,
+static size_t append_known_nsec(uint8_t *query, size_t offset, uint32_t existing_types,
 				uint32_t ttl)
 {
 	uint8_t bitmap[2U + sizeof(uint32_t)] = {0};
-	size_t bitmap_len = existing_type / 8U + 1U;
-	size_t rdata_size = DNS_POINTER_SIZE + 2U + bitmap_len;
+	size_t bitmap_len = 0U;
+	size_t rdata_size;
+
+	for (enum dns_rr_type type = DNS_RR_TYPE_A; type <= DNS_RR_TYPE_AAAA; ++type) {
+		if ((existing_types & BIT(type)) != 0U) {
+			bitmap[2U + type / 8U] |= BIT(7U - type % 8U);
+			bitmap_len = type / 8U + 1U;
+		}
+	}
 
 	bitmap[1] = bitmap_len;
-	bitmap[2U + existing_type / 8U] = BIT(7U - existing_type % 8U);
+	rdata_size = DNS_POINTER_SIZE + 2U + bitmap_len;
 
 	query[7] = 1U;
 	query[offset++] = NS_CMPRSFLGS;
@@ -910,13 +917,23 @@ static void check_reverse_nsec_response(struct net_pkt *pkt, bool legacy, enum d
 	zassert_mem_equal(bitmap, expected_bitmap, sizeof(bitmap), "Unexpected NSEC bitmap");
 }
 
-static void check_host_nsec_response(struct net_pkt *pkt, bool legacy, uint16_t id)
+static void check_host_nsec_response(struct net_pkt *pkt, bool legacy, uint16_t id,
+				     enum dns_rr_type qtype, uint32_t existing_types)
 {
-	static const uint8_t expected_bitmap[] = {0U, 4U, 0U, 0U, 0U, BIT(3)};
 	struct dns_header header;
 	struct dns_rr record;
+	uint8_t expected_bitmap[2U + sizeof(uint32_t)] = {0};
 	uint8_t bitmap[sizeof(expected_bitmap)];
+	size_t bitmap_len = 0U;
 	uint16_t value;
+
+	for (enum dns_rr_type type = DNS_RR_TYPE_A; type <= DNS_RR_TYPE_AAAA; ++type) {
+		if ((existing_types & BIT(type)) != 0U) {
+			expected_bitmap[2U + type / 8U] |= BIT(7U - type % 8U);
+			bitmap_len = type / 8U + 1U;
+		}
+	}
+	expected_bitmap[1] = bitmap_len;
 
 	net_pkt_cursor_init(pkt);
 	net_pkt_set_overwrite(pkt, true);
@@ -930,7 +947,7 @@ static void check_host_nsec_response(struct net_pkt *pkt, bool legacy, uint16_t 
 	if (legacy) {
 		skip_labels(pkt);
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
-		zassert_equal(value, DNS_RR_TYPE_A, "Repeated question has the wrong type");
+		zassert_equal(value, qtype, "Repeated question has the wrong type");
 		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
 		zassert_equal(value, DNS_CLASS_IN, "Repeated question has the wrong class");
 	}
@@ -943,12 +960,12 @@ static void check_host_nsec_response(struct net_pkt *pkt, bool legacy, uint16_t 
 		      "Unexpected answer class");
 	zassert_equal(net_ntohl(record.ttl), legacy ? 10U : CONFIG_MDNS_RESPONDER_TTL,
 		      "Unexpected answer TTL");
-	zassert_equal(net_ntohs(record.rdlength), DNS_POINTER_SIZE + sizeof(bitmap),
+	zassert_equal(net_ntohs(record.rdlength), DNS_POINTER_SIZE + 2U + bitmap_len,
 		      "Unexpected NSEC length");
 	zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
 	zassert_equal(value, 0xc00c, "NSEC next name does not point to its owner");
-	zassert_ok(net_pkt_read(pkt, bitmap, sizeof(bitmap)), "net_pkt read failed");
-	zassert_mem_equal(bitmap, expected_bitmap, sizeof(bitmap), "Unexpected NSEC bitmap");
+	zassert_ok(net_pkt_read(pkt, bitmap, 2U + bitmap_len), "net_pkt read failed");
+	zassert_mem_equal(bitmap, expected_bitmap, 2U + bitmap_len, "Unexpected NSEC bitmap");
 }
 
 #define HOST_KNOWN_ANSWER_SIZE                                                                     \
@@ -1341,19 +1358,20 @@ ZTEST(test_mdns_responder, test_hostname_missing_address_nsec)
 	memcpy(query, a_query, sizeof(a_query));
 	send_msg(query, sizeof(a_query));
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No missing-A NSEC response");
-	check_host_nsec_response(response_pkts[0], false, 0U);
+	check_host_nsec_response(response_pkts[0], false, 0U, DNS_RR_TYPE_A, BIT(DNS_RR_TYPE_AAAA));
 
 	memcpy(query, a_query, sizeof(a_query));
 	sys_put_be16(query_id, query);
 	send_msg_from_port(query, sizeof(a_query), 45678U);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No legacy missing-A NSEC response");
-	check_host_nsec_response(response_pkts[1], true, query_id);
+	check_host_nsec_response(response_pkts[1], true, query_id, DNS_RR_TYPE_A,
+				 BIT(DNS_RR_TYPE_AAAA));
 	zassert_true(net_ipv6_addr_cmp_raw(NET_IPV6_HDR(response_pkts[1])->dst,
 					   (const uint8_t *)&sender_ll_addr),
 		     "Legacy NSEC response was not unicast");
 
 	memcpy(query, a_query, sizeof(a_query));
-	query_size = append_known_nsec(query, sizeof(a_query), DNS_RR_TYPE_AAAA,
+	query_size = append_known_nsec(query, sizeof(a_query), BIT(DNS_RR_TYPE_AAAA),
 				       CONFIG_MDNS_RESPONDER_TTL);
 	send_msg(query, query_size);
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
@@ -1361,12 +1379,63 @@ ZTEST(test_mdns_responder, test_hostname_missing_address_nsec)
 	zassert_equal(responses_count, 2U, "Fresh host NSEC produced a response");
 
 	memcpy(query, a_query, sizeof(a_query));
-	query_size = append_known_nsec(query, sizeof(a_query), DNS_RR_TYPE_AAAA,
+	query_size = append_known_nsec(query, sizeof(a_query), BIT(DNS_RR_TYPE_AAAA),
 				       CONFIG_MDNS_RESPONDER_TTL / 2U - 1U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
 		   "Stale host NSEC did not receive a response");
-	check_host_nsec_response(response_pkts[2], false, 0U);
+	check_host_nsec_response(response_pkts[2], false, 0U, DNS_RR_TYPE_A, BIT(DNS_RR_TYPE_AAAA));
+}
+
+ZTEST(test_mdns_responder, test_hostname_general_nsec)
+{
+	static const uint8_t base_query[] = {/* Header: one question */
+					     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+					     0x00, 0x00, 0x00,
+					     /* zephyr.local, type set below, class IN */
+					     0x06, 0x7a, 0x65, 0x70, 0x68, 0x79, 0x72, 0x05, 0x6c,
+					     0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x01};
+	struct net_in_addr addr;
+	struct net_if_addr *ifaddr;
+	uint8_t query[sizeof(base_query) + sizeof(struct dns_rr) + 10U];
+	size_t query_size;
+
+	memcpy(query, base_query, sizeof(base_query));
+	query[sizeof(base_query) - 3U] = DNS_RR_TYPE_SRV;
+	send_msg(query, sizeof(base_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No absent-SRV NSEC response");
+	check_host_nsec_response(response_pkts[0], false, 0U, DNS_RR_TYPE_SRV,
+				 BIT(DNS_RR_TYPE_AAAA));
+
+	memcpy(query, base_query, sizeof(base_query));
+	query[sizeof(base_query) - 3U] = DNS_RR_TYPE_NSEC;
+	send_msg(query, sizeof(base_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No direct host NSEC response");
+	check_host_nsec_response(response_pkts[1], false, 0U, DNS_RR_TYPE_NSEC,
+				 BIT(DNS_RR_TYPE_AAAA));
+
+	zassert_ok(net_addr_pton(NET_AF_INET, "192.0.2.43", &addr),
+		   "Cannot parse IPv4 test address");
+	ifaddr = net_if_ipv4_addr_add(iface1, &addr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "Cannot add IPv4 test address");
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+
+	memcpy(query, base_query, sizeof(base_query));
+	query[sizeof(base_query) - 3U] = DNS_RR_TYPE_NSEC;
+	send_msg(query, sizeof(base_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No dual-stack host NSEC response");
+	check_host_nsec_response(response_pkts[2], false, 0U, DNS_RR_TYPE_NSEC,
+				 BIT(DNS_RR_TYPE_A) | BIT(DNS_RR_TYPE_AAAA));
+
+	query_size = append_known_nsec(query, sizeof(base_query),
+				       BIT(DNS_RR_TYPE_A) | BIT(DNS_RR_TYPE_AAAA),
+				       CONFIG_MDNS_RESPONDER_TTL);
+	send_msg(query, query_size);
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Fresh dual-stack NSEC known answer was not suppressed");
+	zassert_equal(responses_count, 3U, "Fresh dual-stack NSEC produced a response");
+
+	zassert_true(net_if_ipv4_addr_rm(iface1, &addr), "Cannot remove IPv4 test address");
 }
 
 ZTEST(test_mdns_responder, test_reverse_ptr_queries)
@@ -1475,15 +1544,15 @@ ZTEST(test_mdns_responder, test_reverse_nsec_known_answer_suppression)
 	size_t query_size;
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
-	query_size =
-		append_known_nsec(query, query_size, DNS_RR_TYPE_PTR, CONFIG_MDNS_RESPONDER_TTL);
+	query_size = append_known_nsec(query, query_size, BIT(DNS_RR_TYPE_PTR),
+				       CONFIG_MDNS_RESPONDER_TTL);
 	send_msg(query, query_size);
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
 		      "Fresh reverse NSEC known answer was not suppressed");
 	zassert_equal(responses_count, 0U, "Fresh reverse NSEC produced a response");
 
 	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_A, DNS_CLASS_IN, 0U);
-	query_size = append_known_nsec(query, query_size, DNS_RR_TYPE_PTR,
+	query_size = append_known_nsec(query, query_size, BIT(DNS_RR_TYPE_PTR),
 				       CONFIG_MDNS_RESPONDER_TTL / 2U - 1U);
 	send_msg(query, query_size);
 	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
