@@ -1293,6 +1293,11 @@ static const uint8_t service_instance_txt_known_answer_query[] = {
 	0x00,
 };
 
+static const uint8_t service_instance_empty_txt_known_answer[] = {
+	/* zephyr._foo._udp.local, TXT, class IN, TTL 4500, empty rdata */
+	0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x11, 0x94, 0x00, 0x00,
+};
+
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_query)
 {
 	send_msg(service_instance_srv_query, sizeof(service_instance_srv_query));
@@ -1366,6 +1371,43 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_query)
 	check_service_instance_header(response_pkts[0], 0U, 0U, 2U, 2U);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_SRV, false);
 	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
+}
+
+ZTEST(test_mdns_responder, test_dns_sd_service_instance_any_known_answer_suppression)
+{
+	uint8_t srv_query[sizeof(service_instance_srv_known_answer_query)];
+	uint8_t txt_query[sizeof(service_instance_txt_known_answer_query)];
+	uint8_t all_query[sizeof(service_instance_srv_known_answer_query) +
+			  sizeof(service_instance_empty_txt_known_answer)];
+	const size_t qtype_low = sizeof(service_instance_srv_query) - 3U;
+
+	memcpy(srv_query, service_instance_srv_known_answer_query, sizeof(srv_query));
+	srv_query[qtype_low] = DNS_RR_TYPE_ANY;
+	send_msg(srv_query, sizeof(srv_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Known SRV suppressed the entire ANY response");
+	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 0U);
+	check_service_instance_answer(response_pkts[0], DNS_RR_TYPE_TXT, false);
+
+	memcpy(txt_query, service_instance_txt_known_answer_query, sizeof(txt_query));
+	txt_query[qtype_low] = DNS_RR_TYPE_ANY;
+	send_msg(txt_query, sizeof(txt_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Known TXT suppressed the entire ANY response");
+	check_service_instance_header(response_pkts[1], 0U, 0U, 1U, 2U);
+	check_service_instance_answer(response_pkts[1], DNS_RR_TYPE_SRV, false);
+
+	memcpy(all_query, service_instance_srv_known_answer_query,
+	       sizeof(service_instance_srv_known_answer_query));
+	memcpy(all_query + sizeof(service_instance_srv_known_answer_query),
+	       service_instance_empty_txt_known_answer,
+	       sizeof(service_instance_empty_txt_known_answer));
+	all_query[7] = 2U;
+	all_query[qtype_low] = DNS_RR_TYPE_ANY;
+	send_msg(all_query, sizeof(all_query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Complete fresh ANY known answers were not suppressed");
+	zassert_equal(responses_count, 2U, "Complete ANY known answers produced a response");
 }
 
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_qu_query)
