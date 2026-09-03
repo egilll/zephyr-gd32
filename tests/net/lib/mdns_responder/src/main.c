@@ -1430,9 +1430,14 @@ ZTEST(test_mdns_responder, test_hostname_general_nsec)
 	query_size = append_known_nsec(query, sizeof(base_query),
 				       BIT(DNS_RR_TYPE_A) | BIT(DNS_RR_TYPE_AAAA),
 				       CONFIG_MDNS_RESPONDER_TTL);
+	/* Point the NSEC Next Domain Name at local instead of its zephyr.local
+	 * owner. RFC 6762 requires the responder to ignore this mismatch.
+	 */
+	query[sizeof(base_query) + DNS_POINTER_SIZE + sizeof(struct dns_rr) + 1U] =
+		sizeof(struct dns_header) + DNS_LABEL_LEN_SIZE + strlen("zephyr");
 	send_msg(query, query_size);
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
-		      "Fresh dual-stack NSEC known answer was not suppressed");
+		      "NSEC with a mismatched next name was not suppressed");
 	zassert_equal(responses_count, 3U, "Fresh dual-stack NSEC produced a response");
 
 	zassert_true(net_if_ipv4_addr_rm(iface1, &addr), "Cannot remove IPv4 test address");
