@@ -2321,16 +2321,28 @@ ZTEST(test_mdns_responder, test_dns_sd_service_instance_srv_known_answer_suppres
 	check_service_instance_header(response_pkts[0], 0U, 0U, 1U, 2U);
 }
 
+ZTEST(test_mdns_responder, test_canonical_empty_txt_known_answer_suppression)
+{
+	struct dns_sd_rec *record;
+	uint8_t query[sizeof(service_instance_txt_known_answer_query)];
+
+	record = alloc_ext_record("zephyr", "_foo", "_udp", "local", NULL, 0U, 5353U);
+	zassert_not_null(record, "Failed to allocate external service record");
+	((uint8_t *)record->text)[0] = 0x5a;
+
+	memcpy(query, service_instance_txt_known_answer_query, sizeof(query));
+	send_msg(query, sizeof(query));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Canonical empty TXT known answer was not suppressed");
+	zassert_equal(responses_count, 0U, "Canonical empty TXT produced a response");
+	free_ext_record(record);
+}
+
 ZTEST(test_mdns_responder, test_dns_sd_service_instance_txt_known_answer_suppression)
 {
 	uint8_t query[sizeof(service_instance_txt_known_answer_query)];
 
 	memcpy(query, service_instance_txt_known_answer_query, sizeof(query));
-	send_msg(query, sizeof(query));
-	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
-		      "Fresh TXT known answer was not suppressed");
-	zassert_equal(responses_count, 0U, "Fresh TXT known answer produced a response");
-
 	query[48] = 0x08;
 	query[49] = 0xc9;
 	send_msg(query, sizeof(query));
