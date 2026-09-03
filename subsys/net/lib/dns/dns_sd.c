@@ -124,12 +124,12 @@ bool label_is_valid(const char *label, size_t label_size)
 	}
 
 	for (i = 0; i < label_size; ++i) {
-		if (isalpha((int)label[i]) != 0) {
+		if (isalpha((unsigned char)label[i]) != 0) {
 			continue;
 		}
 
 		if (i > 0) {
-			if (isdigit((int)label[i]) != 0) {
+			if (isdigit((unsigned char)label[i]) != 0) {
 				continue;
 			}
 
@@ -171,12 +171,11 @@ static bool instance_is_valid(const char *instance)
 	}
 
 	for (i = 0; i < instance_size; ++i) {
+		uint8_t byte = (uint8_t)instance[i];
+
 		/* RFC 6763 Section 4.1.1 */
-		if (instance[i] <= 0x1f ||
-		    instance[i] == 0x7f) {
-			NET_DBG(
-				"instance '%s' contains illegal byte 0x%02x",
-				instance, instance[i]);
+		if (byte <= 0x1f || byte == 0x7f) {
+			NET_DBG("instance '%s' contains illegal byte 0x%02x", instance, byte);
 			return false;
 		}
 	}
