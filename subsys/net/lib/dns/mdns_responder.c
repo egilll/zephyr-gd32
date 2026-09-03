@@ -492,13 +492,110 @@ static int init_name_labels(struct net_buf *query)
 	return 0;
 }
 
+struct mdns_answer {
+	const char *owner;
+	const uint8_t *rdata;
+	uint32_t ttl;
+	uint16_t rdlength;
+	uint16_t type;
+	uint16_t class_;
+};
+
+static int mdns_unpack_answer(const uint8_t *msg, uint16_t msg_size, uint16_t *offset,
+			      struct net_buf *scratch, struct mdns_answer *answer)
+{
+	const uint8_t *owner_end;
+	uint16_t owner_size;
+	uint16_t rdata_offset;
+	int ret;
+
+	if (*offset >= msg_size) {
+		return -EMSGSIZE;
+	}
+
+	scratch->len = 0U;
+	ret = dns_unpack_name(msg, msg_size, msg + *offset, scratch, &owner_end);
+	if (ret < 0) {
+		return ret;
+	}
+
+	owner_size = owner_end - (msg + *offset);
+	if (owner_size > msg_size - *offset ||
+	    sizeof(struct dns_rr) > msg_size - *offset - owner_size) {
+		return -EMSGSIZE;
+	}
+
+	answer->owner = scratch->data;
+	answer->type = dns_answer_type(owner_size, msg + *offset);
+	answer->class_ = dns_answer_class(owner_size, msg + *offset) & ~DNS_CLASS_FLUSH;
+	answer->ttl = dns_answer_ttl(owner_size, msg + *offset);
+	answer->rdlength = dns_answer_rdlength(owner_size, msg + *offset);
+	rdata_offset = *offset + owner_size + sizeof(struct dns_rr);
+
+	if (answer->rdlength > msg_size - rdata_offset) {
+		return -EMSGSIZE;
+	}
+
+	answer->rdata = msg + rdata_offset;
+	*offset = rdata_offset + answer->rdlength;
+
+	return 0;
+}
+
 struct answer_ctx {
 	struct net_buf *query;
+	struct net_buf *scratch;
+	const uint8_t *query_msg;
 	enum dns_rr_type qtype;
 	int answer_count;
+	int candidate_count;
+	int error;
 	uint16_t name_offset;
+	uint16_t query_size;
+	uint16_t answer_offset;
+	uint16_t known_answer_count;
 	bool legacy;
 };
+
+static bool mdns_host_name_matches(const char *name)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+
+	return strlen(name) == hostname_len + sizeof(".local") - 1U &&
+	       strncasecmp(name, hostname, hostname_len) == 0 &&
+	       strcasecmp(name + hostname_len, ".local") == 0;
+}
+
+static int mdns_addr_known(struct answer_ctx *ctx, enum dns_rr_type type, const uint8_t *addr,
+			   uint16_t addr_len)
+{
+	uint16_t offset = ctx->answer_offset;
+
+	if (ctx->scratch == NULL || dns_header_tc(ctx->query_msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < ctx->known_answer_count; ++i) {
+		struct mdns_answer answer;
+		int ret;
+
+		ret = mdns_unpack_answer(ctx->query_msg, ctx->query_size, &offset, ctx->scratch,
+					 &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type == type && answer.class_ == DNS_CLASS_IN &&
+		    answer.ttl >= MDNS_TTL / 2U && answer.rdlength == addr_len &&
+		    mdns_host_name_matches(answer.owner) &&
+		    memcmp(answer.rdata, addr, addr_len) == 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
 
 static void add_a_aaaa_answer(struct answer_ctx *ctx, enum dns_rr_type type, uint32_t ttl,
 			      uint16_t addr_len, const uint8_t *addr, bool include_name_ptr)
@@ -546,6 +643,11 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 	bool include_name_ptr = true;
 	const uint8_t *addr;
 	uint16_t addr_len;
+	int ret;
+
+	if (ctx->error < 0) {
+		return;
+	}
 
 	if (ifaddr->addr_state != NET_ADDR_PREFERRED &&
 	    ifaddr->addr_state != NET_ADDR_DEPRECATED) {
@@ -560,6 +662,16 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 		type = DNS_RR_TYPE_A;
 		addr_len = sizeof(struct net_in_addr);
 		addr = ifaddr->address.in_addr.s4_addr;
+	}
+
+	ctx->candidate_count++;
+	ret = mdns_addr_known(ctx, type, addr, addr_len);
+	if (ret < 0) {
+		ctx->error = ret;
+		return;
+	}
+	if (ret > 0) {
+		return;
 	}
 
 	/* First answer contains full DNS name (already encoded). Consecutive
@@ -577,13 +689,20 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 			  include_name_ptr);
 }
 
-static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
-			 struct net_if *iface, bool legacy, uint16_t dns_id)
+static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dns_rr_type qtype,
+			 struct net_if *iface, bool legacy, uint16_t dns_id,
+			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
+			 uint16_t answer_count)
 {
 	struct answer_ctx ctx = {
 		.query = query,
+		.scratch = scratch,
+		.query_msg = query_msg,
 		.qtype = qtype,
 		.name_offset = DNS_MSG_HEADER_SIZE,
+		.query_size = query_size,
+		.answer_offset = answer_offset,
+		.known_answer_count = answer_count,
 		.legacy = legacy,
 	};
 	int ret;
@@ -619,9 +738,12 @@ static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
 		return -EINVAL;
 	}
 
+	if (ctx.error < 0) {
+		return ctx.error;
+	}
+
 	if (ctx.answer_count == 0) {
-		/* No addresses added */
-		return -ENOMEM;
+		return ctx.candidate_count > 0 ? -EALREADY : -ENOMEM;
 	}
 
 	/* A multicast answer carries neither an identifier nor the question:
@@ -636,17 +758,22 @@ static int create_answer(struct net_buf *query, enum dns_rr_type qtype,
 
 static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
 			 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
-			 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id)
+			 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id,
+			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
+			 uint16_t answer_count)
 {
 	struct net_if *iface;
+	struct net_buf *scratch = NULL;
 	net_socklen_t dst_len;
+	bool legacy;
 	int ret;
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
+	legacy = is_legacy_query(src_addr);
 	ret = setup_dst_addr(sock, family, src_addr, addrlen,
-			     is_legacy_query(src_addr) || (qclass & DNS_CLASS_FLUSH) != 0,
-			     (struct net_sockaddr *)&dst, &dst_len);
+			     legacy || (qclass & DNS_CLASS_FLUSH) != 0, (struct net_sockaddr *)&dst,
+			     &dst_len);
 	if (ret < 0) {
 		NET_DBG("unable to set up the response address");
 		return ret;
@@ -669,9 +796,20 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 		return -EINVAL;
 	}
 
-	ret = create_answer(query, qtype, iface, is_legacy_query(src_addr), dns_id);
-	if (ret != 0) {
-		return -ENOMEM;
+	if (!legacy && answer_count > 0U) {
+		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
+	}
+
+	ret = create_answer(query, scratch, qtype, iface, legacy, dns_id, query_msg, query_size,
+			    answer_offset, answer_count);
+	if (scratch != NULL) {
+		net_buf_unref(scratch);
+	}
+	if (ret == -EALREADY) {
+		return 0;
+	}
+	if (ret < 0) {
+		return ret;
 	}
 
 	ret = zsock_sendto(sock, query->data, query->len, 0,
@@ -846,49 +984,26 @@ static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type
 	}
 
 	for (uint16_t i = 0U; i < answer_count; ++i) {
-		const uint8_t *owner_end;
-		uint16_t owner_size;
-		uint16_t rdlength;
-		uint16_t rdata_offset;
-		uint16_t type;
-		uint16_t class_;
-		uint32_t ttl;
+		struct mdns_answer answer;
 		int ret;
 
-		scratch->len = 0U;
-		ret = dns_unpack_name(msg, msg_size, msg + offset, scratch, &owner_end);
+		ret = mdns_unpack_answer(msg, msg_size, &offset, scratch, &answer);
 		if (ret < 0) {
 			return ret;
 		}
 
-		owner_size = owner_end - (msg + offset);
-		if (owner_size > msg_size - offset ||
-		    sizeof(struct dns_rr) > msg_size - offset - owner_size) {
-			return -EMSGSIZE;
-		}
-
-		type = dns_answer_type(owner_size, msg + offset);
-		class_ = dns_answer_class(owner_size, msg + offset) & ~DNS_CLASS_FLUSH;
-		ttl = dns_answer_ttl(owner_size, msg + offset);
-		rdlength = dns_answer_rdlength(owner_size, msg + offset);
-		rdata_offset = offset + owner_size + sizeof(struct dns_rr);
-
-		if (rdlength > msg_size - rdata_offset) {
-			return -EMSGSIZE;
-		}
-
-		if (type == query_type && class_ == DNS_CLASS_IN && ttl >= minimum_ttl &&
-		    (service_type_enum ? dns_sd_service_enum_name_matches(scratch->data, record)
-				       : dns_sd_name_matches(scratch->data, record,
+		if (answer.type == query_type && answer.class_ == DNS_CLASS_IN &&
+		    answer.ttl >= minimum_ttl &&
+		    (service_type_enum ? dns_sd_service_enum_name_matches(answer.owner, record)
+				       : dns_sd_name_matches(answer.owner, record,
 							     query_type != DNS_RR_TYPE_PTR))) {
-			ret = dns_sd_rdata_known(record, type, msg, msg_size, rdata_offset,
-						 rdlength, service_type_enum, scratch);
+			ret = dns_sd_rdata_known(record, answer.type, msg, msg_size,
+						 answer.rdata - msg, answer.rdlength,
+						 service_type_enum, scratch);
 			if (ret != 0) {
 				return ret;
 			}
 		}
-
-		offset = rdata_offset + rdlength;
 	}
 
 	return 0;
@@ -1230,7 +1345,8 @@ static int dns_read(int sock,
 				family == NET_AF_INET ? "IPv4" : "IPv6", "query",
 				hostname, ".local");
 			send_response(sock, family, src_addr, addrlen, result, qtype, qclass,
-				      recv_if, dns_id);
+				      recv_if, dns_id, dns_msg.msg, dns_msg.msg_size, answer_offset,
+				      answer_count);
 		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD) &&
 			   (qtype == DNS_RR_TYPE_PTR || qtype == DNS_RR_TYPE_SRV ||
 			    qtype == DNS_RR_TYPE_TXT || qtype == DNS_RR_TYPE_ANY)) {
