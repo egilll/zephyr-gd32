@@ -1314,6 +1314,47 @@ static int dns_sd_service_available(const struct dns_sd_rec *inst, const struct 
 	return port_in_use(proto, net_ntohs(*(inst->port)), addr4, addr6) ? 0 : -EHOSTDOWN;
 }
 
+int dns_sd_handle_goodbye(const struct dns_sd_rec *inst, uint8_t *buf, uint16_t buf_size)
+{
+	struct dns_header *header = (struct dns_header *)buf;
+	struct dns_sd_buf output = {
+		.data = buf,
+		.size = buf_size,
+		.offset = sizeof(*header),
+	};
+	int ret;
+
+	if (buf == NULL || buf_size < sizeof(*header) || !rec_is_valid(inst)) {
+		return -EINVAL;
+	}
+
+	if (*(inst->port) == 0U) {
+		return -EHOSTDOWN;
+	}
+
+	memset(header, 0, sizeof(*header));
+
+	ret = dns_sd_buf_add_ptr(&output, inst, 0U);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_srv(&output, inst, 0U, false);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = dns_sd_buf_add_txt(&output, inst, 0U, false);
+	if (ret < 0) {
+		return ret;
+	}
+
+	header->flags = net_htons(BIT(15) | BIT(10));
+	header->ancount = net_htons(3U);
+
+	return output.offset;
+}
+
 int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 			const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
 			const struct dns_sd_query *query, uint8_t *buf, uint16_t buf_size)

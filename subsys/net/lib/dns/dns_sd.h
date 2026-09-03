@@ -183,6 +183,22 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 			const struct dns_sd_query *query, uint8_t *buf, uint16_t buf_size);
 
 /**
+ * @brief Encode a DNS-SD service goodbye announcement
+ *
+ * Builds TTL-zero PTR, SRV, and TXT records in the Answer section. Host
+ * address records are omitted because withdrawing a service does not make its
+ * host name or addresses invalid.
+ *
+ * @param inst the DNS-SD record to withdraw
+ * @param buf output buffer
+ * @param buf_size size of the output buffer
+ *
+ * @return on success, number of bytes written to @p buf
+ * @return on failure, a negative errno value
+ */
+int dns_sd_handle_goodbye(const struct dns_sd_rec *inst, uint8_t *buf, uint16_t buf_size);
+
+/**
  * @brief Handle a Service Type Enumeration with DNS Service Discovery
  *
  * This function should be called once for each type of advertised service.
