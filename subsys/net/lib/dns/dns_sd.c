@@ -337,7 +337,7 @@ int add_a_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		/* pointer to .<Instance>.local. */
 		2 + sizeof(*rr) + sizeof(*rdata);
 
-	if (offset > buf_size || total_size >= buf_size - offset) {
+	if (offset > buf_size || total_size > buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d",
 			total_size, (int)buf_size - (int)offset);
 		return -ENOSPC;
@@ -414,7 +414,7 @@ int add_ptr_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		/* compressed e.g. .My Foo" followed by (DNS_SD_PTR_MASK | 0x0abc) */
 		+ 1 + strlen(inst->instance) + 2;
 
-	if (offset > buf_size || name_size >= buf_size - offset) {
+	if (offset > buf_size || name_size > buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d",
 			name_size, (int)buf_size - (int)offset);
 		return -ENOSPC;
@@ -505,7 +505,7 @@ int add_txt_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		/* pointer to .<Instance>.<Service>.<Protocol>.local. */
 		DNS_POINTER_SIZE + sizeof(*rr) + dns_sd_txt_size(inst);
 
-	if (offset > buf_size || total_size >= buf_size - offset) {
+	if (offset > buf_size || total_size > buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d",
 			total_size, (int)buf_size - (int)offset);
 		return -ENOSPC;
@@ -554,7 +554,7 @@ int add_aaaa_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		/* pointer to .<Instance>.local. */
 		DNS_POINTER_SIZE + sizeof(*rr) + sizeof(*rdata);
 
-	if (offset > buf_size || total_size >= buf_size - offset) {
+	if (offset > buf_size || total_size > buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d",
 			total_size, (int)buf_size - (int)offset);
 		return -ENOSPC;
@@ -734,7 +734,7 @@ int add_srv_record(const struct dns_sd_rec *inst, uint32_t ttl,
 		/* pointer to .local. */
 		+ DNS_POINTER_SIZE;
 
-	if (offset > buf_size || total_size >= buf_size - offset) {
+	if (offset > buf_size || total_size > buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d",
 			total_size, (int)buf_size - (int)offset);
 		return -ENOSPC;
@@ -1490,7 +1490,7 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst, const struct 
 		+ DNS_LABEL_LEN_SIZE + service_size + DNS_LABEL_LEN_SIZE + DNS_SD_PROTO_SIZE +
 		DNS_POINTER_SIZE;
 
-	if (offset > buf_size || name_size >= buf_size - offset) {
+	if (offset > buf_size || name_size > buf_size - offset) {
 		NET_DBG("Buffer too small. required: %u available: %d", name_size,
 			(int)buf_size - (int)offset);
 		return -ENOSPC;
