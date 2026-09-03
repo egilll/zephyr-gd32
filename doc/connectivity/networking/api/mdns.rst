@@ -52,8 +52,10 @@ static TCP or UDP services with :c:macro:`DNS_SD_REGISTER_TCP_SERVICE` or
 The responder supports service browsing with ``PTR`` questions, direct
 service-instance ``SRV``, ``TXT``, and ``ANY`` questions, and service-type
 enumeration. Browse replies include the applicable ``SRV``, ``TXT``, ``A``,
-and ``AAAA`` additional records. Known answers in multicast questions suppress
-matching host, browse, and service-instance answers.
+and ``AAAA`` additional records. When the target has addresses from only one
+IP family, browse and direct ``SRV`` replies include a restricted ``NSEC``
+additional record for the absent family. Known answers in multicast questions
+suppress matching host, browse, and service-instance answers.
 
 Applications can replace the externally supplied service-record array with
 :c:func:`mdns_responder_set_ext_records`. The responder stores the supplied
