@@ -508,6 +508,8 @@ static void cleanup(void *d)
 		}
 	}
 
+	(void)mdns_responder_set_ext_records(records, EXT_RECORDS_NUM);
+
 	mh_reset_capture();
 }
 
@@ -691,6 +693,42 @@ ZTEST(test_mdns_responder, test_external_records)
 				     sizeof(payload_foo_tcp_local));
 	check_service_type_enum_resp(response_pkts[6], payload_custom_tcp_local,
 				     sizeof(payload_custom_tcp_local));
+}
+
+ZTEST(test_mdns_responder, test_external_records_clear)
+{
+	struct dns_sd_rec *record;
+
+	record = alloc_ext_record("test_rec", "_custom", "_tcp", "local", NULL, 0, 5353);
+	zassert_not_null(record, "Failed to allocate the external record");
+
+	zassert_equal(mdns_responder_set_ext_records(NULL, 1U), -EINVAL,
+		      "Accepted a NULL pointer with a nonzero count");
+	zassert_equal(mdns_responder_set_ext_records(record, 0U), -EINVAL,
+		      "Accepted a non-NULL pointer with a zero count");
+	zassert_ok(mdns_responder_set_ext_records(record, 1U),
+		   "Failed to install the external record");
+
+	send_msg(dns_sd_service_enumeration_query, sizeof(dns_sd_service_enumeration_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No static service response");
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No external service response");
+	check_service_type_enum_resp(response_pkts[0], payload_foo_udp_local,
+				     sizeof(payload_foo_udp_local));
+	check_service_type_enum_resp(response_pkts[1], payload_custom_tcp_local,
+				     sizeof(payload_custom_tcp_local));
+
+	zassert_ok(mdns_responder_set_ext_records(NULL, 0U),
+		   "Failed to clear the external records");
+	send_msg(dns_sd_service_enumeration_query, sizeof(dns_sd_service_enumeration_query));
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No static service response");
+	check_service_type_enum_resp(response_pkts[2], payload_foo_udp_local,
+				     sizeof(payload_foo_udp_local));
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "A cleared external service was still advertised");
+	zassert_equal(responses_count, 3U, "Unexpected service response count after clearing");
+
+	zassert_ok(mdns_responder_set_ext_records(records, EXT_RECORDS_NUM),
+		   "Failed to restore the external record array");
 }
 
 static void skip_labels(struct net_pkt *pkt)
