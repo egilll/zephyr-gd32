@@ -476,8 +476,8 @@ static void check_complete_dns_sd_announce(struct net_pkt *pkt)
 	zassert_true(found_address, "Announcement is missing its address record");
 }
 
-static bool packet_has_aaaa_answer(struct net_pkt *pkt, const struct net_in6_addr *addr,
-				   uint32_t ttl)
+static bool packet_has_address_answer(struct net_pkt *pkt, uint16_t expected_type,
+				      const void *expected_addr, size_t addr_len, uint32_t ttl)
 {
 	struct dns_header header;
 	uint16_t answer_count;
@@ -506,13 +506,14 @@ static bool packet_has_aaaa_answer(struct net_pkt *pkt, const struct net_in6_add
 			return false;
 		}
 
-		if (type == DNS_RR_TYPE_AAAA && class_ == (DNS_CLASS_IN | DNS_CLASS_FLUSH) &&
-		    rdlength == sizeof(answer_addr)) {
-			if (net_pkt_read(pkt, &answer_addr, sizeof(answer_addr)) != 0) {
+		if (type == expected_type && class_ == (DNS_CLASS_IN | DNS_CLASS_FLUSH) &&
+		    rdlength == addr_len) {
+			if (net_pkt_read(pkt, &answer_addr, addr_len) != 0) {
 				return false;
 			}
 
-			if (answer_ttl == ttl && net_ipv6_addr_cmp(&answer_addr, addr)) {
+			if (answer_ttl == ttl &&
+			    memcmp(&answer_addr, expected_addr, addr_len) == 0) {
 				return true;
 			}
 		} else if (net_pkt_skip(pkt, rdlength) != 0) {
@@ -521,6 +522,17 @@ static bool packet_has_aaaa_answer(struct net_pkt *pkt, const struct net_in6_add
 	}
 
 	return false;
+}
+
+static bool packet_has_aaaa_answer(struct net_pkt *pkt, const struct net_in6_addr *addr,
+				   uint32_t ttl)
+{
+	return packet_has_address_answer(pkt, DNS_RR_TYPE_AAAA, addr, sizeof(*addr), ttl);
+}
+
+static bool packet_has_a_answer(struct net_pkt *pkt, const struct net_in_addr *addr, uint32_t ttl)
+{
+	return packet_has_address_answer(pkt, DNS_RR_TYPE_A, addr, sizeof(*addr), ttl);
 }
 
 static void clear_responses(void)
@@ -560,6 +572,28 @@ static bool wait_for_aaaa_answers(const struct net_in6_addr *addr, uint32_t ttl,
 	return false;
 }
 
+static bool wait_for_a_answers(const struct net_in_addr *addr, uint32_t ttl, size_t expected_count)
+{
+	size_t answer_count = 0U;
+	size_t checked_count = 0U;
+
+	for (int poll = 0; poll < PROBE_MAX_POLLS; ++poll) {
+		for (size_t i = checked_count; i < responses_count; ++i) {
+			if (packet_has_a_answer(response_pkts[i], addr, ttl)) {
+				answer_count++;
+			}
+		}
+		if (answer_count >= expected_count) {
+			return true;
+		}
+
+		checked_count = responses_count;
+		(void)k_sem_take(&wait_data, RESPONSE_TIMEOUT);
+	}
+
+	return false;
+}
+
 ZTEST(test_mdns_responder_probe, test_address_change_announce_and_goodbye)
 {
 	static const struct net_in6_addr changed_addr = {
@@ -583,11 +617,38 @@ ZTEST(test_mdns_responder_probe, test_address_change_announce_and_goodbye)
 	zassert_true(wait_for_aaaa_answers(&changed_addr, 0U, 1U),
 		     "Removed address was not sent with TTL zero");
 
+	/* sender_iface() wakes this thread before zsock_sendto() returns. */
+	k_sleep(RESPONSE_TIMEOUT);
 	clear_responses();
 	net_mgmt_event_notify_with_info(NET_EVENT_IPV6_ADDR_DEL, iface1, &changed_addr,
 					sizeof(changed_addr));
-	zassert_equal(k_sem_take(&wait_data, RESPONSE_TIMEOUT), -EAGAIN,
-		      "Retired address was announced again");
+	k_sleep(RESPONSE_TIMEOUT);
+	for (size_t i = 0; i < responses_count; ++i) {
+		zassert_false(packet_has_aaaa_answer(response_pkts[i], &changed_addr, 0U),
+			      "Retired address was announced again");
+	}
+}
+
+ZTEST(test_mdns_responder_probe, test_address_goodbye_uses_both_transports)
+{
+	static const struct net_in_addr changed_addr = {{{192, 0, 2, 44}}};
+	struct net_if_addr *ifaddr;
+
+	zassert_true(wait_for_responder(), "Responder did not finish startup");
+	k_sleep(RESPONSE_TIMEOUT);
+	clear_responses();
+
+	ifaddr = net_if_ipv4_addr_add(iface1, &changed_addr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "Failed to add changed IPv4 address");
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+	zassert_true(wait_for_a_answers(&changed_addr, CONFIG_MDNS_RESPONDER_TTL, 2U),
+		     "IPv4 address was not announced over IPv6 twice");
+
+	clear_responses();
+	zassert_true(net_if_ipv4_addr_rm(iface1, &changed_addr),
+		     "Failed to remove changed IPv4 address");
+	zassert_true(wait_for_a_answers(&changed_addr, 0U, 1U),
+		     "IPv4 goodbye was not sent over the IPv6 transport");
 }
 
 ZTEST(test_mdns_responder_probe, test_tentative_ipv6_waits_for_dad)
