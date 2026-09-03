@@ -29,6 +29,7 @@
 
 struct dns_sd_query {
 	enum dns_rr_type type;
+	enum dns_class class_;
 	uint16_t id;
 	bool legacy;
 	bool browse;

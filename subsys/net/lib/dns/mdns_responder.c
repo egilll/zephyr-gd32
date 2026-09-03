@@ -756,8 +756,8 @@ static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type ex
 }
 
 static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
-				 enum dns_rr_type qtype, bool legacy, uint16_t dns_id,
-				 const uint8_t *query_msg, uint16_t query_size,
+				 enum dns_rr_type qtype, enum dns_class qclass, bool legacy,
+				 uint16_t dns_id, const uint8_t *query_msg, uint16_t query_size,
 				 uint16_t answer_offset, uint16_t answer_count)
 {
 	const char *hostname = net_hostname_get();
@@ -785,7 +785,7 @@ static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
 
 	if (legacy) {
 		net_buf_add_be16(query, qtype);
-		net_buf_add_be16(query, DNS_CLASS_IN);
+		net_buf_add_be16(query, qclass & ~DNS_CLASS_FLUSH);
 	}
 
 	if (negative) {
@@ -961,7 +961,7 @@ static void add_address_nsec(struct answer_ctx *ctx, enum dns_rr_type existing_t
 }
 
 static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dns_rr_type qtype,
-			 struct net_if *iface, bool legacy, uint16_t dns_id,
+			 enum dns_class qclass, struct net_if *iface, bool legacy, uint16_t dns_id,
 			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
 			 uint16_t answer_count)
 {
@@ -992,7 +992,7 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 		 * bit a querier may have set in it has no meaning coming back.
 		 */
 		net_buf_add_be16(query, qtype);
-		net_buf_add_be16(query, DNS_CLASS_IN);
+		net_buf_add_be16(query, qclass & ~DNS_CLASS_FLUSH);
 	}
 
 	if ((qtype == DNS_RR_TYPE_A) && IS_ENABLED(CONFIG_NET_IPV4)) {
@@ -1089,8 +1089,8 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
 	}
 
-	ret = create_answer(query, scratch, qtype, iface, legacy, dns_id, query_msg, query_size,
-			    answer_offset, answer_count);
+	ret = create_answer(query, scratch, qtype, qclass, iface, legacy, dns_id, query_msg,
+			    query_size, answer_offset, answer_count);
 	if (scratch != NULL) {
 		net_buf_unref(scratch);
 	}
@@ -1170,8 +1170,8 @@ static int send_reverse_response(int sock, net_sa_family_t family, struct net_so
 		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
 	}
 
-	ret = create_reverse_answer(query, scratch, qtype, legacy, dns_id, query_msg, query_size,
-				    answer_offset, answer_count);
+	ret = create_reverse_answer(query, scratch, qtype, qclass, legacy, dns_id, query_msg,
+				    query_size, answer_offset, answer_count);
 	if (scratch != NULL) {
 		net_buf_unref(scratch);
 	}
@@ -1451,6 +1451,7 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 	size_t ext_rec_count = external_records_count;
 	struct dns_sd_query query = {
 		.type = qtype,
+		.class_ = qclass & ~DNS_CLASS_FLUSH,
 		.id = dns_id,
 		.legacy = is_legacy_query(src_addr),
 	};
