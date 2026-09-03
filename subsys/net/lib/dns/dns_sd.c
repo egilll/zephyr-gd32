@@ -904,9 +904,9 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		return -EHOSTDOWN;
 	}
 
-	if (strncmp("_tcp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
+	if (strncasecmp("_tcp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
 		proto = NET_IPPROTO_TCP;
-	} else if (strncmp("_udp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
+	} else if (strncasecmp("_udp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
 		proto = NET_IPPROTO_UDP;
 	} else {
 		NET_DBG("invalid protocol %s", inst->proto);
@@ -1466,9 +1466,9 @@ int dns_sd_handle_service_type_enum(const struct dns_sd_rec *inst, const struct 
 		return -EHOSTDOWN;
 	}
 
-	if (strncmp("_tcp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
+	if (strncasecmp("_tcp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
 		proto = NET_IPPROTO_TCP;
-	} else if (strncmp("_udp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
+	} else if (strncasecmp("_udp", inst->proto, DNS_SD_PROTO_SIZE) == 0) {
 		proto = NET_IPPROTO_UDP;
 	} else {
 		NET_DBG("invalid protocol %s", inst->proto);
