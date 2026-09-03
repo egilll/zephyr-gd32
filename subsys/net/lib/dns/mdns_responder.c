@@ -567,6 +567,183 @@ static bool mdns_host_name_matches(const char *name)
 	       strcasecmp(name + hostname_len, ".local") == 0;
 }
 
+static int mdns_reverse_name_addr(const char *name, struct net_addr *addr)
+{
+	static const char ipv4_suffix[] = ".in-addr.arpa";
+	static const char ipv6_suffix[] = ".ip6.arpa";
+	size_t name_len = strlen(name);
+	const char *end;
+	const char *p;
+
+	memset(addr, 0, sizeof(*addr));
+
+	if (name_len > sizeof(ipv4_suffix) - 1U &&
+	    strcasecmp(name + name_len - (sizeof(ipv4_suffix) - 1U), ipv4_suffix) == 0) {
+		end = name + name_len - (sizeof(ipv4_suffix) - 1U);
+		p = name;
+
+		for (size_t i = 0U; i < sizeof(addr->in_addr.s4_addr); ++i) {
+			unsigned int value = 0U;
+			size_t digits = 0U;
+
+			while (p < end && *p != '.') {
+				if (*p < '0' || *p > '9' || ++digits > 3U) {
+					return -EINVAL;
+				}
+
+				value = value * 10U + (*p++ - '0');
+			}
+
+			if (digits == 0U || value > UINT8_MAX ||
+			    (i + 1U < sizeof(addr->in_addr.s4_addr) ? p >= end : p != end)) {
+				return -EINVAL;
+			}
+
+			addr->in_addr.s4_addr[sizeof(addr->in_addr.s4_addr) - 1U - i] = value;
+			if (p < end) {
+				p++;
+			}
+		}
+
+		addr->family = NET_AF_INET;
+		return 0;
+	}
+
+	if (name_len > sizeof(ipv6_suffix) - 1U &&
+	    strcasecmp(name + name_len - (sizeof(ipv6_suffix) - 1U), ipv6_suffix) == 0) {
+		end = name + name_len - (sizeof(ipv6_suffix) - 1U);
+		p = name;
+
+		for (size_t i = 0U; i < 2U * sizeof(addr->in6_addr.s6_addr); ++i) {
+			uint8_t value;
+			size_t nibble = 2U * sizeof(addr->in6_addr.s6_addr) - 1U - i;
+
+			if (p >= end || p + 1U > end || (p + 1U < end && p[1] != '.')) {
+				return -EINVAL;
+			}
+
+			if (*p >= '0' && *p <= '9') {
+				value = *p - '0';
+			} else if (*p >= 'a' && *p <= 'f') {
+				value = *p - 'a' + 10U;
+			} else if (*p >= 'A' && *p <= 'F') {
+				value = *p - 'A' + 10U;
+			} else {
+				return -EINVAL;
+			}
+
+			addr->in6_addr.s6_addr[nibble / 2U] |= value
+							       << (nibble % 2U == 0U ? 4U : 0U);
+			p += p + 1U < end ? 2U : 1U;
+		}
+
+		if (p != end) {
+			return -EINVAL;
+		}
+
+		addr->family = NET_AF_INET6;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int mdns_reverse_answer_known(const char *query_name, const uint8_t *msg, uint16_t msg_size,
+				     uint16_t answer_offset, uint16_t answer_count,
+				     struct net_buf *scratch)
+{
+	uint16_t offset = answer_offset;
+
+	if (scratch == NULL || dns_header_tc(msg)) {
+		return 0;
+	}
+
+	for (uint16_t i = 0U; i < answer_count; ++i) {
+		struct mdns_answer answer;
+		const uint8_t *rdata_end;
+		int ret;
+
+		ret = mdns_unpack_answer(msg, msg_size, &offset, scratch, &answer);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (answer.type != DNS_RR_TYPE_PTR || answer.class_ != DNS_CLASS_IN ||
+		    answer.ttl < MDNS_TTL / 2U || strcasecmp(answer.owner, query_name) != 0) {
+			continue;
+		}
+
+		scratch->len = 0U;
+		ret = dns_unpack_name(msg, msg_size, answer.rdata, scratch, &rdata_end);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (rdata_end == answer.rdata + answer.rdlength &&
+		    mdns_host_name_matches(scratch->data)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
+				 enum dns_rr_type qtype, bool legacy, uint16_t dns_id,
+				 const uint8_t *query_msg, uint16_t query_size,
+				 uint16_t answer_offset, uint16_t answer_count)
+{
+	const char *hostname = net_hostname_get();
+	size_t hostname_len = strlen(hostname);
+	int ret;
+
+	if (qtype != DNS_RR_TYPE_PTR && qtype != DNS_RR_TYPE_ANY) {
+		return -EINVAL;
+	}
+
+	if (!legacy && answer_count > 0U) {
+		ret = mdns_reverse_answer_known(query->data, query_msg, query_size, answer_offset,
+						answer_count, scratch);
+		if (ret != 0) {
+			return ret > 0 ? -EALREADY : ret;
+		}
+	}
+
+	ret = init_name_labels(query);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (hostname_len > DNS_LABEL_MAX_SIZE ||
+	    net_buf_tailroom(query) <
+		    (legacy ? DNS_QTYPE_LEN + DNS_QCLASS_LEN + DNS_POINTER_SIZE : 0U) +
+			    DNS_QTYPE_LEN + DNS_QCLASS_LEN + DNS_TTL_LEN + DNS_RDLENGTH_LEN +
+			    hostname_len + sizeof(".local") + 1U) {
+		return -ENOBUFS;
+	}
+
+	if (legacy) {
+		net_buf_add_be16(query, qtype);
+		net_buf_add_be16(query, DNS_CLASS_IN);
+		net_buf_add_u8(query, NS_CMPRSFLGS);
+		net_buf_add_u8(query, DNS_MSG_HEADER_SIZE);
+	}
+
+	net_buf_add_be16(query, DNS_RR_TYPE_PTR);
+	net_buf_add_be16(query, legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH);
+	net_buf_add_be32(query, legacy ? MDNS_LEGACY_TTL : MDNS_TTL);
+	net_buf_add_be16(query, hostname_len + sizeof(".local") + 1U);
+	net_buf_add_u8(query, hostname_len);
+	net_buf_add_mem(query, hostname, hostname_len);
+	net_buf_add_u8(query, sizeof("local") - 1U);
+	net_buf_add_mem(query, "local", sizeof("local") - 1U);
+	net_buf_add_u8(query, 0U);
+
+	setup_dns_hdr(query->data, 1U, legacy ? dns_id : 0U, legacy ? 1U : 0U);
+
+	return 0;
+}
+
 static int mdns_addr_known(struct answer_ctx *ctx, enum dns_rr_type type, const uint8_t *addr,
 			   uint16_t addr_len)
 {
@@ -767,6 +944,7 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 	net_socklen_t dst_len;
 	bool legacy;
 	int ret;
+
 	COND_CODE_1(IS_ENABLED(CONFIG_NET_IPV6),
 		    (struct net_sockaddr_in6), (struct net_sockaddr_in)) dst;
 
@@ -814,6 +992,86 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 
 	ret = zsock_sendto(sock, query->data, query->len, 0,
 			   (struct net_sockaddr *)&dst, dst_len);
+	if (ret < 0) {
+		ret = -errno;
+		NET_DBG("Cannot send %s reply (%d)", "mDNS", ret);
+	} else {
+		net_stats_update_dns_sent(iface);
+	}
+
+	return ret;
+}
+
+static int send_reverse_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
+				 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
+				 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id,
+				 const uint8_t *query_msg, uint16_t query_size,
+				 uint16_t answer_offset, uint16_t answer_count,
+				 const struct net_addr *addr)
+{
+	struct net_if_addr *ifaddr;
+	struct net_if *iface;
+	struct net_buf *scratch = NULL;
+	net_socklen_t dst_len;
+	bool legacy;
+	int ret;
+#if defined(CONFIG_NET_IPV6)
+	struct net_sockaddr_in6 dst;
+#else
+	struct net_sockaddr_in dst;
+#endif
+
+	if (recv_if != NULL) {
+		iface = recv_if;
+	} else if (family == NET_AF_INET6) {
+		iface = net_if_ipv6_select_src_iface(&net_sin6(src_addr)->sin6_addr);
+	} else {
+		iface = net_if_ipv4_select_src_iface(&net_sin(src_addr)->sin_addr);
+	}
+
+	if (iface == NULL) {
+		return -ENOENT;
+	}
+
+	if (addr->family == NET_AF_INET && IS_ENABLED(CONFIG_NET_IPV4)) {
+		ifaddr = net_if_ipv4_addr_lookup_by_iface(iface, &addr->in_addr);
+	} else if (addr->family == NET_AF_INET6 && IS_ENABLED(CONFIG_NET_IPV6)) {
+		ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, &addr->in6_addr);
+	} else {
+		return -ENOENT;
+	}
+
+	if (ifaddr == NULL || (ifaddr->addr_state != NET_ADDR_PREFERRED &&
+			       ifaddr->addr_state != NET_ADDR_DEPRECATED)) {
+		return -ENOENT;
+	}
+
+	legacy = is_legacy_query(src_addr);
+	ret = setup_dst_addr(sock, family, src_addr, addrlen,
+			     legacy || (qclass & DNS_CLASS_FLUSH) != 0, (struct net_sockaddr *)&dst,
+			     &dst_len);
+	if (ret < 0) {
+		NET_DBG("unable to set up the response address");
+		return ret;
+	}
+
+	if (!legacy && answer_count > 0U) {
+		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
+	}
+
+	ret = create_reverse_answer(query, scratch, qtype, legacy, dns_id, query_msg, query_size,
+				    answer_offset, answer_count);
+	if (scratch != NULL) {
+		net_buf_unref(scratch);
+	}
+	if (ret == -EALREADY) {
+		return 0;
+	}
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = zsock_sendto(sock, query->data, query->len, 0, (struct net_sockaddr *)&dst, dst_len);
 	if (ret < 0) {
 		ret = -errno;
 		NET_DBG("Cannot send %s reply (%d)", "mDNS", ret);
@@ -1309,6 +1567,7 @@ static int dns_read(int sock,
 	do {
 		enum dns_rr_type qtype;
 		enum dns_class qclass;
+		struct net_addr reverse_addr;
 		uint8_t *lquery;
 
 		(void)memset(result->data, 0, net_buf_tailroom(result));
@@ -1319,12 +1578,6 @@ static int dns_read(int sock,
 			goto quit;
 		}
 
-		/* Handle only .local queries */
-		lquery = strrchr(result->data, '.');
-		if (!lquery || strcasecmp(lquery, ".local") != 0) {
-			continue;
-		}
-
 		if ((qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_IN &&
 		    (qclass & ~DNS_CLASS_FLUSH) != DNS_CLASS_ANY) {
 			continue;
@@ -1333,6 +1586,22 @@ static int dns_read(int sock,
 		NET_DBG("[%d] query %s/%s label %s (%d bytes)", queries,
 			dns_qtype_to_str(qtype), "IN",
 			result->data, ret);
+
+		if (mdns_reverse_name_addr(result->data, &reverse_addr) == 0) {
+			if (qtype == DNS_RR_TYPE_PTR || qtype == DNS_RR_TYPE_ANY) {
+				send_reverse_response(sock, family, src_addr, addrlen, result,
+						      qtype, qclass, recv_if, dns_id, dns_msg.msg,
+						      dns_msg.msg_size, answer_offset, answer_count,
+						      &reverse_addr);
+			}
+			continue;
+		}
+
+		/* Handle only .local queries */
+		lquery = strrchr(result->data, '.');
+		if (!lquery || strcasecmp(lquery, ".local") != 0) {
+			continue;
+		}
 
 		/* If the query matches to our hostname, then send reply.
 		 * We skip the first dot, and make sure there is dot after
