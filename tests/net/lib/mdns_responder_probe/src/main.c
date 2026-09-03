@@ -488,6 +488,65 @@ static void check_complete_dns_sd_announce(struct net_pkt *pkt)
 	zassert_true(found_address, "Announcement is missing its address record");
 }
 
+static void check_complete_dns_sd_goodbye(struct net_pkt *pkt)
+{
+	struct dns_header header;
+	bool found_ptr = false;
+	bool found_srv = false;
+	bool found_txt = false;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "Missing IP/UDP header");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "Missing DNS header");
+	zassert_equal(net_ntohs(header.id), 0U, "Goodbye has a transaction ID");
+	zassert_equal(net_ntohs(header.flags), BIT(15) | BIT(10), "Unexpected goodbye flags");
+	zassert_equal(net_ntohs(header.qdcount), 0U, "Goodbye contains a question");
+	zassert_equal(net_ntohs(header.ancount), 3U, "Unexpected goodbye answer count");
+	zassert_equal(net_ntohs(header.nscount), 0U, "Goodbye contains authority records");
+	zassert_equal(net_ntohs(header.arcount), 0U, "Goodbye contains additional records");
+
+	for (uint16_t i = 0U; i < 3U; ++i) {
+		uint32_t ttl;
+		uint16_t class_;
+		uint16_t expected_class;
+		uint16_t rdlength;
+		uint16_t type;
+
+		zassert_true(skip_dns_name(pkt), "Invalid goodbye owner name");
+		zassert_ok(net_pkt_read_be16(pkt, &type), "Missing goodbye type");
+		zassert_ok(net_pkt_read_be16(pkt, &class_), "Missing goodbye class");
+		zassert_ok(net_pkt_read_be32(pkt, &ttl), "Missing goodbye TTL");
+		zassert_ok(net_pkt_read_be16(pkt, &rdlength), "Missing goodbye RDATA length");
+
+		switch (type) {
+		case DNS_RR_TYPE_PTR:
+			expected_class = DNS_CLASS_IN;
+			found_ptr = true;
+			break;
+		case DNS_RR_TYPE_SRV:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			found_srv = true;
+			break;
+		case DNS_RR_TYPE_TXT:
+			expected_class = DNS_CLASS_IN | DNS_CLASS_FLUSH;
+			found_txt = true;
+			break;
+		default:
+			zassert_unreachable("Unexpected goodbye record type");
+			return;
+		}
+
+		zassert_equal(class_, expected_class, "Unexpected goodbye class for type %u", type);
+		zassert_equal(ttl, 0U, "Nonzero goodbye TTL for type %u", type);
+		zassert_ok(net_pkt_skip(pkt, rdlength), "Truncated goodbye RDATA");
+	}
+
+	zassert_true(found_ptr, "Goodbye is missing its PTR record");
+	zassert_true(found_srv, "Goodbye is missing its SRV record");
+	zassert_true(found_txt, "Goodbye is missing its TXT record");
+}
+
 static bool packet_has_address_answer(struct net_pkt *pkt, uint16_t expected_type,
 				      const void *expected_addr, size_t addr_len, uint32_t ttl)
 {
@@ -762,6 +821,18 @@ ZTEST(test_mdns_responder_probe, test_announce_includes_dns_sd_records)
 
 	zassert_equal(dns_sd_announce_count, 2U, "Expected two DNS-SD announcements, received %zu",
 		      dns_sd_announce_count);
+
+	clear_responses();
+	zassert_ok(mdns_responder_set_ext_records(NULL, 0U), "Failed to clear external records");
+
+	for (size_t i = 0U; i < responses_count; ++i) {
+		if (packet_has_ptr_answer(response_pkts[i], service, proto, domain)) {
+			check_complete_dns_sd_goodbye(response_pkts[i]);
+			return;
+		}
+	}
+
+	zassert_unreachable("Clearing the service did not send a goodbye");
 }
 
 /* Regression test for the "DHCP-bound announce races ahead of the RFC 6762
