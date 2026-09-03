@@ -1230,7 +1230,7 @@ static void leave_mcast_all(struct net_if *iface)
 			continue;
 		}
 
-		net_ipv6_mld_leave(iface, &ipv6->mcast[i].address.in6_addr);
+		net_ipv6_mld_send_leave(iface, &ipv6->mcast[i]);
 	}
 }
 
@@ -1681,10 +1681,11 @@ static void rejoin_ipv6_mcast_groups(struct net_if *iface)
 	struct net_if_ipv6 *ipv6;
 	sys_slist_t rejoin_needed;
 
+	sys_slist_init(&rejoin_needed);
+
 	net_if_lock(iface);
 
-	if (!net_if_flag_is_set(iface, NET_IF_IPV6) ||
-	    net_if_flag_is_set(iface, NET_IF_IPV6_NO_ND)) {
+	if (!net_if_flag_is_set(iface, NET_IF_IPV6)) {
 		goto out;
 	}
 
@@ -1692,16 +1693,9 @@ static void rejoin_ipv6_mcast_groups(struct net_if *iface)
 		goto out;
 	}
 
-	/* Rejoin solicited node multicasts. */
-	ARRAY_FOR_EACH(ipv6->unicast, i) {
-		if (!ipv6->unicast[i].is_used) {
-			continue;
-		}
-
-		join_mcast_nodes(iface, &ipv6->unicast[i].address.in6_addr);
+	if (net_if_flag_is_set(iface, NET_IF_IPV6_NO_MLD)) {
+		goto out;
 	}
-
-	sys_slist_init(&rejoin_needed);
 
 	/* Rejoin any mcast address present on the interface, but marked as not joined. */
 	ARRAY_FOR_EACH(ipv6->mcast, i) {
@@ -1713,16 +1707,14 @@ static void rejoin_ipv6_mcast_groups(struct net_if *iface)
 		sys_slist_prepend(&rejoin_needed, &ipv6->mcast[i].rejoin_node);
 	}
 
+out:
 	net_if_unlock(iface);
 
-	/* Start DAD for all the addresses without holding the iface lock
-	 * to avoid any possible mutex deadlock issues.
-	 */
 	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&rejoin_needed,
 					  ifaddr, next, rejoin_node) {
 		int ret;
 
-		ret = net_ipv6_mld_rejoin(iface, &ifaddr->address.in6_addr);
+		ret = net_ipv6_mld_rejoin(iface, ifaddr);
 		if (ret < 0) {
 			NET_ERR("Cannot join mcast address %s for %d (%d)",
 				net_sprint_ipv6_addr(&ifaddr->address.in6_addr),
@@ -1733,11 +1725,6 @@ static void rejoin_ipv6_mcast_groups(struct net_if *iface)
 				net_if_get_by_iface(iface));
 		}
 	}
-
-	return;
-
-out:
-	net_if_unlock(iface);
 }
 
 /* To be called when interface comes operational down so that multicast
@@ -5191,7 +5178,7 @@ static void leave_ipv4_mcast_all(struct net_if *iface)
 			continue;
 		}
 
-		net_ipv4_igmp_leave(iface, &ipv4->mcast[i].address.in_addr);
+		net_ipv4_igmp_send_leave(iface, &ipv4->mcast[i]);
 	}
 }
 
@@ -5242,7 +5229,7 @@ static void rejoin_ipv4_mcast_groups(struct net_if *iface)
 	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&rejoin_needed, ifaddr, next, rejoin_node) {
 		int ret;
 
-		ret = net_ipv4_igmp_rejoin(iface, &ifaddr->address.in_addr);
+		ret = net_ipv4_igmp_rejoin(iface, ifaddr);
 		if (ret < 0) {
 			NET_ERR("Cannot join mcast address %s for %d (%d)",
 				net_sprint_ipv4_addr(&ifaddr->address.in_addr),

@@ -7,3 +7,27 @@ tests:
   net.mdns:
     min_ram: 21
     timeout: 600
+  net.mdns.iface_allowlist:
+    min_ram: 21
+    timeout: 600
+    extra_configs:
+      - CONFIG_MDNS_RESPONDER_IFACE_POLICY_ALLOWLIST=y
+      - CONFIG_MDNS_RESPONDER_IFACE_LIST="dummy0"
+  net.mdns.iface_denylist:
+    min_ram: 21
+    timeout: 600
+    extra_configs:
+      - CONFIG_MDNS_RESPONDER_IFACE_POLICY_DENYLIST=y
+      - CONFIG_MDNS_RESPONDER_IFACE_LIST="dummy1"
+  net.mdns.runtime_iface:
+    min_ram: 21
+    timeout: 600
+    extra_configs:
+      - CONFIG_MDNS_RESPONDER_RUNTIME_IFACE_CONTROL=y
+  net.mdns.runtime_iface_allowlist:
+    min_ram: 21
+    timeout: 600
+    extra_configs:
+      - CONFIG_MDNS_RESPONDER_IFACE_POLICY_ALLOWLIST=y
+      - CONFIG_MDNS_RESPONDER_IFACE_LIST="dummy0"
+      - CONFIG_MDNS_RESPONDER_RUNTIME_IFACE_CONTROL=y

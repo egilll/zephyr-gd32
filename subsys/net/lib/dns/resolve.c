@@ -377,6 +377,7 @@ static int register_dispatcher(struct dns_resolve_context *ctx,
 			       const struct net_socket_service_desc *svc,
 			       struct dns_server *server,
 			       struct net_sockaddr *local,
+			       size_t local_len,
 			       const struct net_in6_addr *addr6,
 			       const struct net_in_addr *addr4)
 {
@@ -390,11 +391,19 @@ static int register_dispatcher(struct dns_resolve_context *ctx,
 
 	if (IS_ENABLED(CONFIG_NET_IPV6) &&
 	    server->dns_server.sa_family == NET_AF_INET6) {
+		if (local_len < sizeof(struct net_sockaddr_in6)) {
+			return -EINVAL;
+		}
+
 		memcpy(&server->dispatcher.local_addr,
 		       local,
 		       sizeof(struct net_sockaddr_in6));
 	} else if (IS_ENABLED(CONFIG_NET_IPV4) &&
 		   server->dns_server.sa_family == NET_AF_INET) {
+		if (local_len < sizeof(struct net_sockaddr_in)) {
+			return -EINVAL;
+		}
+
 		memcpy(&server->dispatcher.local_addr,
 		       local,
 		       sizeof(struct net_sockaddr_in));
@@ -847,7 +856,7 @@ static int dns_resolve_init_locked(struct dns_resolve_context *ctx,
 		}
 
 		ret = register_dispatcher(ctx, svc, &ctx->servers[i], local_addr,
-					  addr6, addr4);
+					  addr_len, addr6, addr4);
 		if (ret < 0) {
 			if (ret == -EALREADY) {
 				goto skip_event;
@@ -2087,7 +2096,8 @@ try_resolve:
 	if (IS_ENABLED(CONFIG_MDNS_RESOLVER)) {
 		const char *ptr = strrchr(query, '.');
 
-		if (ptr && strcmp(ptr, ".local") == 0) {
+		/* Note that we memcmp() the \0 here too */
+		if (ptr && !memcmp(ptr, (const void *){ ".local" }, 7)) {
 			mdns_query = true;
 
 			ctx->queries[i].id = 0;

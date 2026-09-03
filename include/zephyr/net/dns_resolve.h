@@ -48,7 +48,9 @@ enum dns_query_type {
 	/** IPv6 query */
 	DNS_QUERY_TYPE_AAAA = 28,
 	/** Service location query */
-	DNS_QUERY_TYPE_SRV = 33
+	DNS_QUERY_TYPE_SRV = 33,
+	/** Request all record types query */
+	DNS_QUERY_TYPE_ANY = 255
 };
 
 /**
@@ -234,8 +236,14 @@ struct dns_socket_dispatcher {
 
 	/** Type of the socket (resolver / responder) */
 	enum dns_socket_type type;
-	/** Local endpoint address (used when binding the socket) */
-	struct net_sockaddr local_addr;
+	/** Local endpoint address storage */
+	union {
+		/** Local endpoint address (used when binding the socket) */
+		struct net_sockaddr_storage local_addr_storage;
+/** @cond INTERNAL_HIDDEN */
+		struct net_sockaddr local_addr;
+/** @endcond */
+	};
 	/** DNS socket dispatcher callback is called for incoming traffic */
 	dns_socket_dispatcher_cb cb;
 	/** Socket descriptors to poll */

@@ -242,6 +242,56 @@ config MDNS_RESPONDER_INIT_PRIO
 	  Note that if NET_CONFIG_AUTO_INIT is enabled, then this value
 	  should be bigger than its value.
 
+choice
+	prompt "mDNS responder interface policy"
+	default MDNS_RESPONDER_IFACE_POLICY_ALL
+	help
+	  Select on which network interfaces the mDNS responder operates.
+	  This allows the responder to be kept off interfaces that do not
+	  need local service discovery, or that have hardware which is not
+	  ready when the responder is initialized.
+
+config MDNS_RESPONDER_IFACE_POLICY_ALL
+	bool "All interfaces"
+	help
+	  The mDNS responder attaches to every network interface. This is
+	  the default and backward compatible behavior.
+
+config MDNS_RESPONDER_IFACE_POLICY_ALLOWLIST
+	bool "Only listed interfaces"
+	select NET_INTERFACE_NAME
+	help
+	  The mDNS responder attaches only to interfaces whose name is
+	  listed in MDNS_RESPONDER_IFACE_LIST.
+
+config MDNS_RESPONDER_IFACE_POLICY_DENYLIST
+	bool "All except listed interfaces"
+	select NET_INTERFACE_NAME
+	help
+	  The mDNS responder attaches to every interface except those whose
+	  name is listed in MDNS_RESPONDER_IFACE_LIST.
+
+endchoice
+
+config MDNS_RESPONDER_IFACE_LIST
+	string "Comma separated list of interface names"
+	depends on MDNS_RESPONDER_IFACE_POLICY_ALLOWLIST || MDNS_RESPONDER_IFACE_POLICY_DENYLIST
+	help
+	  Comma separated list of network interface names (for example
+	  "eth0,wlan0") that the interface policy applies to. Interface
+	  names are used instead of interface indexes because the indexes
+	  can change depending on configuration.
+
+config MDNS_RESPONDER_RUNTIME_IFACE_CONTROL
+	bool "Runtime control of the mDNS responder per interface"
+	help
+	  Provide mdns_responder_enable_iface() and
+	  mdns_responder_disable_iface() so that the application can enable or
+	  disable the mDNS responder on a specific network interface at
+	  runtime. The runtime setting overrides the build-time interface
+	  policy for that interface. When this option is not set, the
+	  responder follows the build-time interface policy only.
+
 config MDNS_RESPONDER_PROBE
 	bool "mDNS probing support [EXPERIMENTAL]"
 	select NET_CONNECTION_MANAGER
@@ -291,6 +341,24 @@ config MDNS_RESPONDER_DNS_SD_SERVICE_TYPE_ENUMERATION
 	  performs DNS-SD Service Type Enumeration according to RFC 6763,
 	  Chapter 9. By doing so, Zephyr network services are discoverable
 	  using e.g. 'avahi-browse -t -r _services._dns-sd._udp.local'.
+
+config MDNS_RESPONDER_ANNOUNCE_DNS_SD
+	bool "Include DNS-SD service records in mDNS announcements"
+	depends on MDNS_RESPONDER_PROBE
+	help
+	  RFC 6762 Section 8.3 requires the startup announcement to contain
+	  all of a responder's newly registered resource records, not just
+	  address records -- this covers the shared PTR record and unique
+	  SRV/TXT records for every DNS-SD service registered via
+	  DNS_SD_REGISTER_SERVICE() (and any records set through
+	  mdns_responder_set_ext_records()).
+
+	  Enable this for full RFC 6762 compliance. Leave disabled to keep
+	  announcements limited to address records only (smaller, less
+	  frequent traffic on startup) -- clients that actively query for
+	  services (e.g. avahi-browse) are unaffected either way, since
+	  normal query/response handling already answers DNS-SD queries
+	  regardless of this option.
 endif # MDNS_RESPONDER_DNS_SD
 
 module = MDNS_RESPONDER

@@ -2159,7 +2159,7 @@ int net_dhcpv4_init(void)
 	uint64_t events =
 		IS_ENABLED(CONFIG_NET_DHCPV4_RESTART_ON_IF_UP) ?
 		(NET_EVENT_IF_UP | NET_EVENT_IF_DOWN) : NET_EVENT_IF_DOWN;
-	struct net_sockaddr local_addr;
+	struct net_sockaddr local_addr = { 0 };
 	int ret;
 
 	NET_DBG("");

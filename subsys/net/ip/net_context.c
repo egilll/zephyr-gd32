@@ -1363,7 +1363,8 @@ int net_context_connect(struct net_context *context,
 			void *user_data)
 {
 	struct net_sockaddr *laddr = NULL;
-	struct net_sockaddr local_addr __unused;
+	struct net_sockaddr_storage local_addr_storage __maybe_unused = { 0 };
+	struct net_sockaddr *local_addr = net_sad(&local_addr_storage);
 	uint16_t lport, rport;
 	int ret;
 
@@ -1454,15 +1455,15 @@ int net_context_connect(struct net_context *context,
 		}
 
 		net_sin6_ptr(&context->local)->sin6_family = NET_AF_INET6;
-		net_sin6(&local_addr)->sin6_family = NET_AF_INET6;
-		net_sin6(&local_addr)->sin6_port = lport =
+		net_sin6(local_addr)->sin6_family = NET_AF_INET6;
+		net_sin6(local_addr)->sin6_port = lport =
 			net_sin6((struct net_sockaddr *)&context->local)->sin6_port;
 
 		if (net_sin6_ptr(&context->local)->sin6_addr) {
-			net_ipaddr_copy(&net_sin6(&local_addr)->sin6_addr,
+			net_ipaddr_copy(&net_sin6(local_addr)->sin6_addr,
 				     net_sin6_ptr(&context->local)->sin6_addr);
 
-			laddr = &local_addr;
+			laddr = local_addr;
 		}
 	} else if (IS_ENABLED(CONFIG_NET_IPV4) &&
 		   net_context_get_family(context) == NET_AF_INET) {
@@ -1502,15 +1503,15 @@ int net_context_connect(struct net_context *context,
 		}
 
 		net_sin_ptr(&context->local)->sin_family = NET_AF_INET;
-		net_sin(&local_addr)->sin_family = NET_AF_INET;
-		net_sin(&local_addr)->sin_port = lport =
+		net_sin(local_addr)->sin_family = NET_AF_INET;
+		net_sin(local_addr)->sin_port = lport =
 			net_sin((struct net_sockaddr *)&context->local)->sin_port;
 
 		if (net_sin_ptr(&context->local)->sin_addr) {
-			net_ipaddr_copy(&net_sin(&local_addr)->sin_addr,
+			net_ipaddr_copy(&net_sin(local_addr)->sin_addr,
 				       net_sin_ptr(&context->local)->sin_addr);
 
-			laddr = &local_addr;
+			laddr = local_addr;
 		}
 	} else {
 		ret = -EINVAL; /* Not IPv4 or IPv6 */
