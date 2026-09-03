@@ -2028,11 +2028,31 @@ ZTEST(dns_resolve, test_dns_unpack_name_with_forward_pointer)
 		int ret;
 
 		zassert_not_null(result, "Failed to allocate buffer");
+		net_buf_add_mem(result, "seed", 4U);
 		ret = dns_unpack_name(cases[i].record, cases[i].size, cases[i].record, result,
 				      NULL);
 		zassert_equal(ret, -EMSGSIZE, "Accepted non-backward compression pointer");
+		zassert_equal(result->len, 4U, "Left partial decoded text on failure");
+		zassert_mem_equal(result->data, "seed", 4U, "Changed existing output on failure");
 		net_buf_unref(result);
 	}
+}
+
+ZTEST(dns_resolve, test_dns_unpack_name_invalid_args)
+{
+	static const uint8_t root[] = {0x00};
+	struct net_buf *result = net_buf_alloc(&test_dns_qname_pool, K_NO_WAIT);
+
+	zassert_not_null(result, "Failed to allocate buffer");
+	zassert_equal(dns_unpack_name(NULL, sizeof(root), root, result, NULL), -EINVAL,
+		      "Accepted NULL message");
+	zassert_equal(dns_unpack_name(root, sizeof(root), NULL, result, NULL), -EINVAL,
+		      "Accepted NULL source");
+	zassert_equal(dns_unpack_name(root, sizeof(root), root, NULL, NULL), -EINVAL,
+		      "Accepted NULL output");
+	zassert_equal(dns_unpack_name(root, 0, root, result, NULL), -EINVAL,
+		      "Accepted empty message");
+	net_buf_unref(result);
 }
 
 ZTEST(dns_resolve, test_dns_unpack_name_overflow)
