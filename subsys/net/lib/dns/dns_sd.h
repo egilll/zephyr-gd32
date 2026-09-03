@@ -50,6 +50,11 @@ extern "C" {
 #define DNS_SD_GET(i, dst) \
 	STRUCT_SECTION_GET(dns_sd_rec, i, dst)
 
+static inline const char *dns_sd_txt_data(const struct dns_sd_rec *record)
+{
+	return record->text_size == 0U ? dns_sd_empty_txt : record->text;
+}
+
 /**
  * @brief Extract labels from a DNS-SD PTR query name
  *

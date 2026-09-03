@@ -1301,7 +1301,7 @@ static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type 
 							     !service_type_enum);
 	case DNS_RR_TYPE_TXT:
 		return rdlength == dns_sd_txt_size(record) &&
-		       memcmp(msg + rdata_offset, record->text, rdlength) == 0;
+		       memcmp(msg + rdata_offset, dns_sd_txt_data(record), rdlength) == 0;
 	case DNS_RR_TYPE_SRV:
 		if (rdlength < sizeof(struct dns_srv_rdata) + 1U) {
 			return false;

@@ -546,7 +546,7 @@ int add_txt_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	rr->rdlength = net_htons(dns_sd_txt_size(inst));
 	offset += sizeof(*rr);
 
-	memcpy(&buf[offset], inst->text, dns_sd_txt_size(inst));
+	memcpy(&buf[offset], dns_sd_txt_data(inst), dns_sd_txt_size(inst));
 	offset += dns_sd_txt_size(inst);
 
 	__ASSERT_NO_MSG(total_size == offset - buf_offset);
@@ -1158,7 +1158,7 @@ static int dns_sd_buf_add_txt(struct dns_sd_buf *buf, const struct dns_sd_rec *i
 		return ret;
 	}
 
-	return dns_sd_buf_add(buf, inst->text, dns_sd_txt_size(inst));
+	return dns_sd_buf_add(buf, dns_sd_txt_data(inst), dns_sd_txt_size(inst));
 }
 
 static int dns_sd_buf_add_srv(struct dns_sd_buf *buf, const struct dns_sd_rec *inst, uint32_t ttl,
