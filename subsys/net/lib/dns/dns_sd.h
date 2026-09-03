@@ -163,9 +163,10 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 /**
  * @brief Handle a matching DNS-SD question
  *
- * Builds PTR browse responses and direct SRV, TXT, and ANY service-instance
- * responses. Legacy queries repeat the question and use conventional DNS
- * response semantics required by RFC 6762 Section 6.7.
+ * Builds PTR browse responses, direct SRV, TXT, and ANY service-instance
+ * responses, and restricted NSEC answers for absent service-instance types.
+ * Legacy queries repeat the question and use conventional DNS response
+ * semantics required by RFC 6762 Section 6.7.
  *
  * @param iface the network interface the query was received on
  * @param inst the matching DNS-SD record

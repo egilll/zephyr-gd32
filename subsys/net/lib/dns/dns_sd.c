@@ -616,37 +616,49 @@ int add_aaaa_record(const struct dns_sd_rec *inst, uint32_t ttl,
 	return offset - buf_offset;
 }
 
-static int add_nsec_record(uint16_t host_offset, uint32_t ttl, bool legacy, uint32_t existing_types,
-			   uint8_t *buf, uint16_t buf_offset, uint16_t buf_size)
+static int add_nsec_record(uint16_t name_offset, uint32_t ttl, bool legacy, uint64_t existing_types,
+			   bool include_name, uint8_t *buf, uint16_t buf_offset, uint16_t buf_size)
 {
-	uint8_t bitmap[4] = {0};
-	uint16_t host_ptr;
+	static const enum dns_rr_type supported_types[] = {
+		DNS_RR_TYPE_A,
+		DNS_RR_TYPE_TXT,
+		DNS_RR_TYPE_AAAA,
+		DNS_RR_TYPE_SRV,
+	};
+	const uint64_t supported_mask = BIT64(DNS_RR_TYPE_A) | BIT64(DNS_RR_TYPE_TXT) |
+					BIT64(DNS_RR_TYPE_AAAA) | BIT64(DNS_RR_TYPE_SRV);
+	uint8_t bitmap[DNS_RR_TYPE_SRV / 8U + 1U] = {0};
+	uint16_t name_ptr;
 	struct dns_rr *rr;
-	size_t bitmap_size;
+	size_t bitmap_size = 0U;
 	size_t total_size;
 	uint16_t offset = buf_offset;
 
-	if ((host_offset & DNS_SD_PTR_MASK) != 0U || existing_types == 0U ||
-	    (existing_types & ~(BIT(DNS_RR_TYPE_A) | BIT(DNS_RR_TYPE_AAAA))) != 0U) {
+	if ((name_offset & DNS_SD_PTR_MASK) != 0U || existing_types == 0U ||
+	    (existing_types & ~supported_mask) != 0U) {
 		return -EINVAL;
 	}
 
-	if ((existing_types & BIT(DNS_RR_TYPE_A)) != 0U) {
-		bitmap[DNS_RR_TYPE_A / 8U] |= BIT(7U - DNS_RR_TYPE_A % 8U);
+	ARRAY_FOR_EACH(supported_types, i) {
+		enum dns_rr_type type = supported_types[i];
+
+		if ((existing_types & BIT64(type)) != 0U) {
+			bitmap[type / 8U] |= BIT(7U - type % 8U);
+			bitmap_size = type / 8U + 1U;
+		}
 	}
-	if ((existing_types & BIT(DNS_RR_TYPE_AAAA)) != 0U) {
-		bitmap[DNS_RR_TYPE_AAAA / 8U] |= BIT(7U - DNS_RR_TYPE_AAAA % 8U);
-	}
-	bitmap_size = (existing_types & BIT(DNS_RR_TYPE_AAAA)) != 0U ? sizeof(bitmap) : 1U;
-	total_size = DNS_POINTER_SIZE + sizeof(*rr) + DNS_POINTER_SIZE + 2U + bitmap_size;
+	total_size = (include_name ? DNS_POINTER_SIZE : 0U) + sizeof(*rr) + DNS_POINTER_SIZE + 2U +
+		     bitmap_size;
 
 	if (offset > buf_size || total_size > buf_size - offset) {
 		return -ENOSPC;
 	}
 
-	host_ptr = net_htons(host_offset | DNS_SD_PTR_MASK);
-	memcpy(&buf[offset], &host_ptr, sizeof(host_ptr));
-	offset += sizeof(host_ptr);
+	name_ptr = net_htons(name_offset | DNS_SD_PTR_MASK);
+	if (include_name) {
+		memcpy(&buf[offset], &name_ptr, sizeof(name_ptr));
+		offset += sizeof(name_ptr);
+	}
 
 	rr = (struct dns_rr *)&buf[offset];
 	rr->type = net_htons(DNS_RR_TYPE_NSEC);
@@ -655,8 +667,8 @@ static int add_nsec_record(uint16_t host_offset, uint32_t ttl, bool legacy, uint
 	rr->rdlength = net_htons(DNS_POINTER_SIZE + 2U + bitmap_size);
 	offset += sizeof(*rr);
 
-	memcpy(&buf[offset], &host_ptr, sizeof(host_ptr));
-	offset += sizeof(host_ptr);
+	memcpy(&buf[offset], &name_ptr, sizeof(name_ptr));
+	offset += sizeof(name_ptr);
 	buf[offset++] = 0U;
 	buf[offset++] = bitmap_size;
 	memcpy(&buf[offset], bitmap, bitmap_size);
@@ -668,7 +680,7 @@ static int add_nsec_record(uint16_t host_offset, uint32_t ttl, bool legacy, uint
 static void collect_address_types_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 				     void *user_data)
 {
-	uint32_t *types = user_data;
+	uint64_t *types = user_data;
 
 	ARG_UNUSED(iface);
 
@@ -677,9 +689,9 @@ static void collect_address_types_cb(struct net_if *iface, struct net_if_addr *i
 	}
 
 	if (ifaddr->address.family == NET_AF_INET) {
-		*types |= BIT(DNS_RR_TYPE_A);
+		*types |= BIT64(DNS_RR_TYPE_A);
 	} else if (ifaddr->address.family == NET_AF_INET6) {
-		*types |= BIT(DNS_RR_TYPE_AAAA);
+		*types |= BIT64(DNS_RR_TYPE_AAAA);
 	}
 }
 
@@ -987,7 +999,7 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	 * (rsp is packed).
 	 */
 	uint16_t extra_count = 0;
-	uint32_t address_types = 0U;
+	uint64_t address_types = 0U;
 	uint32_t tmp;
 	int r;
 
@@ -1019,10 +1031,10 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	}
 
 	if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
-		address_types |= BIT(DNS_RR_TYPE_AAAA);
+		address_types |= BIT64(DNS_RR_TYPE_AAAA);
 	}
 	if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
-		address_types |= BIT(DNS_RR_TYPE_A);
+		address_types |= BIT64(DNS_RR_TYPE_A);
 	}
 	if (iface != NULL) {
 		if (IS_ENABLED(CONFIG_NET_IPV6)) {
@@ -1103,9 +1115,10 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		extra_count += r;
 	}
 
-	if (address_types != 0U && address_types != (BIT(DNS_RR_TYPE_A) | BIT(DNS_RR_TYPE_AAAA))) {
-		r = add_nsec_record(host_offset, DNS_SD_A_TTL, false, address_types, buf, offset,
-				    buf_size);
+	if (address_types != 0U &&
+	    address_types != (BIT64(DNS_RR_TYPE_A) | BIT64(DNS_RR_TYPE_AAAA))) {
+		r = add_nsec_record(host_offset, DNS_SD_A_TTL, false, address_types, true, buf,
+				    offset, buf_size);
 		if (r > 0) {
 			extra_count++;
 			offset += r;
@@ -1339,7 +1352,7 @@ struct dns_sd_addr_ctx {
 	const struct net_in_addr *skip_addr4;
 	const struct net_in6_addr *skip_addr6;
 	uint32_t ttl;
-	uint32_t types;
+	uint64_t types;
 	uint16_t count;
 	bool legacy;
 };
@@ -1483,6 +1496,7 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	uint16_t host_offset = 0U;
 	bool include_srv;
 	bool include_txt;
+	bool negative;
 	int ret;
 
 	if (query == NULL || buf_size < sizeof(*header)) {
@@ -1506,6 +1520,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	include_txt = (query->type == DNS_RR_TYPE_TXT || query->type == DNS_RR_TYPE_ANY ||
 		       query->browse) &&
 		      !query->suppress_txt;
+	negative = !query->browse && query->type != DNS_RR_TYPE_SRV &&
+		   query->type != DNS_RR_TYPE_TXT && query->type != DNS_RR_TYPE_ANY;
 
 	if (!query->legacy && query->browse) {
 		return dns_sd_handle_ptr_query(iface, inst, addr4, addr6, buf, buf_size, false);
@@ -1517,10 +1533,10 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	}
 
 	if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
-		addr_ctx.types |= BIT(DNS_RR_TYPE_AAAA);
+		addr_ctx.types |= BIT64(DNS_RR_TYPE_AAAA);
 	}
 	if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
-		addr_ctx.types |= BIT(DNS_RR_TYPE_A);
+		addr_ctx.types |= BIT64(DNS_RR_TYPE_A);
 	}
 	if (iface != NULL) {
 		if (IS_ENABLED(CONFIG_NET_IPV6)) {
@@ -1552,6 +1568,28 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		if (ret < 0) {
 			return ret;
 		}
+	}
+
+	if (negative) {
+		uint16_t name_offset = DNS_MSG_HEADER_SIZE;
+
+		if (!query->legacy) {
+			name_offset = output.offset;
+			ret = dns_sd_buf_add_instance_name(&output, inst);
+			if (ret < 0) {
+				return ret;
+			}
+		}
+
+		ret = add_nsec_record(
+			name_offset, query->legacy ? DNS_SD_LEGACY_TTL : DNS_SD_SRV_TTL,
+			query->legacy, BIT64(DNS_RR_TYPE_SRV) | BIT64(DNS_RR_TYPE_TXT),
+			query->legacy, output.data, output.offset, output.size);
+		if (ret < 0) {
+			return ret;
+		}
+		output.offset += ret;
+		answer_count++;
 	}
 
 	if (query->browse) {
@@ -1615,9 +1653,9 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		additional_count += addr_ctx.count;
 
 		if (addr_ctx.types != 0U &&
-		    addr_ctx.types != (BIT(DNS_RR_TYPE_A) | BIT(DNS_RR_TYPE_AAAA))) {
+		    addr_ctx.types != (BIT64(DNS_RR_TYPE_A) | BIT64(DNS_RR_TYPE_AAAA))) {
 			ret = add_nsec_record(host_offset, addr_ctx.ttl, query->legacy,
-					      addr_ctx.types, output.data, output.offset,
+					      addr_ctx.types, true, output.data, output.offset,
 					      output.size);
 			if (ret > 0) {
 				output.offset += ret;
