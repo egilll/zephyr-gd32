@@ -729,6 +729,117 @@ static void validate_label(struct net_pkt *pkt, const char *label, bool last)
 	}
 }
 
+#define REVERSE_QUERY_MAX_SIZE 128U
+
+static void append_dns_label(uint8_t *query, size_t *offset, const char *label, size_t len)
+{
+	query[(*offset)++] = len;
+	memcpy(&query[*offset], label, len);
+	*offset += len;
+}
+
+static size_t build_reverse_query(uint8_t *query, const struct net_addr *addr,
+				  enum dns_rr_type qtype, enum dns_class qclass, uint16_t id)
+{
+	static const char hex[] = "0123456789abcdef";
+	size_t offset = sizeof(struct dns_header);
+
+	memset(query, 0, REVERSE_QUERY_MAX_SIZE);
+	sys_put_be16(id, &query[0]);
+	sys_put_be16(1U, &query[4]);
+
+	if (addr->family == NET_AF_INET) {
+		for (size_t i = 0U; i < sizeof(addr->in_addr.s4_addr); ++i) {
+			char octet[4];
+			uint8_t value =
+				addr->in_addr.s4_addr[sizeof(addr->in_addr.s4_addr) - 1U - i];
+			int len = snprintk(octet, sizeof(octet), "%u", value);
+
+			append_dns_label(query, &offset, octet, len);
+		}
+		append_dns_label(query, &offset, "in-addr", sizeof("in-addr") - 1U);
+	} else {
+		for (size_t i = 2U * sizeof(addr->in6_addr.s6_addr); i > 0U; --i) {
+			size_t nibble = i - 1U;
+			char value = hex[(addr->in6_addr.s6_addr[nibble / 2U] >>
+					  (nibble % 2U == 0U ? 4U : 0U)) &
+					 0xf];
+
+			append_dns_label(query, &offset, &value, 1U);
+		}
+		append_dns_label(query, &offset, "ip6", sizeof("ip6") - 1U);
+	}
+
+	append_dns_label(query, &offset, "arpa", sizeof("arpa") - 1U);
+	query[offset++] = 0U;
+	sys_put_be16(qtype, &query[offset]);
+	offset += DNS_QTYPE_LEN;
+	sys_put_be16(qclass, &query[offset]);
+	offset += DNS_QCLASS_LEN;
+
+	return offset;
+}
+
+static size_t append_reverse_known_answer(uint8_t *query, size_t offset, uint32_t ttl)
+{
+	static const char hostname[] = "zephyr";
+	static const char domain[] = "local";
+
+	query[7] = 1U;
+	query[offset++] = NS_CMPRSFLGS;
+	query[offset++] = sizeof(struct dns_header);
+	sys_put_be16(DNS_RR_TYPE_PTR, &query[offset]);
+	offset += DNS_QTYPE_LEN;
+	sys_put_be16(DNS_CLASS_IN, &query[offset]);
+	offset += DNS_QCLASS_LEN;
+	sys_put_be32(ttl, &query[offset]);
+	offset += DNS_TTL_LEN;
+	sys_put_be16(sizeof(hostname) + sizeof(domain) + 1U, &query[offset]);
+	offset += DNS_RDLENGTH_LEN;
+	append_dns_label(query, &offset, hostname, sizeof(hostname) - 1U);
+	append_dns_label(query, &offset, domain, sizeof(domain) - 1U);
+	query[offset++] = 0U;
+
+	return offset;
+}
+
+static void check_reverse_response(struct net_pkt *pkt, bool legacy, enum dns_rr_type qtype,
+				   uint16_t id)
+{
+	struct dns_header header;
+	struct dns_rr record;
+	uint16_t value;
+
+	net_pkt_cursor_init(pkt);
+	net_pkt_set_overwrite(pkt, true);
+	zassert_ok(net_pkt_skip(pkt, NET_IPV6UDPH_LEN), "net_pkt skip failed");
+	zassert_ok(net_pkt_read(pkt, &header, sizeof(header)), "net_pkt read failed");
+	zassert_equal(net_ntohs(header.id), legacy ? id : 0U, "Unexpected response ID");
+	zassert_equal(net_ntohs(header.qdcount), legacy ? 1U : 0U, "Unexpected question count");
+	zassert_equal(net_ntohs(header.ancount), 1U, "Unexpected answer count");
+
+	if (legacy) {
+		skip_labels(pkt);
+		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
+		zassert_equal(value, qtype, "Repeated question has the wrong type");
+		zassert_ok(net_pkt_read_be16(pkt, &value), "net_pkt read failed");
+		zassert_equal(value, DNS_CLASS_IN, "Repeated question has the wrong class");
+	}
+
+	skip_labels(pkt);
+	zassert_ok(net_pkt_read(pkt, &record, sizeof(record)), "net_pkt read failed");
+	zassert_equal(net_ntohs(record.type), DNS_RR_TYPE_PTR, "Unexpected answer type");
+	zassert_equal(net_ntohs(record.class_),
+		      legacy ? DNS_CLASS_IN : DNS_CLASS_IN | DNS_CLASS_FLUSH,
+		      "Unexpected answer class");
+	zassert_equal(net_ntohl(record.ttl), legacy ? 10U : CONFIG_MDNS_RESPONDER_TTL,
+		      "Unexpected answer TTL");
+	zassert_equal(net_ntohs(record.rdlength), sizeof("zephyr") + sizeof("local") + 1U,
+		      "Unexpected PTR length");
+	validate_label(pkt, "zephyr", false);
+	validate_label(pkt, "local", true);
+}
+
 #define HOST_KNOWN_ANSWER_SIZE                                                                     \
 	(DNS_POINTER_SIZE + sizeof(struct dns_rr) + sizeof(struct net_in6_addr))
 #define HOST_KNOWN_QUERY_SIZE                                                                      \
@@ -932,6 +1043,91 @@ ZTEST(test_mdns_responder, test_hostname_known_answer_suppression)
 	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
 		      "Complete host known answers were not suppressed");
 	zassert_equal(responses_count, 3U, "Complete host known answers produced a response");
+}
+
+ZTEST(test_mdns_responder, test_reverse_ptr_queries)
+{
+	struct net_addr addr = {0};
+	struct net_if_addr *ifaddr;
+	uint8_t query[REVERSE_QUERY_MAX_SIZE];
+	size_t query_size;
+
+	addr.family = NET_AF_INET6;
+	addr.in6_addr = ll_addr;
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
+	send_msg(query, query_size);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No IPv6 reverse PTR response");
+	check_reverse_response(response_pkts[0], false, DNS_RR_TYPE_PTR, 0U);
+
+	addr.in6_addr = extra_addr;
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_ANY, DNS_CLASS_ANY, 0U);
+	send_msg(query, query_size);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No IPv6 reverse ANY response");
+	check_reverse_response(response_pkts[1], false, DNS_RR_TYPE_ANY, 0U);
+
+	addr.family = NET_AF_INET;
+	zassert_ok(net_addr_pton(NET_AF_INET, "192.0.2.42", &addr.in_addr),
+		   "Cannot parse IPv4 test address");
+	ifaddr = net_if_ipv4_addr_add(iface1, &addr.in_addr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "Cannot add IPv4 test address");
+	ifaddr->addr_state = NET_ADDR_PREFERRED;
+
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
+	send_msg(query, query_size);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No IPv4 reverse PTR response");
+	check_reverse_response(response_pkts[2], false, DNS_RR_TYPE_PTR, 0U);
+	zassert_true(net_if_ipv4_addr_rm(iface1, &addr.in_addr), "Cannot remove IPv4 test address");
+
+	addr.family = NET_AF_INET6;
+	addr.in6_addr = ll_addr;
+	addr.in6_addr.s6_addr[15] ^= 1U;
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
+	send_msg(query, query_size);
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Responder answered for an address it does not own");
+	zassert_equal(responses_count, 3U, "Unowned reverse name produced a response");
+}
+
+ZTEST(test_mdns_responder, test_reverse_ptr_known_answer_suppression)
+{
+	struct net_addr addr = {
+		.family = NET_AF_INET6,
+		.in6_addr = ll_addr,
+	};
+	uint8_t query[REVERSE_QUERY_MAX_SIZE];
+	size_t query_size;
+
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
+	query_size = append_reverse_known_answer(query, query_size, CONFIG_MDNS_RESPONDER_TTL);
+	send_msg(query, query_size);
+	zassert_equal(k_sem_take(&wait_data, K_MSEC(100)), -EAGAIN,
+		      "Fresh reverse PTR known answer was not suppressed");
+	zassert_equal(responses_count, 0U, "Fresh reverse PTR produced a response");
+
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR, DNS_CLASS_IN, 0U);
+	query_size =
+		append_reverse_known_answer(query, query_size, CONFIG_MDNS_RESPONDER_TTL / 2U - 1U);
+	send_msg(query, query_size);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT),
+		   "Stale reverse PTR did not receive a response");
+	check_reverse_response(response_pkts[0], false, DNS_RR_TYPE_PTR, 0U);
+}
+
+ZTEST(test_mdns_responder, test_legacy_reverse_ptr_query)
+{
+	static const uint16_t query_id = 0x4321;
+	struct net_addr addr = {
+		.family = NET_AF_INET6,
+		.in6_addr = ll_addr,
+	};
+	uint8_t query[REVERSE_QUERY_MAX_SIZE];
+	size_t query_size;
+
+	query_size = build_reverse_query(query, &addr, DNS_RR_TYPE_PTR,
+					 DNS_CLASS_IN | DNS_CLASS_FLUSH, query_id);
+	send_msg_from_port(query, query_size, 45678U);
+	zassert_ok(k_sem_take(&wait_data, RESPONSE_TIMEOUT), "No legacy reverse PTR response");
+	check_reverse_response(response_pkts[0], true, DNS_RR_TYPE_PTR, query_id);
 }
 
 ZTEST(test_mdns_responder, test_query_class_any)
