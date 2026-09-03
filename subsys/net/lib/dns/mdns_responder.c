@@ -3026,8 +3026,7 @@ int mdns_responder_disable_iface(struct net_if *iface)
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 
 #define ANNOUNCE_TIMEOUT 1 /* in seconds, RFC 6762 ch 8.3 */
-
-/* ATM we do only .local announcing, SD announcing is TODO */
+#define ANNOUNCE_COUNT   2
 
 static int send_unsolicited_response(struct net_if *iface,
 				     int sock,
@@ -3375,7 +3374,7 @@ static void announce_start(struct k_work *work)
 	announce_count++;
 
 	/* Address-change announces need only one packet. */
-	if (&announce_timer != dwork) {
+	if (&announce_timer != dwork && announce_count < ANNOUNCE_COUNT) {
 		ret = k_work_reschedule_for_queue(&mdns_work_q, dwork, K_SECONDS(ANNOUNCE_TIMEOUT));
 		if (ret < 0) {
 			NET_DBG("Cannot schedule %s work (%d)", "announce", ret);
@@ -3393,7 +3392,7 @@ static void do_init_listener(struct k_work *work)
 	}
 
 	if (do_announce) {
-		if (announce_count < 1) {
+		if (announce_count < ANNOUNCE_COUNT) {
 			announce_start(work);
 		} else {
 			mark_needs_announce(NULL, false);
