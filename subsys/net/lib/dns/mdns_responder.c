@@ -271,6 +271,7 @@ struct mdns_monitor_iface_addr {
 	bool in_use : 1;
 	bool needs_announce : 1;
 	bool pending_goodbye : 1;
+	bool ready: 1;
 };
 
 static struct mdns_monitor_iface_addr mon_if[
@@ -1872,8 +1873,8 @@ quit:
  */
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
 
-static int add_address(struct net_if *iface, net_sa_family_t family,
-		       const void *address, size_t addrlen)
+static int add_address(struct net_if *iface, net_sa_family_t family, const void *address,
+		       size_t addrlen, bool ready)
 {
 	size_t expected_len;
 	int first_free;
@@ -1912,6 +1913,7 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 		if (memcmp(&mon_if[j].addr.in_addr, address, expected_len) == 0) {
 			mon_if[j].in_use = true;
 			mon_if[j].pending_goodbye = false;
+			mon_if[j].ready = ready;
 			return -EALREADY;
 		}
 	}
@@ -1919,6 +1921,7 @@ static int add_address(struct net_if *iface, net_sa_family_t family,
 	if (first_free >= 0) {
 		mon_if[first_free].in_use = true;
 		mon_if[first_free].pending_goodbye = false;
+		mon_if[first_free].ready = ready;
 		mon_if[first_free].iface = iface;
 		mon_if[first_free].addr.family = family;
 
@@ -1974,6 +1977,7 @@ static int del_address(struct net_if *iface, net_sa_family_t family, const void 
 				mon_if[j].in_use = false;
 				mon_if[j].pending_goodbye = false;
 				mon_if[j].needs_announce = false;
+				mon_if[j].ready = false;
 			}
 			return 0;
 		}
@@ -2213,7 +2217,8 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 		}
 
 		if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-			ret = add_address(iface, NET_AF_INET, info, info_length);
+			ret = add_address(iface, NET_AF_INET, info, info_length,
+					  !IS_ENABLED(CONFIG_NET_IPV4_ACD));
 			if (ret < 0 && ret != -EALREADY) {
 				NET_DBG("Cannot %s %s address (%d)", "add", "IPv4", ret);
 				return;
@@ -2239,6 +2244,12 @@ static void mdns_addr_ipv4_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					&v4_ctx[i]);
 			}
 		} else if (mgmt_event == NET_EVENT_IPV4_ACD_SUCCEED) {
+			ret = add_address(iface, NET_AF_INET, info, info_length, true);
+			if (ret < 0 && ret != -EALREADY) {
+				NET_DBG("Cannot %s %s address (%d)", "validate", "IPv4", ret);
+				return;
+			}
+
 			if (init_listener_done) {
 				start_announce(iface);
 				return;
@@ -2324,16 +2335,19 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 
 		if (mgmt_event == NET_EVENT_IPV6_ADDR_ADD) {
 			struct net_if_addr *ifaddr;
+			bool ready;
 
-			ret = add_address(iface, NET_AF_INET6, info, info_length);
+			ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, info);
+			ready = !IS_ENABLED(CONFIG_NET_IPV6_DAD) ||
+				(ifaddr != NULL && ifaddr->addr_state != NET_ADDR_TENTATIVE);
+
+			ret = add_address(iface, NET_AF_INET6, info, info_length, ready);
 			if (ret < 0 && ret != -EALREADY) {
 				NET_DBG("Cannot %s %s address (%d)", "add", "IPv6", ret);
 				return;
 			}
 
-			ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, info);
-			if (IS_ENABLED(CONFIG_NET_IPV6_DAD) && ifaddr != NULL &&
-			    ifaddr->addr_state == NET_ADDR_TENTATIVE) {
+			if (!ready) {
 				return;
 			}
 
@@ -2353,6 +2367,12 @@ static void mdns_addr_ipv6_event_handler(uint64_t mgmt_event, struct net_if *ifa
 					&v6_ctx[i]);
 			}
 		} else if (mgmt_event == NET_EVENT_IPV6_DAD_SUCCEED) {
+			ret = add_address(iface, NET_AF_INET6, info, info_length, true);
+			if (ret < 0 && ret != -EALREADY) {
+				NET_DBG("Cannot %s %s address (%d)", "validate", "IPv6", ret);
+				return;
+			}
+
 			if (init_listener_done) {
 				start_announce(iface);
 				return;
@@ -3190,7 +3210,7 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		uint16_t type;
 		size_t left;
 
-		if (!addr_list[i].in_use) {
+		if (!addr_list[i].in_use || !addr_list[i].ready) {
 			continue;
 		}
 
@@ -3256,6 +3276,11 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 		answer_count++;
 	}
 
+	if (answer_count == 0U) {
+		net_buf_unref(answer);
+		return NULL;
+	}
+
 	/* Adjust the answer count in the header */
 	if (answer_count > 1) {
 		UNALIGNED_PUT(net_htons(answer_count), (uint16_t *)&answer->data[6]);
@@ -3290,6 +3315,7 @@ static void clear_pending_goodbyes(struct net_if *iface)
 			mon_if[i].in_use = false;
 			mon_if[i].pending_goodbye = false;
 			mon_if[i].needs_announce = false;
+			mon_if[i].ready = false;
 		}
 	}
 }
