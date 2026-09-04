@@ -33,8 +33,6 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/dt-bindings/clock/gd32f4xx-clocks.h>
-#include <zephyr/devicetree/gpio.h>
-#include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/ethernet.h>
@@ -1394,29 +1392,6 @@ static int eth_gd32_hw_init(const struct device *dev)
 		gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, GPIO_PIN_8);
 		gpio_af_set(GPIOA, GPIO_AF_0, GPIO_PIN_8);
 		rcu_ckout0_config(RCU_CKOUT0SRC_PLLP, RCU_CKOUT0_DIV4);
-	}
-#endif
-
-#if DT_INST_NODE_HAS_PROP(0, ethernet_reset_gpios)
-	{
-		/*
-		 * Give the PHY a clean hardware reset with the RMII reference clock
-		 * already running, so it latches its strap configuration correctly. The
-		 * gdzone wires PHY nRST to GPIOG; the pin/polarity come from devicetree.
-		 */
-		uint16_t clk_gpiog = GD32_CLOCK_GPIOG;
-		uint32_t rst_pin = BIT(DT_INST_GPIO_PIN(0, ethernet_reset_gpios));
-		bool active_low =
-			(DT_INST_GPIO_FLAGS(0, ethernet_reset_gpios) & GPIO_ACTIVE_LOW) != 0U;
-
-		(void)clock_control_on(GD32_CLOCK_CONTROLLER, (clock_control_subsys_t)&clk_gpiog);
-		gpio_mode_set(GPIOG, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, rst_pin);
-		gpio_output_options_set(GPIOG, GPIO_OTYPE_PP, GPIO_OSPEED_MAX, rst_pin);
-
-		gpio_bit_write(GPIOG, rst_pin, active_low ? RESET : SET);
-		k_msleep(10);
-		gpio_bit_write(GPIOG, rst_pin, active_low ? SET : RESET);
-		k_msleep(50);
 	}
 #endif
 
