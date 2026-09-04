@@ -634,6 +634,21 @@ ZTEST(ip_addr_fn, test_ipv4_ll_address_select)
 	zassert_equal_ptr(iface, second_iface, "Wrong iface selected");
 }
 
+ZTEST(ip_addr_fn, test_ipv4_manual_ll_source_for_multicast)
+{
+	struct net_in_addr lladdr = { { { 169, 254, 42, 7 } } };
+	struct net_in_addr mdns = { { { 224, 0, 0, 251 } } };
+	struct net_if_addr *ifaddr;
+	const struct net_in_addr *out;
+
+	ifaddr = net_if_ipv4_addr_add(default_iface, &lladdr, NET_ADDR_MANUAL, 0);
+	zassert_not_null(ifaddr, "IPv4 link-local address add failed");
+
+	out = net_if_ipv4_select_src_addr(default_iface, &mdns);
+	zassert_equal(out->s_addr, lladdr.s_addr,
+		      "Manual IPv4 link-local address was not selected for multicast");
+}
+
 ZTEST(ip_addr_fn, test_ipv4_addresses)
 {
 	const struct net_in_addr *out;
