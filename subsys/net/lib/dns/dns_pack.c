@@ -123,6 +123,12 @@ static int skip_fqdn(uint8_t *answer, int buf_sz)
 	return i;
 }
 
+static inline bool handle_private_dns_query_type(uint16_t rr_type)
+{
+	return IS_ENABLED(CONFIG_DNS_RESOLVER_PRIVATE_RR_SUPPORT) &&
+	       dns_query_type_is_private((enum dns_query_type)rr_type);
+}
+
 int dns_unpack_answer(struct dns_msg_t *dns_msg, int dname_ptr, uint32_t *ttl,
 		      enum dns_rr_type *type)
 {
@@ -175,6 +181,11 @@ int dns_unpack_answer(struct dns_msg_t *dns_msg, int dname_ptr, uint32_t *ttl,
 		DNS_RDLENGTH_LEN;
 	*type = dns_answer_type(dname_len, answer);
 
+	/* Reject records whose declared rdata extends past the packet. */
+	if ((uint32_t)pos + len > dns_msg->msg_size) {
+		return -EINVAL;
+	}
+
 	switch (*type) {
 	case DNS_RR_TYPE_A:
 	case DNS_RR_TYPE_AAAA:
@@ -199,6 +210,11 @@ int dns_unpack_answer(struct dns_msg_t *dns_msg, int dname_ptr, uint32_t *ttl,
 		return 0;
 
 	default:
+		if (handle_private_dns_query_type(*type)) {
+			set_dns_msg_response(dns_msg, DNS_RESPONSE_PRIVATE, pos, len);
+			return 0;
+		}
+
 		/* malformed dns answer */
 		return -EINVAL;
 	}
@@ -362,7 +378,8 @@ int dns_unpack_response_query(struct dns_msg_t *dns_msg)
 	buf = dns_query + qname_size;
 	if (dns_unpack_query_qtype(buf) != DNS_RR_TYPE_A &&
 	    dns_unpack_query_qtype(buf) != DNS_RR_TYPE_AAAA &&
-	    dns_unpack_query_qtype(buf) != DNS_RR_TYPE_PTR) {
+	    dns_unpack_query_qtype(buf) != DNS_RR_TYPE_PTR &&
+	    !handle_private_dns_query_type(dns_unpack_query_qtype(buf))) {
 		return -EINVAL;
 	}
 

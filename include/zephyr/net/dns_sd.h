@@ -154,7 +154,7 @@ extern "C" {
  * @param service name of the service, such as "_http"
  * @param domain the domain of the service, such as "local"
  * @param text information for the DNS TXT record
- * @param port the port number that this service will use
+ * @param port a pointer to the port number that this service will use
  *
  * @see <a href="https://tools.ietf.org/html/rfc6763">RFC 6763</a>
  */

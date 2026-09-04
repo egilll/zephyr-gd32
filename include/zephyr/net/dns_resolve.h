@@ -53,6 +53,25 @@ enum dns_query_type {
 	DNS_QUERY_TYPE_ANY = 255
 };
 
+/** Private RR type range start (RFC 6895). */
+#define DNS_RR_TYPE_PRIVATE_START_VALUE 65280
+/** Private RR type range end (RFC 6895). */
+#define DNS_RR_TYPE_PRIVATE_END_VALUE 65534
+
+/**
+ * @brief Check if a query type is a private RR type.
+ *
+ * @param type Query type to check
+ * @return true if type is in the RFC 6895 private-use range
+ */
+static inline bool dns_query_type_is_private(enum dns_query_type type)
+{
+	unsigned int value = (unsigned int)type;
+
+	return value >= DNS_RR_TYPE_PRIVATE_START_VALUE &&
+	       value <= DNS_RR_TYPE_PRIVATE_END_VALUE;
+}
+
 /**
  * Entity that added the DNS server.
  */
