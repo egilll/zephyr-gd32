@@ -5,7 +5,7 @@ identifier: gd32f470i_eval
 name: GigaDevice GD32F470I-EVAL
 type: mcu
 arch: arm
-ram: 112
+ram: 256
 flash: 3072
 toolchain:
   - zephyr
