@@ -391,6 +391,35 @@ static bool is_legacy_query(const struct net_sockaddr *src)
 	return false;
 }
 
+static struct net_if *response_iface(net_sa_family_t family, const struct net_sockaddr *src,
+				     struct net_if *recv_if)
+{
+	if (recv_if != NULL) {
+		return recv_if;
+	}
+
+	if (family == NET_AF_INET6) {
+		return net_if_ipv6_select_src_iface(&net_sin6(src)->sin6_addr);
+	}
+
+	return net_if_ipv4_select_src_iface(&net_sin(src)->sin_addr);
+}
+
+static int send_response_buf(int sock, const struct net_sockaddr *dst, net_socklen_t dst_len,
+			     struct net_buf *response, struct net_if *iface)
+{
+	int ret;
+
+	ret = zsock_sendto(sock, response->data, response->len, 0, dst, dst_len);
+	if (ret < 0) {
+		return -errno;
+	}
+
+	net_stats_update_dns_sent(iface);
+
+	return 0;
+}
+
 int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr *src,
 		   net_socklen_t src_len, bool unicast, struct net_sockaddr *dst,
 		   net_socklen_t *dst_len)
@@ -1290,13 +1319,7 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 	/* Use the interface the query arrived on (per-socket BINDTODEVICE) so
 	 * A/AAAA records advertise addresses on that link.
 	 */
-	if (recv_if != NULL) {
-		iface = recv_if;
-	} else if (family == NET_AF_INET6) {
-		iface = net_if_ipv6_select_src_iface(&net_sin6(src_addr)->sin6_addr);
-	} else {
-		iface = net_if_ipv4_select_src_iface(&net_sin(src_addr)->sin_addr);
-	}
+	iface = response_iface(family, src_addr, recv_if);
 
 	if (qtype == DNS_RR_TYPE_INVALID) {
 		return -EINVAL;
@@ -1311,13 +1334,9 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 		return ret;
 	}
 
-	ret = zsock_sendto(sock, query->data, query->len, 0,
-			   (struct net_sockaddr *)&dst, dst_len);
+	ret = send_response_buf(sock, (struct net_sockaddr *)&dst, dst_len, query, iface);
 	if (ret < 0) {
-		ret = -errno;
 		NET_DBG("Cannot send %s reply (%d)", "mDNS", ret);
-	} else {
-		net_stats_update_dns_sent(iface);
 	}
 
 	return ret;
@@ -1341,13 +1360,7 @@ static int send_reverse_response(int sock, net_sa_family_t family, struct net_so
 	struct net_sockaddr_in dst;
 #endif
 
-	if (recv_if != NULL) {
-		iface = recv_if;
-	} else if (family == NET_AF_INET6) {
-		iface = net_if_ipv6_select_src_iface(&net_sin6(src_addr)->sin6_addr);
-	} else {
-		iface = net_if_ipv4_select_src_iface(&net_sin(src_addr)->sin_addr);
-	}
+	iface = response_iface(family, src_addr, recv_if);
 
 	if (iface == NULL) {
 		return -ENOENT;
@@ -1384,12 +1397,9 @@ static int send_reverse_response(int sock, net_sa_family_t family, struct net_so
 		return ret;
 	}
 
-	ret = zsock_sendto(sock, query->data, query->len, 0, (struct net_sockaddr *)&dst, dst_len);
+	ret = send_response_buf(sock, (struct net_sockaddr *)&dst, dst_len, query, iface);
 	if (ret < 0) {
-		ret = -errno;
 		NET_DBG("Cannot send %s reply (%d)", "mDNS", ret);
-	} else {
-		net_stats_update_dns_sent(iface);
 	}
 
 	return ret;
@@ -1704,13 +1714,7 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 	/* Use the interface the query arrived on (per-socket BINDTODEVICE) so
 	 * DNS-SD records advertise addresses on that link.
 	 */
-	if (recv_if != NULL) {
-		iface = recv_if;
-	} else if (family == NET_AF_INET6) {
-		iface = net_if_ipv6_select_src_iface(&net_sin6(src_addr)->sin6_addr);
-	} else {
-		iface = net_if_ipv4_select_src_iface(&net_sin(src_addr)->sin_addr);
-	}
+	iface = response_iface(family, src_addr, recv_if);
 
 	if (IS_ENABLED(CONFIG_NET_IPV4)) {
 		/* Look up the local IPv4 address */
@@ -1837,13 +1841,11 @@ static void send_sd_response(int sock, net_sa_family_t family, struct net_sockad
 			result->len = ret;
 
 			/* Send the response */
-			ret = zsock_sendto(sock, result->data, result->len, 0,
-					   (struct net_sockaddr *)&dst, dst_len);
+			ret = send_response_buf(sock, (struct net_sockaddr *)&dst, dst_len, result,
+						iface);
 			if (ret < 0) {
 				NET_DBG("Cannot send %s reply (%d)", "mDNS", ret);
 				continue;
-			} else {
-				net_stats_update_dns_sent(iface);
 			}
 		}
 	}
