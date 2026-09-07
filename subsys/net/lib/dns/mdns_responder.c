@@ -1552,37 +1552,43 @@ static int dns_sd_rdata_known(const struct dns_sd_rec *record, enum dns_rr_type 
 	}
 }
 
-static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type query_type,
-			       uint8_t *msg, uint16_t msg_size, uint16_t answer_offset,
-			       uint16_t answer_count, bool service_type_enum,
-			       struct net_buf *scratch)
+enum dns_sd_answer_flag {
+	DNS_SD_ANSWER_PTR = BIT(0),
+	DNS_SD_ANSWER_TXT = BIT(1),
+	DNS_SD_ANSWER_SRV = BIT(2),
+	DNS_SD_ANSWER_NSEC = BIT(3),
+};
+
+static enum dns_sd_answer_flag dns_sd_answer_flag(enum dns_rr_type type)
+{
+	switch (type) {
+	case DNS_RR_TYPE_PTR:
+		return DNS_SD_ANSWER_PTR;
+	case DNS_RR_TYPE_TXT:
+		return DNS_SD_ANSWER_TXT;
+	case DNS_RR_TYPE_SRV:
+		return DNS_SD_ANSWER_SRV;
+	case DNS_RR_TYPE_NSEC:
+		return DNS_SD_ANSWER_NSEC;
+	default:
+		return 0;
+	}
+}
+
+static int dns_sd_known_answers(const struct dns_sd_rec *record, uint8_t requested, uint8_t *msg,
+				uint16_t msg_size, uint16_t answer_offset, uint16_t answer_count,
+				bool service_type_enum, struct net_buf *scratch, uint8_t *known)
 {
 	uint16_t offset = answer_offset;
-	uint32_t minimum_ttl;
 
 	if (dns_header_tc(msg)) {
 		return 0;
 	}
 
-	switch (query_type) {
-	case DNS_RR_TYPE_PTR:
-		minimum_ttl = DNS_SD_PTR_TTL / 2U;
-		break;
-	case DNS_RR_TYPE_SRV:
-		minimum_ttl = DNS_SD_SRV_TTL / 2U;
-		break;
-	case DNS_RR_TYPE_TXT:
-		minimum_ttl = DNS_SD_TXT_TTL / 2U;
-		break;
-	case DNS_RR_TYPE_NSEC:
-		minimum_ttl = DNS_SD_SRV_TTL / 2U;
-		break;
-	default:
-		return 0;
-	}
-
 	for (uint16_t i = 0U; i < answer_count; ++i) {
 		struct mdns_answer answer;
+		enum dns_sd_answer_flag flag;
+		uint32_t minimum_ttl;
 		int ret;
 
 		ret = mdns_unpack_answer(msg, msg_size, &offset, scratch, &answer);
@@ -1590,17 +1596,28 @@ static int dns_sd_answer_known(const struct dns_sd_rec *record, enum dns_rr_type
 			return ret;
 		}
 
-		if (answer.type == query_type && answer.class_ == DNS_CLASS_IN &&
-		    answer.ttl >= minimum_ttl &&
-		    (service_type_enum ? dns_sd_service_enum_name_matches(answer.owner, record)
-				       : dns_sd_name_matches(answer.owner, record,
-							     query_type != DNS_RR_TYPE_PTR))) {
-			ret = dns_sd_rdata_known(record, answer.type, msg, msg_size,
-						 answer.rdata - msg, answer.rdlength,
-						 service_type_enum, scratch);
-			if (ret != 0) {
-				return ret;
-			}
+		flag = dns_sd_answer_flag(answer.type);
+		if ((requested & flag) == 0U || answer.class_ != DNS_CLASS_IN) {
+			continue;
+		}
+
+		minimum_ttl = answer.type == DNS_RR_TYPE_PTR   ? DNS_SD_PTR_TTL / 2U
+			      : answer.type == DNS_RR_TYPE_TXT ? DNS_SD_TXT_TTL / 2U
+							       : DNS_SD_SRV_TTL / 2U;
+		if (answer.ttl < minimum_ttl ||
+		    !(service_type_enum ? dns_sd_service_enum_name_matches(answer.owner, record)
+					: dns_sd_name_matches(answer.owner, record,
+							      answer.type != DNS_RR_TYPE_PTR))) {
+			continue;
+		}
+
+		ret = dns_sd_rdata_known(record, answer.type, msg, msg_size, answer.rdata - msg,
+					 answer.rdlength, service_type_enum, scratch);
+		if (ret < 0) {
+			return ret;
+		}
+		if (ret > 0) {
+			*known |= flag;
 		}
 	}
 
@@ -1613,38 +1630,36 @@ static int dns_sd_suppress_known_answers(const struct dns_sd_rec *record,
 					 uint16_t answer_count, bool service_type_enum,
 					 struct net_buf *scratch)
 {
+	uint8_t known = 0U;
+	uint8_t requested;
 	int ret;
 
 	query->suppress_srv = false;
 	query->suppress_txt = false;
 
 	if (query->browse) {
-		return dns_sd_answer_known(record, DNS_RR_TYPE_PTR, msg, msg_size, answer_offset,
-					   answer_count, service_type_enum, scratch);
+		requested = DNS_SD_ANSWER_PTR;
+	} else if (query->type != DNS_RR_TYPE_SRV && query->type != DNS_RR_TYPE_TXT &&
+		   query->type != DNS_RR_TYPE_ANY) {
+		requested = DNS_SD_ANSWER_NSEC;
+	} else if (query->type == DNS_RR_TYPE_ANY) {
+		requested = DNS_SD_ANSWER_SRV | DNS_SD_ANSWER_TXT;
+	} else {
+		requested = dns_sd_answer_flag(query->type);
 	}
-	if (query->type != DNS_RR_TYPE_SRV && query->type != DNS_RR_TYPE_TXT &&
-	    query->type != DNS_RR_TYPE_ANY) {
-		return dns_sd_answer_known(record, DNS_RR_TYPE_NSEC, msg, msg_size, answer_offset,
-					   answer_count, false, scratch);
+
+	ret = dns_sd_known_answers(record, requested, msg, msg_size, answer_offset, answer_count,
+				   service_type_enum, scratch, &known);
+	if (ret < 0) {
+		return ret;
 	}
 
 	if (query->type != DNS_RR_TYPE_ANY) {
-		return dns_sd_answer_known(record, query->type, msg, msg_size, answer_offset,
-					   answer_count, service_type_enum, scratch);
+		return (known & requested) != 0U;
 	}
-	ret = dns_sd_answer_known(record, DNS_RR_TYPE_SRV, msg, msg_size, answer_offset,
-				  answer_count, false, scratch);
-	if (ret < 0) {
-		return ret;
-	}
-	query->suppress_srv = ret > 0;
 
-	ret = dns_sd_answer_known(record, DNS_RR_TYPE_TXT, msg, msg_size, answer_offset,
-				  answer_count, false, scratch);
-	if (ret < 0) {
-		return ret;
-	}
-	query->suppress_txt = ret > 0;
+	query->suppress_srv = (known & DNS_SD_ANSWER_SRV) != 0U;
+	query->suppress_txt = (known & DNS_SD_ANSWER_TXT) != 0U;
 
 	return query->suppress_srv && query->suppress_txt;
 }
