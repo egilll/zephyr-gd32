@@ -33,6 +33,7 @@ struct dns_sd_query {
 	uint16_t id;
 	bool legacy;
 	bool browse;
+	bool announce;
 	bool suppress_srv;
 	bool suppress_txt;
 };
