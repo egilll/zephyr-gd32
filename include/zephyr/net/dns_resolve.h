@@ -17,6 +17,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/net/net_ip.h>
 #include <zephyr/net/net_if.h>
+#include <zephyr/net/hostname.h>
 #include <zephyr/net/socket_poll.h>
 #include <zephyr/net/net_core.h>
 #include <zephyr/sys/atomic.h>
@@ -644,7 +645,7 @@ struct dns_resolve_context {
 
 struct mdns_probe_user_data {
 	struct mdns_responder_context *ctx;
-	char query[DNS_MAX_NAME_SIZE + 1];
+	char query[NET_HOSTNAME_MAX_LEN + sizeof(".local")];
 	uint16_t dns_id;
 };
 

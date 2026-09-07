@@ -3671,12 +3671,9 @@ static int send_announce(const char *name)
 static void announce_start(struct k_work *work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-	char name[DNS_MAX_NAME_SIZE + 1];
 	int ret;
 
-	snprintk(name, sizeof(name), "%s", net_hostname_get());
-
-	ret = send_announce(name);
+	ret = send_announce(net_hostname_get());
 	if (ret < 0) {
 		NET_DBG("Cannot send %s announce (%d)", "mDNS", ret);
 		return;
