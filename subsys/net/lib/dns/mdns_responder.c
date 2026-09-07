@@ -631,14 +631,19 @@ static bool mdns_host_name_matches(const char *name)
 
 static int mdns_reverse_name_addr(const char *name, struct net_addr *addr)
 {
+#if defined(CONFIG_NET_IPV4)
 	static const char ipv4_suffix[] = ".in-addr.arpa";
+#endif
+#if defined(CONFIG_NET_IPV6)
 	static const char ipv6_suffix[] = ".ip6.arpa";
+#endif
 	size_t name_len = strlen(name);
 	const char *end;
 	const char *p;
 
 	memset(addr, 0, sizeof(*addr));
 
+#if defined(CONFIG_NET_IPV4)
 	if (name_len > sizeof(ipv4_suffix) - 1U &&
 	    strcasecmp(name + name_len - (sizeof(ipv4_suffix) - 1U), ipv4_suffix) == 0) {
 		end = name + name_len - (sizeof(ipv4_suffix) - 1U);
@@ -670,7 +675,9 @@ static int mdns_reverse_name_addr(const char *name, struct net_addr *addr)
 		addr->family = NET_AF_INET;
 		return 0;
 	}
+#endif
 
+#if defined(CONFIG_NET_IPV6)
 	if (name_len > sizeof(ipv6_suffix) - 1U &&
 	    strcasecmp(name + name_len - (sizeof(ipv6_suffix) - 1U), ipv6_suffix) == 0) {
 		end = name + name_len - (sizeof(ipv6_suffix) - 1U);
@@ -706,6 +713,7 @@ static int mdns_reverse_name_addr(const char *name, struct net_addr *addr)
 		addr->family = NET_AF_INET6;
 		return 0;
 	}
+#endif
 
 	return -EINVAL;
 }
