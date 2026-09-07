@@ -350,9 +350,9 @@ static void collect_address_types_cb(struct net_if *iface, struct net_if_addr *i
 		return;
 	}
 
-	if (ifaddr->address.family == NET_AF_INET) {
+	if (IS_ENABLED(CONFIG_NET_IPV4) && ifaddr->address.family == NET_AF_INET) {
 		*types |= DNS_NSEC_TYPE_A;
-	} else if (ifaddr->address.family == NET_AF_INET6) {
+	} else if (IS_ENABLED(CONFIG_NET_IPV6) && ifaddr->address.family == NET_AF_INET6) {
 		*types |= DNS_NSEC_TYPE_AAAA;
 	}
 }
@@ -385,7 +385,7 @@ static bool port_in_use(uint16_t proto, uint16_t port,
 {
 	bool ret = false;
 
-	if (addr4 != NULL) {
+	if (IS_ENABLED(CONFIG_NET_IPV4) && addr4 != NULL) {
 		struct net_sockaddr_in sa = { 0 };
 
 		sa.sin_family = NET_AF_INET;
@@ -398,7 +398,7 @@ static bool port_in_use(uint16_t proto, uint16_t port,
 		}
 	}
 
-	if (addr6 != NULL) {
+	if (IS_ENABLED(CONFIG_NET_IPV6) && addr6 != NULL) {
 		struct net_sockaddr_in6 sa = { 0 };
 
 		sa.sin6_family = NET_AF_INET6;
@@ -765,7 +765,7 @@ static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, voi
 		return;
 	}
 
-	if (ifaddr->address.family == NET_AF_INET6) {
+	if (IS_ENABLED(CONFIG_NET_IPV6) && ifaddr->address.family == NET_AF_INET6) {
 		if (ctx->skip_addr6 != NULL &&
 		    net_ipv6_addr_cmp(&ifaddr->address.in6_addr, ctx->skip_addr6)) {
 			return;
@@ -773,7 +773,7 @@ static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, voi
 
 		ret = dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_AAAA, ifaddr->address.in6_addr.s6_addr,
 					  sizeof(ifaddr->address.in6_addr));
-	} else {
+	} else if (IS_ENABLED(CONFIG_NET_IPV4) && ifaddr->address.family == NET_AF_INET) {
 		if (ctx->skip_addr4 != NULL &&
 		    net_ipv4_addr_cmp(&ifaddr->address.in_addr, ctx->skip_addr4)) {
 			return;
@@ -781,6 +781,8 @@ static void dns_sd_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr, voi
 
 		ret = dns_sd_buf_add_addr(ctx, DNS_RR_TYPE_A, ifaddr->address.in_addr.s4_addr,
 					  sizeof(ifaddr->address.in_addr));
+	} else {
+		return;
 	}
 
 	if (ret < 0) {
@@ -907,10 +909,10 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 		return ret;
 	}
 
-	if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
+	if (IS_ENABLED(CONFIG_NET_IPV6) && addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
 		addr_ctx.types |= DNS_NSEC_TYPE_AAAA;
 	}
-	if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
+	if (IS_ENABLED(CONFIG_NET_IPV4) && addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
 		addr_ctx.types |= DNS_NSEC_TYPE_A;
 	}
 	if (iface != NULL) {
@@ -1011,7 +1013,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 	if (include_srv) {
 		rrset_offset = output.offset;
 		rrset_count = addr_ctx.count;
-		if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
+		if (IS_ENABLED(CONFIG_NET_IPV6) && addr6 != NULL &&
+		    !net_ipv6_is_addr_unspecified(addr6)) {
 			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_AAAA, addr6->s6_addr,
 						  sizeof(*addr6));
 			addr_ctx.error = ret;
@@ -1020,7 +1023,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 			net_if_ipv6_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
 		}
 		if (addr_ctx.error < 0) {
-			if (addr6 != NULL && !net_ipv6_is_addr_unspecified(addr6)) {
+			if (IS_ENABLED(CONFIG_NET_IPV6) && addr6 != NULL &&
+			    !net_ipv6_is_addr_unspecified(addr6)) {
 				return addr_ctx.error;
 			}
 
@@ -1031,7 +1035,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 
 		rrset_offset = output.offset;
 		rrset_count = addr_ctx.count;
-		if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
+		if (IS_ENABLED(CONFIG_NET_IPV4) && addr4 != NULL &&
+		    !net_ipv4_is_addr_unspecified(addr4)) {
 			ret = dns_sd_buf_add_addr(&addr_ctx, DNS_RR_TYPE_A, addr4->s4_addr,
 						  sizeof(*addr4));
 			addr_ctx.error = ret;
@@ -1040,7 +1045,8 @@ int dns_sd_handle_query(struct net_if *iface, const struct dns_sd_rec *inst,
 			net_if_ipv4_addr_foreach(iface, dns_sd_addr_cb, &addr_ctx);
 		}
 		if (addr_ctx.error < 0) {
-			if (addr4 != NULL && !net_ipv4_is_addr_unspecified(addr4)) {
+			if (IS_ENABLED(CONFIG_NET_IPV4) && addr4 != NULL &&
+			    !net_ipv4_is_addr_unspecified(addr4)) {
 				return addr_ctx.error;
 			}
 

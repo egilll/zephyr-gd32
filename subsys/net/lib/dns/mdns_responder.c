@@ -991,9 +991,9 @@ static void collect_address_types_cb(struct net_if *iface, struct net_if_addr *i
 	ARG_UNUSED(iface);
 
 	if (ifaddr->addr_state == NET_ADDR_PREFERRED || ifaddr->addr_state == NET_ADDR_DEPRECATED) {
-		if (ifaddr->address.family == NET_AF_INET) {
+		if (IS_ENABLED(CONFIG_NET_IPV4) && ifaddr->address.family == NET_AF_INET) {
 			*types |= DNS_NSEC_TYPE_A;
-		} else if (ifaddr->address.family == NET_AF_INET6) {
+		} else if (IS_ENABLED(CONFIG_NET_IPV6) && ifaddr->address.family == NET_AF_INET6) {
 			*types |= DNS_NSEC_TYPE_AAAA;
 		}
 	}
@@ -1021,14 +1021,16 @@ static void inspect_address_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 		return;
 	}
 
-	if (ifaddr->address.family == NET_AF_INET6) {
+	if (IS_ENABLED(CONFIG_NET_IPV6) && ifaddr->address.family == NET_AF_INET6) {
 		type = DNS_RR_TYPE_AAAA;
 		addr_len = sizeof(struct net_in6_addr);
 		addr = ifaddr->address.in6_addr.s6_addr;
-	} else {
+	} else if (IS_ENABLED(CONFIG_NET_IPV4) && ifaddr->address.family == NET_AF_INET) {
 		type = DNS_RR_TYPE_A;
 		addr_len = sizeof(struct net_in_addr);
 		addr = ifaddr->address.in_addr.s4_addr;
+	} else {
+		return;
 	}
 
 	rrset = address_rrset_state(ctx, type);
@@ -1103,14 +1105,16 @@ static void answer_addr_cb(struct net_if *iface, struct net_if_addr *ifaddr,
 		return;
 	}
 
-	if (ifaddr->address.family == NET_AF_INET6) {
+	if (IS_ENABLED(CONFIG_NET_IPV6) && ifaddr->address.family == NET_AF_INET6) {
 		type = DNS_RR_TYPE_AAAA;
 		addr_len = sizeof(struct net_in6_addr);
 		addr = ifaddr->address.in6_addr.s6_addr;
-	} else {
+	} else if (IS_ENABLED(CONFIG_NET_IPV4) && ifaddr->address.family == NET_AF_INET) {
 		type = DNS_RR_TYPE_A;
 		addr_len = sizeof(struct net_in_addr);
 		addr = ifaddr->address.in_addr.s4_addr;
+	} else {
+		return;
 	}
 
 	ctx->candidate_count++;
@@ -2014,14 +2018,12 @@ static int add_address(struct net_if *iface, net_sa_family_t family, const void 
 	size_t expected_len;
 	int first_free;
 
-	if (family != NET_AF_INET && family != NET_AF_INET6) {
-		return -EINVAL;
-	}
-
-	if (family == NET_AF_INET) {
+	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
 		expected_len = sizeof(struct net_in_addr);
-	} else {
+	} else if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
 		expected_len = sizeof(struct net_in6_addr);
+	} else {
+		return -EINVAL;
 	}
 
 	if (addrlen != expected_len) {
@@ -2078,14 +2080,12 @@ static int del_address(struct net_if *iface, net_sa_family_t family, const void 
 {
 	size_t expected_len;
 
-	if (family != NET_AF_INET && family != NET_AF_INET6) {
-		return -EINVAL;
-	}
-
-	if (family == NET_AF_INET) {
+	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
 		expected_len = sizeof(struct net_in_addr);
-	} else {
+	} else if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
 		expected_len = sizeof(struct net_in6_addr);
+	} else {
+		return -EINVAL;
 	}
 	if (addrlen != expected_len) {
 		return -EINVAL;
@@ -3295,9 +3295,10 @@ static struct net_buf *create_unsolicited_mdns_answer(struct net_if *iface,
 			continue;
 		}
 
-		if (addr_list[i].addr.family == NET_AF_INET) {
+		if (IS_ENABLED(CONFIG_NET_IPV4) && addr_list[i].addr.family == NET_AF_INET) {
 			type = DNS_RR_TYPE_A;
-		} else if (addr_list[i].addr.family == NET_AF_INET6) {
+		} else if (IS_ENABLED(CONFIG_NET_IPV6) &&
+			   addr_list[i].addr.family == NET_AF_INET6) {
 			type = DNS_RR_TYPE_AAAA;
 		} else {
 			NET_DBG("Unknown family %d", addr_list[i].addr.family);
