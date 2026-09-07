@@ -300,7 +300,7 @@ static int setup_dst_addr(int sock, net_sa_family_t family, struct net_sockaddr 
 			  net_socklen_t *dst_len);
 #endif /* CONFIG_NET_TEST */
 
-#define DNS_RESOLVER_MIN_BUF		2
+#define DNS_RESOLVER_MIN_BUF    1
 #define DNS_RESOLVER_BUF_CTR	(DNS_RESOLVER_MIN_BUF + \
 				 CONFIG_MDNS_RESOLVER_ADDITIONAL_BUF_CTR)
 
@@ -560,6 +560,17 @@ static int mdns_unpack_answer(const uint8_t *msg, uint16_t msg_size, uint16_t *o
 	return 0;
 }
 
+static int mdns_restore_query_name(struct net_buf *query, const uint8_t *query_msg,
+				   uint16_t query_size, uint16_t question_offset)
+{
+	const uint8_t *name_end;
+
+	query->len = 0U;
+
+	return dns_unpack_name(query_msg, query_size, query_msg + question_offset, query,
+			       &name_end);
+}
+
 struct answer_ctx {
 	struct net_buf *query;
 	struct net_buf *scratch;
@@ -746,8 +757,23 @@ static bool mdns_nsec_matches(uint32_t existing_types, const uint8_t *msg, uint1
 	       memcmp(next_name_end, expected, 2U + bitmap_len) == 0;
 }
 
-static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type expected_type,
-				     const uint8_t *msg, uint16_t msg_size, uint16_t answer_offset,
+static bool mdns_reverse_owner_matches(const char *owner, const struct net_addr *expected)
+{
+	struct net_addr parsed;
+	size_t addr_len;
+
+	if (mdns_reverse_name_addr(owner, &parsed) < 0 || parsed.family != expected->family) {
+		return false;
+	}
+
+	addr_len = parsed.family == NET_AF_INET ? sizeof(parsed.in_addr) : sizeof(parsed.in6_addr);
+
+	return memcmp(&parsed.in_addr, &expected->in_addr, addr_len) == 0;
+}
+
+static int mdns_reverse_answer_known(const struct net_addr *query_addr,
+				     enum dns_rr_type expected_type, const uint8_t *msg,
+				     uint16_t msg_size, uint16_t answer_offset,
 				     uint16_t answer_count, struct net_buf *scratch)
 {
 	uint16_t offset = answer_offset;
@@ -767,7 +793,8 @@ static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type ex
 		}
 
 		if (answer.type != expected_type || answer.class_ != DNS_CLASS_IN ||
-		    answer.ttl < MDNS_TTL / 2U || strcasecmp(answer.owner, query_name) != 0) {
+		    answer.ttl < MDNS_TTL / 2U ||
+		    !mdns_reverse_owner_matches(answer.owner, query_addr)) {
 			continue;
 		}
 
@@ -794,10 +821,11 @@ static int mdns_reverse_answer_known(const char *query_name, enum dns_rr_type ex
 	return 0;
 }
 
-static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
-				 enum dns_rr_type qtype, enum dns_class qclass, bool legacy,
-				 uint16_t dns_id, const uint8_t *query_msg, uint16_t query_size,
-				 uint16_t answer_offset, uint16_t answer_count)
+static int create_reverse_answer(struct net_buf *query, enum dns_rr_type qtype,
+				 enum dns_class qclass, bool legacy, uint16_t dns_id,
+				 const uint8_t *query_msg, uint16_t query_size,
+				 uint16_t question_offset, uint16_t answer_offset,
+				 uint16_t answer_count, const struct net_addr *query_addr)
 {
 	const char *hostname = net_hostname_get();
 	size_t hostname_len = strlen(hostname);
@@ -806,11 +834,16 @@ static int create_reverse_answer(struct net_buf *query, struct net_buf *scratch,
 
 	if (!legacy && answer_count > 0U) {
 		ret = mdns_reverse_answer_known(
-			query->data, negative ? DNS_RR_TYPE_NSEC : DNS_RR_TYPE_PTR, query_msg,
-			query_size, answer_offset, answer_count, scratch);
+			query_addr, negative ? DNS_RR_TYPE_NSEC : DNS_RR_TYPE_PTR, query_msg,
+			query_size, answer_offset, answer_count, query);
 		if (ret != 0) {
 			return ret > 0 ? -EALREADY : ret;
 		}
+	}
+
+	ret = mdns_restore_query_name(query, query_msg, query_size, question_offset);
+	if (ret < 0) {
+		return ret;
 	}
 
 	ret = init_name_labels(query);
@@ -1086,14 +1119,14 @@ static void add_address_nsec(struct answer_ctx *ctx, enum dns_rr_type existing_t
 	}
 }
 
-static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dns_rr_type qtype,
-			 enum dns_class qclass, struct net_if *iface, bool legacy, uint16_t dns_id,
-			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
-			 uint16_t answer_count)
+static int create_answer(struct net_buf *query, enum dns_rr_type qtype, enum dns_class qclass,
+			 struct net_if *iface, bool legacy, uint16_t dns_id,
+			 const uint8_t *query_msg, uint16_t query_size, uint16_t question_offset,
+			 uint16_t answer_offset, uint16_t answer_count)
 {
 	struct answer_ctx ctx = {
 		.query = query,
-		.scratch = scratch,
+		.scratch = query,
 		.query_msg = query_msg,
 		.qtype = qtype,
 		.name_offset = DNS_MSG_HEADER_SIZE,
@@ -1105,22 +1138,6 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 	uint32_t address_types = 0U;
 	int candidate_count;
 	int ret;
-
-	ret = init_name_labels(query);
-	if (ret < 0) {
-		return ret;
-	}
-
-	if (legacy) {
-		/* Repeat the question, RFC 6762 6.7. The name is already
-		 * there, written by init_name_labels() at the offset the
-		 * answers point back to, so only its type and class are
-		 * missing. The class is written plain: the unicast response
-		 * bit a querier may have set in it has no meaning coming back.
-		 */
-		net_buf_add_be16(query, qtype);
-		net_buf_add_be16(query, qclass & ~DNS_CLASS_FLUSH);
-	}
 
 	if (IS_ENABLED(CONFIG_NET_IPV4)) {
 		net_if_ipv4_addr_foreach(iface, collect_address_types_cb, &address_types);
@@ -1138,6 +1155,51 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 		if (ctx.error < 0) {
 			return ctx.error;
 		}
+	}
+
+	if (qtype == DNS_RR_TYPE_A) {
+		candidate_count = ctx.a.total;
+	} else if (qtype == DNS_RR_TYPE_AAAA) {
+		candidate_count = ctx.aaaa.total;
+	} else if (qtype == DNS_RR_TYPE_ANY) {
+		candidate_count = ctx.a.total + ctx.aaaa.total;
+	} else {
+		candidate_count = 0;
+	}
+
+	if (candidate_count > 0 && (qtype != DNS_RR_TYPE_A || ctx.a.known == ctx.a.total) &&
+	    (qtype != DNS_RR_TYPE_AAAA || ctx.aaaa.known == ctx.aaaa.total) &&
+	    (qtype != DNS_RR_TYPE_ANY ||
+	     (ctx.a.known == ctx.a.total && ctx.aaaa.known == ctx.aaaa.total))) {
+		return -EALREADY;
+	}
+
+	if (candidate_count == 0 && address_types != 0U && !legacy) {
+		ret = mdns_host_nsec_known(&ctx, address_types);
+		if (ret != 0) {
+			return ret > 0 ? -EALREADY : ret;
+		}
+	}
+
+	ret = mdns_restore_query_name(query, query_msg, query_size, question_offset);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = init_name_labels(query);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (legacy) {
+		/* Repeat the question, RFC 6762 6.7. The name is already
+		 * there, written by init_name_labels() at the offset the
+		 * answers point back to, so only its type and class are
+		 * missing. The class is written plain: the unicast response
+		 * bit a querier may have set in it has no meaning coming back.
+		 */
+		net_buf_add_be16(query, qtype);
+		net_buf_add_be16(query, qclass & ~DNS_CLASS_FLUSH);
 	}
 
 	if ((qtype == DNS_RR_TYPE_A) && IS_ENABLED(CONFIG_NET_IPV4)) {
@@ -1164,13 +1226,6 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 
 		if (address_types == 0U) {
 			return -ENOMEM;
-		}
-
-		if (!legacy) {
-			ret = mdns_host_nsec_known(&ctx, address_types);
-			if (ret != 0) {
-				return ret > 0 ? -EALREADY : ret;
-			}
 		}
 
 		ret = mdns_add_nsec(query, ctx.name_offset, legacy ? MDNS_LEGACY_TTL : MDNS_TTL,
@@ -1212,11 +1267,10 @@ static int create_answer(struct net_buf *query, struct net_buf *scratch, enum dn
 static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *src_addr,
 			 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
 			 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id,
-			 const uint8_t *query_msg, uint16_t query_size, uint16_t answer_offset,
-			 uint16_t answer_count)
+			 const uint8_t *query_msg, uint16_t query_size, uint16_t question_offset,
+			 uint16_t answer_offset, uint16_t answer_count)
 {
 	struct net_if *iface;
-	struct net_buf *scratch = NULL;
 	net_socklen_t dst_len;
 	bool legacy;
 	int ret;
@@ -1248,15 +1302,8 @@ static int send_response(int sock, net_sa_family_t family, struct net_sockaddr *
 		return -EINVAL;
 	}
 
-	if (!legacy && answer_count > 0U) {
-		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
-	}
-
-	ret = create_answer(query, scratch, qtype, qclass, iface, legacy, dns_id, query_msg,
-			    query_size, answer_offset, answer_count);
-	if (scratch != NULL) {
-		net_buf_unref(scratch);
-	}
+	ret = create_answer(query, qtype, qclass, iface, legacy, dns_id, query_msg, query_size,
+			    question_offset, answer_offset, answer_count);
 	if (ret == -EALREADY) {
 		return 0;
 	}
@@ -1280,12 +1327,11 @@ static int send_reverse_response(int sock, net_sa_family_t family, struct net_so
 				 size_t addrlen, struct net_buf *query, enum dns_rr_type qtype,
 				 enum dns_class qclass, struct net_if *recv_if, uint16_t dns_id,
 				 const uint8_t *query_msg, uint16_t query_size,
-				 uint16_t answer_offset, uint16_t answer_count,
-				 const struct net_addr *addr)
+				 uint16_t question_offset, uint16_t answer_offset,
+				 uint16_t answer_count, const struct net_addr *addr)
 {
 	struct net_if_addr *ifaddr;
 	struct net_if *iface;
-	struct net_buf *scratch = NULL;
 	net_socklen_t dst_len;
 	bool legacy;
 	int ret;
@@ -1329,15 +1375,8 @@ static int send_reverse_response(int sock, net_sa_family_t family, struct net_so
 		return ret;
 	}
 
-	if (!legacy && answer_count > 0U) {
-		scratch = net_buf_alloc(&mdns_msg_pool, K_NO_WAIT);
-	}
-
-	ret = create_reverse_answer(query, scratch, qtype, qclass, legacy, dns_id, query_msg,
-				    query_size, answer_offset, answer_count);
-	if (scratch != NULL) {
-		net_buf_unref(scratch);
-	}
+	ret = create_reverse_answer(query, qtype, qclass, legacy, dns_id, query_msg, query_size,
+				    question_offset, answer_offset, answer_count, addr);
 	if (ret == -EALREADY) {
 		return 0;
 	}
@@ -1883,6 +1922,7 @@ static int dns_read(int sock,
 		enum dns_rr_type qtype;
 		enum dns_class qclass;
 		struct net_addr reverse_addr;
+		uint16_t question_offset = dns_msg.query_offset;
 		uint8_t *lquery;
 
 		(void)memset(result->data, 0, net_buf_tailroom(result));
@@ -1905,8 +1945,8 @@ static int dns_read(int sock,
 		if (mdns_reverse_name_addr(result->data, &reverse_addr) == 0) {
 			send_reverse_response(sock, family, src_addr, addrlen, result, qtype,
 					      qclass, recv_if, dns_id, dns_msg.msg,
-					      dns_msg.msg_size, answer_offset, answer_count,
-					      &reverse_addr);
+					      dns_msg.msg_size, question_offset, answer_offset,
+					      answer_count, &reverse_addr);
 			continue;
 		}
 
@@ -1927,8 +1967,8 @@ static int dns_read(int sock,
 				family == NET_AF_INET ? "IPv4" : "IPv6", "query",
 				hostname, ".local");
 			send_response(sock, family, src_addr, addrlen, result, qtype, qclass,
-				      recv_if, dns_id, dns_msg.msg, dns_msg.msg_size, answer_offset,
-				      answer_count);
+				      recv_if, dns_id, dns_msg.msg, dns_msg.msg_size,
+				      question_offset, answer_offset, answer_count);
 		} else if (IS_ENABLED(CONFIG_MDNS_RESPONDER_DNS_SD)) {
 			send_sd_response(sock, family, src_addr, addrlen, result, recv_if, qtype,
 					 qclass, dns_id, dns_msg.msg, dns_msg.msg_size,
