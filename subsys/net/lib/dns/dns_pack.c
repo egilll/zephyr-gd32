@@ -644,6 +644,34 @@ const char *dns_qtype_to_str(enum dns_rr_type qtype)
 	return "<unknown>";
 }
 
+size_t dns_nsec_bitmap(uint8_t types, uint8_t bitmap[5])
+{
+	memset(bitmap, 0, 5U);
+
+	if ((types & DNS_NSEC_TYPE_A) != 0U) {
+		bitmap[DNS_RR_TYPE_A / 8U] |= BIT(7U - DNS_RR_TYPE_A % 8U);
+	}
+	if ((types & DNS_NSEC_TYPE_PTR) != 0U) {
+		bitmap[DNS_RR_TYPE_PTR / 8U] |= BIT(7U - DNS_RR_TYPE_PTR % 8U);
+	}
+	if ((types & DNS_NSEC_TYPE_TXT) != 0U) {
+		bitmap[DNS_RR_TYPE_TXT / 8U] |= BIT(7U - DNS_RR_TYPE_TXT % 8U);
+	}
+	if ((types & DNS_NSEC_TYPE_AAAA) != 0U) {
+		bitmap[DNS_RR_TYPE_AAAA / 8U] |= BIT(7U - DNS_RR_TYPE_AAAA % 8U);
+	}
+	if ((types & DNS_NSEC_TYPE_SRV) != 0U) {
+		bitmap[DNS_RR_TYPE_SRV / 8U] |= BIT(7U - DNS_RR_TYPE_SRV % 8U);
+	}
+
+	return (types & DNS_NSEC_TYPE_SRV) != 0U    ? 5U
+	       : (types & DNS_NSEC_TYPE_AAAA) != 0U ? 4U
+	       : (types & DNS_NSEC_TYPE_TXT) != 0U  ? 3U
+	       : (types & DNS_NSEC_TYPE_PTR) != 0U  ? 2U
+	       : (types & DNS_NSEC_TYPE_A) != 0U    ? 1U
+						    : 0U;
+}
+
 int dns_unpack_query(struct dns_msg_t *dns_msg, struct net_buf *buf,
 		     enum dns_rr_type *qtype, enum dns_class *qclass)
 {

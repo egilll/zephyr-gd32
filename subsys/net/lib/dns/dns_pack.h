@@ -498,4 +498,14 @@ const char *dns_qtype_to_str(enum dns_rr_type qtype);
 int dns_unpack_name(const uint8_t *msg, int maxlen, const uint8_t *src,
 		    struct net_buf *buf, const uint8_t **eol);
 
+enum dns_nsec_type_flag {
+	DNS_NSEC_TYPE_A = BIT(0),
+	DNS_NSEC_TYPE_PTR = BIT(1),
+	DNS_NSEC_TYPE_TXT = BIT(2),
+	DNS_NSEC_TYPE_AAAA = BIT(3),
+	DNS_NSEC_TYPE_SRV = BIT(4),
+};
+
+size_t dns_nsec_bitmap(uint8_t types, uint8_t bitmap[5]);
+
 #endif
