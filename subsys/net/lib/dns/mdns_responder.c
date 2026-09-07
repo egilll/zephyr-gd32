@@ -2845,10 +2845,6 @@ static int init_listener(void)
 	fds_pos = 0;
 
 	ARRAY_FOR_EACH(v6_ctx, i) {
-		ARRAY_FOR_EACH(v6_ctx[i].fds, j) {
-			v6_ctx[i].fds[j].fd = -1;
-		}
-
 		/* Mark the slot closed up front. Skipped slots (no socket,
 		 * disabled or missing interface) must not look "open" to the
 		 * teardown path, otherwise mdns_close_listeners() would act on
@@ -2899,29 +2895,8 @@ static int init_listener(void)
 		}
 
 		v6_ctx[i].sock = v6;
-		ret = -1;
-
-		ARRAY_FOR_EACH(v6_ctx[i].fds, j) {
-			if (v6_ctx[i].fds[j].fd == v6) {
-				ret = 0;
-				break;
-			}
-
-			if (v6_ctx[i].fds[j].fd < 0) {
-				v6_ctx[i].fds[j].fd = v6;
-				v6_ctx[i].fds[j].events = ZSOCK_POLLIN;
-				ipv6_fds[fds_pos].fd = v6;
-				ipv6_fds[fds_pos++].events = ZSOCK_POLLIN;
-				ret = 0;
-				break;
-			}
-		}
-
-		if (ret < 0) {
-			NET_DBG("Cannot set %s to socket (%d)", "polling", ret);
-			zsock_close(v6);
-			continue;
-		}
+		ipv6_fds[fds_pos].fd = v6;
+		ipv6_fds[fds_pos++].events = ZSOCK_POLLIN;
 
 		ret = register_dispatcher(&v6_ctx[i], &v6_svc, (struct net_sockaddr *)&local_addr6,
 					  sizeof(local_addr6), ifindex, ipv6_fds,
@@ -2955,10 +2930,6 @@ static int init_listener(void)
 	fds_pos = 0;
 
 	ARRAY_FOR_EACH(v4_ctx, i) {
-		ARRAY_FOR_EACH(v4_ctx[i].fds, j) {
-			v4_ctx[i].fds[j].fd = -1;
-		}
-
 		/* Mark the slot closed up front. Skipped slots (no socket,
 		 * disabled or missing interface) must not look "open" to the
 		 * teardown path, otherwise mdns_close_listeners() would act on
@@ -3009,29 +2980,8 @@ static int init_listener(void)
 		}
 
 		v4_ctx[i].sock = v4;
-		ret = -1;
-
-		ARRAY_FOR_EACH(v4_ctx[i].fds, j) {
-			if (v4_ctx[i].fds[j].fd == v4) {
-				ret = 0;
-				break;
-			}
-
-			if (v4_ctx[i].fds[j].fd < 0) {
-				v4_ctx[i].fds[j].fd = v4;
-				v4_ctx[i].fds[j].events = ZSOCK_POLLIN;
-				ipv4_fds[fds_pos].fd = v4;
-				ipv4_fds[fds_pos++].events = ZSOCK_POLLIN;
-				ret = 0;
-				break;
-			}
-		}
-
-		if (ret < 0) {
-			NET_DBG("Cannot set %s to socket (%d)", "polling", ret);
-			zsock_close(v4);
-			continue;
-		}
+		ipv4_fds[fds_pos].fd = v4;
+		ipv4_fds[fds_pos++].events = ZSOCK_POLLIN;
 
 		ret = register_dispatcher(&v4_ctx[i], &v4_svc, (struct net_sockaddr *)&local_addr4,
 					  sizeof(local_addr4), ifindex, ipv4_fds,
@@ -3074,10 +3024,6 @@ static void mdns_close_listeners(void)
 		(void)dns_dispatcher_unregister(&v6_ctx[i].dispatcher);
 		(void)zsock_close(sock);
 		v6_ctx[i].sock = -1;
-
-		ARRAY_FOR_EACH(v6_ctx[i].fds, j) {
-			v6_ctx[i].fds[j].fd = -1;
-		}
 	}
 #endif /* CONFIG_NET_IPV6 */
 
@@ -3092,10 +3038,6 @@ static void mdns_close_listeners(void)
 		(void)dns_dispatcher_unregister(&v4_ctx[i].dispatcher);
 		(void)zsock_close(sock);
 		v4_ctx[i].sock = -1;
-
-		ARRAY_FOR_EACH(v4_ctx[i].fds, j) {
-			v4_ctx[i].fds[j].fd = -1;
-		}
 	}
 #endif /* CONFIG_NET_IPV4 */
 }

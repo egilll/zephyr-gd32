@@ -649,9 +649,7 @@ struct mdns_probe_user_data {
 };
 
 struct mdns_responder_context {
-	struct net_sockaddr_storage server_addr;
 	struct dns_socket_dispatcher dispatcher;
-	struct zsock_pollfd fds[1];
 	int sock;
 	struct net_if *iface;
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
