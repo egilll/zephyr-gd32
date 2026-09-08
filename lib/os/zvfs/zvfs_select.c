@@ -9,8 +9,8 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/internal/syscall_handler.h>
+#include <zephyr/sys/fdtable.h>
 #include <zephyr/sys/math_extras.h>
-#include <zephyr/net/socket.h>
 
 /* Get size, in elements, of an array within a struct. */
 #define STRUCT_MEMBER_ARRAY_SIZE(type, field) ARRAY_SIZE(((type *)0)->field)

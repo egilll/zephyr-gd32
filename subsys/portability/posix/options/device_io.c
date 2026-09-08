@@ -12,6 +12,7 @@
 #include <zephyr/posix/poll.h>
 #include <zephyr/posix/unistd.h>
 #include <zephyr/posix/sys/select.h>
+#include <zephyr/posix/sys/time.h>
 
 /* prototypes for external, not-yet-public, functions in fdtable.c or fs.c */
 FILE *zvfs_fdopen(int fd, const char *mode);

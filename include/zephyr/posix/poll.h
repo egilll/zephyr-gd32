@@ -6,7 +6,7 @@
 #ifndef ZEPHYR_INCLUDE_POSIX_POLL_H_
 #define ZEPHYR_INCLUDE_POSIX_POLL_H_
 
-#include <zephyr/net/socket.h>
+#include <zephyr/sys/fdtable.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,14 +14,14 @@ extern "C" {
 
 typedef	unsigned int nfds_t;
 
-#define pollfd zsock_pollfd
+#define pollfd zvfs_pollfd
 
-#define POLLIN ZSOCK_POLLIN
-#define POLLPRI ZSOCK_POLLPRI
-#define POLLOUT ZSOCK_POLLOUT
-#define POLLERR ZSOCK_POLLERR
-#define POLLHUP ZSOCK_POLLHUP
-#define POLLNVAL ZSOCK_POLLNVAL
+#define POLLIN   ZVFS_POLLIN
+#define POLLPRI  ZVFS_POLLPRI
+#define POLLOUT  ZVFS_POLLOUT
+#define POLLERR  ZVFS_POLLERR
+#define POLLHUP  ZVFS_POLLHUP
+#define POLLNVAL ZVFS_POLLNVAL
 
 int poll(struct pollfd *fds, int nfds, int timeout);
 
