@@ -27,7 +27,6 @@ LOG_MODULE_REGISTER(udc_dwc2, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 enum dwc2_drv_event_type {
 	/* USB connection speed determined after bus reset */
-	DWC2_DRV_EVT_ENUM_DONE,
 	/* Trigger next transfer, must not be used for control OUT */
 	DWC2_DRV_EVT_XFER,
 	/* Setup packet received */
@@ -2432,31 +2431,6 @@ static void dwc2_handle_enumdone(const struct device *dev)
 	priv->enumspd = usb_dwc2_get_dsts_enumspd(dsts);
 	priv->enumdone = 1;
 
-	k_event_post(&priv->drv_evt, BIT(DWC2_DRV_EVT_ENUM_DONE));
-}
-
-static int dwc2_flush_reset_fifo(const struct device *dev, bool tx)
-{
-	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
-	mem_addr_t grstctl_reg = (mem_addr_t)&base->grstctl;
-	const uint32_t flush = tx ? USB_DWC2_GRSTCTL_TXFFLSH : USB_DWC2_GRSTCTL_RXFFLSH;
-	k_timepoint_t deadline = sys_timepoint_calc(K_MSEC(10));
-	uint32_t command = flush;
-
-	if (tx) {
-		command |= usb_dwc2_set_grstctl_txfnum(0x10U);
-	}
-	sys_write32(command, grstctl_reg);
-
-	while ((sys_read32(grstctl_reg) & flush) != 0U) {
-		if (sys_timepoint_expired(deadline)) {
-			LOG_ERR("USB reset %s FIFO flush timed out", tx ? "TX" : "RX");
-			return -ETIMEDOUT;
-		}
-		k_usleep(10);
-	}
-
-	return 0;
 }
 
 static inline int dwc2_read_fifo_setup(const struct device *dev, uint8_t ep,
@@ -3062,6 +3036,7 @@ static void udc_dwc2_isr_handler(const struct device *dev)
 			/* Clear and handle Enumeration Done interrupt. */
 			sys_write32(USB_DWC2_GINTSTS_ENUMDONE, gintsts_reg);
 			dwc2_handle_enumdone(dev);
+			udc_submit_event(dev, UDC_EVT_RESET, 0);
 		}
 
 		if (int_status & USB_DWC2_GINTSTS_WKUPINT) {
@@ -3324,13 +3299,6 @@ static ALWAYS_INLINE void dwc2_thread_handler(void *const arg)
 		}
 
 		config->irq_enable_func(dev);
-	}
-
-	if (evt & BIT(DWC2_DRV_EVT_ENUM_DONE)) {
-		k_event_clear(&priv->drv_evt, BIT(DWC2_DRV_EVT_ENUM_DONE));
-		(void)dwc2_flush_reset_fifo(dev, true);
-		(void)dwc2_flush_reset_fifo(dev, false);
-		udc_submit_event(dev, UDC_EVT_RESET, 0);
 	}
 
 	if (evt & BIT(DWC2_DRV_EVT_DISABLE)) {
