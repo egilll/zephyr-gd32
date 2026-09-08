@@ -797,6 +797,7 @@ static int handle_fu_set(const struct device *dev, const struct usb_setup_packet
 	const uint8_t channel = CONTROL_CHANNEL_NUMBER(setup);
 	uint8_t control_bit;
 	uint8_t value_size;
+	uint16_t expected_length;
 	uint8_t normalized[32U * sizeof(int16_t)];
 	struct uac1_feature_update update = {
 		.values = normalized,
@@ -824,6 +825,34 @@ static int handle_fu_set(const struct device *dev, const struct usb_setup_packet
 
 	if (CONTROL_ATTRIBUTE(setup) != SET_CUR) {
 		errno = -ENOTSUP;
+		return 0;
+	}
+
+	if (channel != UINT8_MAX) {
+		if (find_fu_state(fu_cfg, channel) == NULL) {
+			errno = -EINVAL;
+			return 0;
+		}
+		if (!(fu_cfg->controls[channel] & control_bit)) {
+			errno = -ENOTSUP;
+			return 0;
+		}
+		expected_length = value_size;
+	} else {
+		expected_length = feature_control_count(fu_cfg, control_bit) * value_size;
+		if (expected_length == 0U) {
+			errno = -ENOTSUP;
+			return 0;
+		}
+	}
+
+	if (setup->wLength != expected_length) {
+		errno = -EINVAL;
+		return 0;
+	}
+
+	/* The first call validates the setup packet; the second supplies the OUT data. */
+	if (buf == NULL) {
 		return 0;
 	}
 
@@ -982,6 +1011,15 @@ static int handle_ep_sample_rate_set(const struct device *dev, const struct usb_
 
 	if (CONTROL_SELECTOR(setup) != EP_SAMPLING_FREQ_CONTROL || CONTROL_ATTRIBUTE(setup) != SET_CUR) {
 		errno = -ENOTSUP;
+		return 0;
+	}
+	if (setup->wLength != 3U) {
+		errno = -EINVAL;
+		return 0;
+	}
+
+	/* The first call validates the setup packet; the second supplies the OUT data. */
+	if (buf == NULL) {
 		return 0;
 	}
 
