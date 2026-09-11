@@ -881,9 +881,7 @@ static int gd32_sdhc_get_host_props(const struct device *dev, struct sdhc_host_p
 	props->power_delay = cfg->power_delay_ms;
 	props->bus_4_bit_support = cfg->bus_width >= 4U;
 	props->host_caps.bus_8_bit_support = cfg->bus_width >= 8U;
-	props->host_caps.high_spd_support = props->f_max >= SD_CLOCK_25MHZ;
 	props->host_caps.sdma_support = 1;
-	props->host_caps.sdio_async_interrupt_support = 1;
 	props->host_caps.vol_330_support = 1;
 	props->max_current_330 = cfg->max_current_330;
 	props->max_current_300 = cfg->max_current_300;
@@ -1860,7 +1858,11 @@ static int gd32_sdhc_init(const struct device *dev)
 	}
 
 	if (cfg->reset.dev != NULL) {
-		(void)reset_line_toggle_dt(&cfg->reset);
+		ret = reset_line_toggle_dt(&cfg->reset);
+		if (ret != 0) {
+			LOG_ERR("reset_line_toggle_dt failed (%d)", ret);
+			return ret;
+		}
 	}
 
 	if (cfg->cd_gpio.port != NULL) {

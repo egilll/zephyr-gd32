@@ -248,6 +248,8 @@ zephyr_udc0: &usbfs {
 &sdio {
 	status = "okay";
 	bus-width = <4>;
+	/* GD32F4xx specifies at most 25 MHz for SD and SD I/O cards. */
+	max-bus-freq = <25000000>;
 	pinctrl-0 = <&sdio_default>;
 	pinctrl-1 = <&sdio_slow>;
 	pinctrl-2 = <&sdio_fast>;
