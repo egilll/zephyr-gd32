@@ -572,24 +572,22 @@ static int sdmmc_init_uhs(struct sd_card *card)
 	return ret;
 }
 
-/* Performs initialization for SD high speed cards */
+/* Configure optional high-speed timing and the native bus width. */
 static int sdmmc_init_hs(struct sd_card *card)
 {
 	int ret;
 
-	if ((!card->host_props.host_caps.high_spd_support) ||
-	    (card->sd_version < SD_SPEC_VER1_1) ||
-	    (card->switch_caps.hs_max_dtr == HS_UNSUPPORTED)) {
-		/* No high speed support. Leave card untouched */
-		return 0;
-	}
-	/* Select bus speed for card depending on host and card capability*/
-	sdmmc_select_bus_speed(card);
-	/* Apply selected bus speed */
-	ret = sdmmc_set_bus_speed(card);
-	if (ret) {
-		LOG_ERR("Failed to switch card to HS mode");
-		return ret;
+	if (card->host_props.host_caps.high_spd_support &&
+	    (card->sd_version >= SD_SPEC_VER1_1) &&
+	    (card->switch_caps.hs_max_dtr != HS_UNSUPPORTED)) {
+		/* Select bus speed for card depending on host and card capability. */
+		sdmmc_select_bus_speed(card);
+		/* Apply selected bus speed */
+		ret = sdmmc_set_bus_speed(card);
+		if (ret) {
+			LOG_ERR("Failed to switch card to HS mode");
+			return ret;
+		}
 	}
 	if (card->host_props.bus_4_bit_support && (card->flags & SD_4BITS_WIDTH)) {
 		/* Raise bus width to 4 bits */
