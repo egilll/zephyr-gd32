@@ -29,7 +29,9 @@ extern "C" {
  * @{
  */
 
-#if defined(CONFIG_NET_HOSTNAME_MAX_LEN)
+#if !defined(CONFIG_NET_HOSTNAME_ENABLE)
+#define NET_HOSTNAME_MAX_LEN CONFIG_NET_HOSTNAME_MAX_LEN
+#elif defined(CONFIG_NET_HOSTNAME_MAX_LEN)
 #define NET_HOSTNAME_MAX_LEN                                                                       \
 	MAX(CONFIG_NET_HOSTNAME_MAX_LEN,                                                           \
 	    (sizeof(CONFIG_NET_HOSTNAME) - 1 +                                                     \

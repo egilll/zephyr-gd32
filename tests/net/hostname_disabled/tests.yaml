@@ -1,0 +1,8 @@
+tests:
+  net.hostname.disabled:
+    build_only: true
+    platform_allow:
+      - qemu_cortex_m3
+    tags:
+      - net
+      - hostname
