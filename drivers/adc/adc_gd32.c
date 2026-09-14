@@ -40,6 +40,10 @@ LOG_MODULE_REGISTER(adc_gd32, CONFIG_ADC_LOG_LEVEL);
 #define ADC1_ENABLE		DT_NODE_HAS_STATUS_OKAY(ADC1_NODE)
 #define ADC2_ENABLE		DT_NODE_HAS_STATUS_OKAY(ADC2_NODE)
 
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+static bool adc_reset_done;
+#endif
+
 #ifndef	ADC0
 /**
  * @brief The name of gd32 ADC HAL are different between single and multi ADC SoCs.
@@ -520,7 +524,14 @@ static int adc_gd32_init(const struct device *dev)
 	(void)clock_control_on(GD32_CLOCK_CONTROLLER,
 			       (clock_control_subsys_t)&cfg->clkid);
 
+#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+	if (!adc_reset_done) {
+		(void)reset_line_toggle_dt(&cfg->reset);
+		adc_reset_done = true;
+	}
+#else
 	(void)reset_line_toggle_dt(&cfg->reset);
+#endif
 
 #if defined(CONFIG_SOC_SERIES_GD32F403) || \
 	defined(CONFIG_SOC_SERIES_GD32VF103) || \
