@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
-#include <nxp/kinetis/MK66FN2M0VMD18-pinctrl.h>
+#include <nxp/kinetis/k6x/pinctrl/MK66FN2M0VMD18-pinctrl.h>
 
 &pinctrl {
 	i2c0_default: i2c0_default {
