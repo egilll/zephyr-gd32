@@ -254,11 +254,8 @@
 				 <&cctl GD32_CLOCK_ENETRX>,
 				 <&cctl GD32_CLOCK_ENETPTP>;
 			clock-names = "mac", "tx", "rx", "ptp";
-			resets = <&rctl GD32_RESET_ENET>,
-				 <&rctl GD32_RESET_ENETTX>,
-				 <&rctl GD32_RESET_ENETRX>,
-				 <&rctl GD32_RESET_ENETPTP>;
-			reset-names = "mac", "tx", "rx", "ptp";
+			resets = <&rctl GD32_RESET_ENET>;
+			reset-names = "mac";
 			phy-connection-type = "rmii";
 			status = "disabled";
 
@@ -341,7 +338,7 @@
 			reg = <0x40012000 0x100>;
 			interrupts = <18 0>;
 			clocks = <&cctl GD32_CLOCK_ADC0>;
-			resets = <&rctl GD32_RESET_ADC0>;
+			resets = <&rctl GD32_RESET_ADC>;
 			channels = <16>;
 			status = "disabled";
 			#io-channel-cells = <1>;
@@ -352,7 +349,7 @@
 			reg = <0x40012100 0x100>;
 			interrupts = <18 0>;
 			clocks = <&cctl GD32_CLOCK_ADC1>;
-			resets = <&rctl GD32_RESET_ADC1>;
+			resets = <&rctl GD32_RESET_ADC>;
 			channels = <16>;
 			status = "disabled";
 			#io-channel-cells = <1>;
@@ -363,7 +360,7 @@
 			reg = <0x40012200 0x100>;
 			interrupts = <18 0>;
 			clocks = <&cctl GD32_CLOCK_ADC2>;
-			resets = <&rctl GD32_RESET_ADC2>;
+			resets = <&rctl GD32_RESET_ADC>;
 			channels = <16>;
 			status = "disabled";
 			#io-channel-cells = <1>;
