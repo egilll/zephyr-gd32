@@ -6,3 +6,12 @@ tests:
     tags:
       - net
       - hostname
+  net.hostname.disabled.no_networking:
+    build_only: true
+    extra_args:
+      - CONF_FILE=prj_no_networking.conf
+    platform_allow:
+      - qemu_cortex_m3
+    tags:
+      - net
+      - hostname

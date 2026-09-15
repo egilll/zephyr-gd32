@@ -29,8 +29,10 @@ extern "C" {
  * @{
  */
 
-#if !defined(CONFIG_NET_HOSTNAME_ENABLE)
+#if !defined(CONFIG_NET_HOSTNAME_ENABLE) && defined(CONFIG_NET_HOSTNAME_MAX_LEN)
 #define NET_HOSTNAME_MAX_LEN CONFIG_NET_HOSTNAME_MAX_LEN
+#elif !defined(CONFIG_NET_HOSTNAME_ENABLE)
+#define NET_HOSTNAME_MAX_LEN (sizeof("zephyr") - 1)
 #elif defined(CONFIG_NET_HOSTNAME_MAX_LEN)
 #define NET_HOSTNAME_MAX_LEN                                                                       \
 	MAX(CONFIG_NET_HOSTNAME_MAX_LEN,                                                           \
