@@ -44,9 +44,10 @@
  *
  * Packs an RCU register offset and a bit position into one 32-bit reset cell value.
  *
- * Bits [5:0]: bit position
- * Bits [14:6]: RCU register offset
- * Bit 15: reserved
+ * Bits [4:0]: bit position
+ * Bit 5: reserved
+ * Bits [13:6]: RCU register offset
+ * Bits [31:14]: reserved
  *
  * @param reg RCU register name (expands to GD32_{reg}_OFFSET)
  * @param bit Bit position of the peripheral's reset line within that register
