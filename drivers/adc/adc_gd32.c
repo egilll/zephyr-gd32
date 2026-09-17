@@ -146,7 +146,40 @@ struct adc_gd32_data {
 	const struct device *dev;
 	uint16_t *buffer;
 	uint16_t *repeat_buffer;
+	bool reset_done;
 };
+
+#define ADC_GD32_DEVICE(n) DEVICE_DT_INST_GET(n),
+
+static const struct device *const adc_gd32_devices[] = {
+	DT_INST_FOREACH_STATUS_OKAY(ADC_GD32_DEVICE)};
+
+static int adc_gd32_reset_once(const struct device *dev)
+{
+	const struct adc_gd32_config *cfg = dev->config;
+	struct adc_gd32_data *data = dev->data;
+	int ret;
+
+	/*
+	 * ADC device initialization is serialized, so initialized peers record each reset domain.
+	 */
+	for (size_t i = 0; i < ARRAY_SIZE(adc_gd32_devices); i++) {
+		const struct adc_gd32_config *peer_cfg = adc_gd32_devices[i]->config;
+		const struct adc_gd32_data *peer_data = adc_gd32_devices[i]->data;
+
+		if (peer_data->reset_done && peer_cfg->reset.dev == cfg->reset.dev &&
+		    peer_cfg->reset.id == cfg->reset.id) {
+			return 0;
+		}
+	}
+
+	ret = reset_line_toggle_dt(&cfg->reset);
+	if (ret == 0) {
+		data->reset_done = true;
+	}
+
+	return ret;
+}
 
 static void adc_gd32_isr(const struct device *dev)
 {
@@ -385,7 +418,10 @@ static int adc_gd32_init(const struct device *dev)
 	(void)clock_control_on(GD32_CLOCK_CONTROLLER,
 			       (clock_control_subsys_t)&cfg->clkid);
 
-	(void)reset_line_toggle_dt(&cfg->reset);
+	ret = adc_gd32_reset_once(dev);
+	if (ret < 0) {
+		return ret;
+	}
 
 #if defined(CONFIG_SOC_SERIES_GD32F403) || \
 	defined(CONFIG_SOC_SERIES_GD32VF103) || \
