@@ -35,6 +35,7 @@
  */
 
 #define GD32_AHB1RST_OFFSET       0x28U
+#define GD32_AHB2RST_OFFSET       0x38U
 #define GD32_APB1RST_OFFSET       0x10U
 #define GD32_APB2RST_OFFSET       0x0CU
 
