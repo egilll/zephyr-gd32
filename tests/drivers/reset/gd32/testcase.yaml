@@ -1,0 +1,13 @@
+# Copyright (c) 2026, Ylhyra ehf.
+# SPDX-License-Identifier: Apache-2.0
+
+tests:
+  drivers.reset.gd32:
+    platform_allow:
+      - native_sim/native/64
+  drivers.reset.gd32.smp:
+    platform_allow:
+      - qemu_x86_64
+    extra_configs:
+      - CONFIG_SPIN_VALIDATE=y
+      - CONFIG_SCHED_CPU_MASK=y

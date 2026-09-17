@@ -1,0 +1,17 @@
+/*
+ * Copyright (c) 2026, Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	test_rcu: reset-clock-controller@1000 {
+		compatible = "gd,gd32-rcu";
+		reg = <0x1000 0x80>;
+
+		rctl: reset-controller {
+			compatible = "gd,gd32-rctl";
+			#reset-cells = <1>;
+			status = "okay";
+		};
+	};
+};
