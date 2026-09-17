@@ -12,6 +12,7 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/reset.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 
 #define GD32_RESET_BIT_MASK     0x1FU
@@ -28,6 +29,8 @@
 struct reset_gd32_config {
 	uintptr_t base;
 };
+
+static struct k_spinlock reset_lock;
 
 BUILD_ASSERT(DT_REG_SIZE(DT_INST_PARENT(0)) >= sizeof(uint32_t));
 
@@ -62,9 +65,13 @@ static int reset_gd32_status(const struct device *dev, uint32_t id,
 	return 0;
 }
 
-static int reset_gd32_line_assert(const struct device *dev, uint32_t id)
+static int reset_gd32_update(const struct device *dev, uint32_t id, bool asserted, bool pulse)
 {
 	const struct reset_gd32_config *config = dev->config;
+	uintptr_t reg;
+	uint32_t mask;
+	uint32_t value;
+	k_spinlock_key_t key;
 	int err;
 
 	err = reset_gd32_validate_id(id);
@@ -72,38 +79,35 @@ static int reset_gd32_line_assert(const struct device *dev, uint32_t id)
 		return err;
 	}
 
-	sys_set_bit(config->base + GD32_RESET_ID_OFFSET(id),
-		    GD32_RESET_ID_BIT(id));
+	reg = config->base + GD32_RESET_ID_OFFSET(id);
+	mask = BIT(GD32_RESET_ID_BIT(id));
+	key = k_spin_lock(&reset_lock);
+	value = sys_read32(reg);
+
+	sys_write32(asserted ? value | mask : value & ~mask, reg);
+	if (pulse) {
+		/* Read back assertion before releasing reset on the peripheral bus. */
+		value = sys_read32(reg);
+		sys_write32(value & ~mask, reg);
+	}
+	k_spin_unlock(&reset_lock, key);
 
 	return 0;
+}
+
+static int reset_gd32_line_assert(const struct device *dev, uint32_t id)
+{
+	return reset_gd32_update(dev, id, true, false);
 }
 
 static int reset_gd32_line_deassert(const struct device *dev, uint32_t id)
 {
-	const struct reset_gd32_config *config = dev->config;
-	int err;
-
-	err = reset_gd32_validate_id(id);
-	if (err != 0) {
-		return err;
-	}
-
-	sys_clear_bit(config->base + GD32_RESET_ID_OFFSET(id),
-		      GD32_RESET_ID_BIT(id));
-
-	return 0;
+	return reset_gd32_update(dev, id, false, false);
 }
 
 static int reset_gd32_line_toggle(const struct device *dev, uint32_t id)
 {
-	int err;
-
-	err = reset_gd32_line_assert(dev, id);
-	if (err != 0) {
-		return err;
-	}
-
-	return reset_gd32_line_deassert(dev, id);
+	return reset_gd32_update(dev, id, true, true);
 }
 
 static DEVICE_API(reset, reset_gd32_driver_api) = {
