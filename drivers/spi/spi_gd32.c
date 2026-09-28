@@ -190,7 +190,15 @@ static inline bool spi_gd32_transfer_done(const struct spi_gd32_data *data)
 
 static inline bool spi_gd32_can_write_frame(const struct spi_gd32_data *data)
 {
-	return data->frames_left != 0U && data->rx_pending < SPI_GD32_INFLIGHT_MAX;
+	/* A polling controller cannot guarantee reading RX within one frame
+	 * time, so it keeps a single frame in flight to avoid RX overruns.
+	 */
+	const uint32_t inflight_max =
+		(data->xfer_mode == SPI_GD32_XFER_POLLING && !spi_gd32_is_slave(data))
+			? 1U
+			: SPI_GD32_INFLIGHT_MAX;
+
+	return data->frames_left != 0U && data->rx_pending < inflight_max;
 }
 
 static inline bool spi_gd32_keep_enabled(const struct spi_gd32_data *data)
