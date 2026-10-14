@@ -3949,6 +3949,8 @@ int net_tcp_queue(struct net_context *context, const void *data, size_t len,
 		return -ENOTCONN;
 	}
 
+	tcp_check_sock_options(conn);
+
 	k_mutex_lock(&conn->lock, K_FOREVER);
 
 	/* If there is no space to transmit, try at a later time.
