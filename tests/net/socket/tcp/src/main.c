@@ -2077,6 +2077,55 @@ ZTEST(net_socket_tcp, test_so_sndbuf_win_size)
 	test_context_cleanup();
 }
 
+ZTEST(net_socket_tcp, test_so_sndbuf_win_size_after_accept)
+{
+	int rv;
+	int c_sock;
+	int s_sock;
+	int new_sock;
+	struct net_sockaddr_in c_saddr;
+	struct net_sockaddr_in s_saddr;
+	struct net_sockaddr addr;
+	net_socklen_t addrlen = sizeof(addr);
+	char tx_buf[] = TEST_STR_SMALL;
+	int buf_optval = sizeof(TEST_STR_SMALL);
+
+	prepare_sock_tcp_v4(MY_IPV4_ADDR, ANY_PORT, &c_sock, &c_saddr);
+	prepare_sock_tcp_v4(MY_IPV4_ADDR, SERVER_PORT, &s_sock, &s_saddr);
+
+	test_bind(s_sock, (struct net_sockaddr *)&s_saddr, sizeof(s_saddr));
+	test_listen(s_sock);
+
+	test_connect(c_sock, (struct net_sockaddr *)&s_saddr, sizeof(s_saddr));
+
+	test_accept(s_sock, &new_sock, &addr, &addrlen);
+	zassert_equal(addrlen, sizeof(struct net_sockaddr_in), "wrong addrlen");
+
+	/* Lower the TX window of the established connection. */
+	rv = zsock_setsockopt(new_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_SNDBUF, &buf_optval,
+			      sizeof(buf_optval));
+	zassert_equal(rv, 0, "setsockopt failed (%d)", errno);
+
+	/* No segment arrives from the peer after the option is set. */
+	loopback_set_packet_drop_ratio(1.0f);
+
+	rv = zsock_send(new_sock, tx_buf, sizeof(tx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(rv, sizeof(tx_buf), "Unexpected return code %d", rv);
+
+	/* Server should not be able to send now (TX window full). */
+	rv = zsock_send(new_sock, tx_buf, 1, ZSOCK_MSG_DONTWAIT);
+	zassert_equal(rv, -1, "Unexpected return code %d", rv);
+	zassert_equal(errno, EAGAIN, "Unexpected errno value: %d", errno);
+
+	restore_packet_loss_ratio();
+
+	test_close(c_sock);
+	test_close(new_sock);
+	test_close(s_sock);
+
+	test_context_cleanup();
+}
+
 ZTEST(net_socket_tcp, test_v4_so_rcvtimeo)
 {
 	int c_sock;
