@@ -645,7 +645,10 @@ config NET_CONTEXT_LINGER
 	help
 	  Allow setting the SO_LINGER option on a TCP socket. When linger is
 	  enabled with a zero timeout, closing the socket aborts the connection
-	  by sending a RST segment instead of performing a graceful FIN close.
+	  instead of performing a graceful FIN close, whatever state the peer
+	  has moved it to: queued data is discarded and its buffers are freed
+	  before close() returns, and a RST segment is sent where RFC 9293
+	  ABORT requires one.
 	  When linger is enabled with a non-zero timeout, close() blocks until
 	  the connection has been closed by the stack or the timeout (in
 	  seconds) expires, in which case the connection is aborted with a RST.

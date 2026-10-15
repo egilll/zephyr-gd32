@@ -1017,6 +1017,79 @@ static int tcp_conn_close(struct tcp *conn, int status)
 	return tcp_conn_unref(conn);
 }
 
+/* Close a connection from a timer unless the application or the peer
+ * already closed it: a timer that fired just before an abortive close was
+ * cancelled must not drop the stack's reference a second time.
+ */
+static void tcp_conn_close_if_open(struct tcp *conn, int status)
+{
+	k_mutex_lock(&conn->lock, K_FOREVER);
+
+	if (conn->state != TCP_CLOSED && conn->state != TCP_UNUSED) {
+		(void)tcp_conn_close(conn, status);
+	}
+
+	k_mutex_unlock(&conn->lock);
+}
+
+/* Free everything queued for transmission. Called with conn->lock held on a
+ * connection that can no longer send, so that close() returns the buffers
+ * to the pool instead of leaving them to tcp_conn_release().
+ */
+static void tcp_discard_send_data(struct tcp *conn)
+{
+	tcp_send_queue_flush(conn);
+
+	if (conn->send_data.frags != NULL) {
+		net_pkt_frag_unref(conn->send_data.frags);
+		conn->send_data.frags = NULL;
+		net_pkt_cursor_init(&conn->send_data);
+	}
+
+	conn->send_data_total = 0;
+	conn->unacked_len = 0;
+}
+
+/* An abortive close resets the peer where RFC 9293 ABORT does: in every
+ * synchronized state, and in CLOSING or LAST-ACK only while data is still
+ * outstanding. TIME-WAIT has nothing left to reset.
+ */
+static bool tcp_abort_sends_rst(struct tcp *conn)
+{
+	switch (conn->state) {
+	case TCP_SYN_RECEIVED:
+	case TCP_ESTABLISHED:
+	case TCP_CLOSE_WAIT:
+	case TCP_FIN_WAIT_1:
+	case TCP_FIN_WAIT_2:
+		return true;
+	case TCP_CLOSING:
+	case TCP_LAST_ACK:
+		return conn->send_data_total > 0;
+	default:
+		return false;
+	}
+}
+
+#if defined(CONFIG_NET_CONTEXT_LINGER)
+static bool tcp_can_abort(struct tcp *conn)
+{
+	switch (conn->state) {
+	case TCP_SYN_RECEIVED:
+	case TCP_ESTABLISHED:
+	case TCP_CLOSE_WAIT:
+	case TCP_FIN_WAIT_1:
+	case TCP_FIN_WAIT_2:
+	case TCP_CLOSING:
+	case TCP_LAST_ACK:
+	case TCP_TIME_WAIT:
+		return true;
+	default:
+		return false;
+	}
+}
+#endif /* CONFIG_NET_CONTEXT_LINGER */
+
 static void tcp_send_process_no_lock(struct tcp *conn)
 {
 	struct net_pkt *pkt;
@@ -2066,10 +2139,9 @@ static void tcp_timewait_timeout(struct k_work *work)
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
 	struct tcp *conn = CONTAINER_OF(dwork, struct tcp, timewait_timer);
 
-	/* no need to acquire the conn->lock as there is nothing scheduled here */
 	NET_DBG("[%p] %s", conn, tcp_conn_state(conn, NULL, NULL));
 
-	(void)tcp_conn_close(conn, -ETIMEDOUT);
+	tcp_conn_close_if_open(conn, -ETIMEDOUT);
 }
 
 static void tcp_establish_timeout(struct tcp *conn)
@@ -2085,7 +2157,6 @@ static void tcp_fin_timeout(struct k_work *work)
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
 	struct tcp *conn = CONTAINER_OF(dwork, struct tcp, fin_timer);
 
-	/* no need to acquire the conn->lock as there is nothing scheduled here */
 	if (conn->state == TCP_SYN_RECEIVED) {
 		tcp_establish_timeout(conn);
 		return;
@@ -2094,7 +2165,7 @@ static void tcp_fin_timeout(struct k_work *work)
 	NET_DBG("[%p] Did not receive %s in %dms", conn, "FIN", tcp_max_timeout_ms);
 	NET_DBG("[%p] %s", conn, tcp_conn_state(conn, NULL, NULL));
 
-	(void)tcp_conn_close(conn, -ETIMEDOUT);
+	tcp_conn_close_if_open(conn, -ETIMEDOUT);
 }
 
 #if defined(CONFIG_NET_CONTEXT_LINGER)
@@ -2127,7 +2198,7 @@ static void tcp_last_ack_timeout(struct k_work *work)
 	NET_DBG("[%p] Did not receive %s in %dms", conn, "last ACK", LAST_ACK_TIMEOUT_MS);
 	NET_DBG("[%p] %s", conn, tcp_conn_state(conn, NULL, NULL));
 
-	(void)tcp_conn_close(conn, -ETIMEDOUT);
+	tcp_conn_close_if_open(conn, -ETIMEDOUT);
 }
 
 static void tcp_setup_last_ack_timer(struct tcp *conn)
@@ -3811,32 +3882,42 @@ int net_tcp_put(struct net_context *context, bool force_close)
 	}
 
 #if defined(CONFIG_NET_CONTEXT_LINGER)
-	/* SO_LINGER with a zero timeout requests an abortive close: send a RST
-	 * to the peer and tear down the connection immediately, instead of
-	 * performing a graceful FIN handshake.
+	/* SO_LINGER with a zero timeout requests an abortive close: discard
+	 * any queued data, reset the peer and tear down the connection
+	 * immediately, in whatever state the peer has moved it to.
 	 */
 	linger_abort = context->options.linger.l_onoff != 0 &&
 		       context->options.linger.l_linger == 0 &&
-		       (conn->state == TCP_ESTABLISHED ||
-			conn->state == TCP_SYN_RECEIVED ||
-			conn->state == TCP_CLOSE_WAIT);
+		       tcp_can_abort(conn);
 #endif /* CONFIG_NET_CONTEXT_LINGER */
 
 	if (linger_abort) {
 		NET_DBG("[%p] Aborting connection (SO_LINGER)", conn);
 
 		k_work_cancel_delayable(&conn->send_data_timer);
+		k_work_cancel_delayable(&conn->persist_timer);
+		k_work_cancel_delayable(&conn->fin_timer);
+		k_work_cancel_delayable(&conn->timewait_timer);
 		keep_alive_timer_stop(conn);
 
-		tcp_out(conn, RST);
+		if (tcp_abort_sends_rst(conn)) {
+			tcp_out(conn, RST);
+		}
 
-		/* An established connection holds two references. Like the
-		 * graceful close path below, this falls through to the common
-		 * tcp_conn_unref() at the end: tcp_conn_close() drops one
-		 * reference and the common epilogue drops the other, fully
-		 * releasing the (immediately closed) connection.
+		/* A connection the application has not closed yet holds two
+		 * references. Like the graceful close path below, this falls
+		 * through to the common tcp_conn_unref() at the end:
+		 * tcp_conn_close() drops one reference and the common epilogue
+		 * drops the other, fully releasing the (immediately closed)
+		 * connection.
 		 */
 		tcp_conn_close(conn, -ECONNRESET);
+		tcp_discard_send_data(conn);
+	} else if (conn->state == TCP_CLOSED) {
+		/* The stack already closed the connection: nothing queued can
+		 * be sent any more.
+		 */
+		tcp_discard_send_data(conn);
 	} else if (conn->state == TCP_ESTABLISHED ||
 		   conn->state == TCP_SYN_RECEIVED) {
 #if defined(CONFIG_NET_CONTEXT_LINGER)
