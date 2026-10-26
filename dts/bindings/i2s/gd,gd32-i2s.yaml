@@ -36,3 +36,12 @@ properties:
   mck-enabled:
     type: boolean
     description: Enable master clock (MCK) output when in master mode.
+
+  ws-gpios:
+    type: phandle-array
+    description: |
+      The WS (frame clock) pin, read as a GPIO while the I2S is a target. A
+      target must be enabled before its master starts a frame; with this
+      property it arms in the half frame before the next frame starts, so it
+      can start while the master is already clocking. The pin stays muxed to
+      the I2S.

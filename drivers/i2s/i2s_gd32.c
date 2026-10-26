@@ -15,6 +15,7 @@
 #include <zephyr/drivers/clock_control/gd32.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_gd32.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
@@ -53,6 +54,7 @@ struct i2s_gd32_config {
 	void (*irq_configure)(const struct device *dev);
 	struct i2s_gd32_dma dma_rx;
 	struct i2s_gd32_dma dma_tx;
+	struct gpio_dt_spec ws_gpio;
 };
 
 struct stream {
@@ -888,6 +890,58 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	}
 }
 
+/*
+ * A target has to be enabled before its master starts a frame (GD32F4xx user manual, I2S slave
+ * transmission and reception sequences). Enabled part way through a frame it raises a frame
+ * error or swaps the channels. With ws-gpios the target arms in step with a master that is
+ * already clocking: Philips frames start as WS falls, so it arms while WS is high; justified and
+ * PCM frames start as WS rises, so it arms while WS is low. Waiting for the other level first
+ * catches the start of a half frame, which leaves the whole half for the enable.
+ */
+static bool gd32_i2s_arms_on_ws(const struct stream *stream)
+{
+	const struct i2s_gd32_config *cfg = stream->dev->config;
+
+	return !stream->master && cfg->ws_gpio.port != NULL;
+}
+
+static bool gd32_i2s_wait_ws(const struct gpio_dt_spec *ws, int level, uint32_t deadline)
+{
+	gpio_port_value_t value;
+
+	while ((int32_t)(deadline - k_cycle_get_32()) > 0) {
+		if (gpio_port_get_raw(ws->port, &value) == 0 &&
+		    (int)((value >> ws->pin) & 1U) == level) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Enables `first` and `second` (or 0) in the half frame before the next frame starts. Without
+ * WS edges within a few frames the master is not clocking yet, which is what the target needs,
+ * so it enables them at once.
+ */
+static void gd32_i2s_enable_on_ws(const struct stream *stream, uint32_t first, uint32_t second)
+{
+	const struct i2s_gd32_config *cfg = stream->dev->config;
+	const uint32_t format = stream->cfg.format & I2S_FMT_DATA_FORMAT_MASK;
+	const int arm_level = format == I2S_FMT_DATA_FORMAT_I2S ? 1 : 0;
+	const uint32_t frames = MAX(stream->cfg.frame_clk_freq, 1U);
+	const uint32_t window = 4U * (sys_clock_hw_cycles_per_sec() / frames);
+	unsigned int key = irq_lock();
+	const uint32_t deadline = k_cycle_get_32() + window;
+
+	if (gd32_i2s_wait_ws(&cfg->ws_gpio, !arm_level, deadline)) {
+		(void)gd32_i2s_wait_ws(&cfg->ws_gpio, arm_level, deadline);
+	}
+	i2s_enable(first);
+	if (second != 0U) {
+		i2s_enable(second);
+	}
+	irq_unlock(key);
+}
+
 static int gd32_i2s_stream_start(struct stream *stream)
 {
 	const struct i2s_gd32_config *cfg = stream->dev->config;
@@ -963,7 +1017,9 @@ static int gd32_i2s_stream_start(struct stream *stream)
 		gd32_i2s_rx_errors_clear(rx_reg);
 		SPI_CTL1(rx_reg) |= SPI_CTL1_ERRIE;
 		spi_dma_enable(rx_reg, SPI_DMA_RECEIVE);
-		i2s_enable(rx_reg);
+		if (!gd32_i2s_arms_on_ws(stream)) {
+			i2s_enable(rx_reg);
+		}
 
 		LOG_DBG("%s rx stream started", stream->dev->name);
 		return 0;
@@ -1023,7 +1079,9 @@ static int gd32_i2s_stream_start(struct stream *stream)
 	gd32_i2s_tx_errors_clear(cfg->reg);
 	SPI_CTL1(cfg->reg) |= SPI_CTL1_ERRIE;
 	spi_dma_enable(cfg->reg, SPI_DMA_TRANSMIT);
-	i2s_enable(cfg->reg);
+	if (!gd32_i2s_arms_on_ws(stream)) {
+		i2s_enable(cfg->reg);
+	}
 	LOG_DBG("%s tx stream started", stream->dev->name);
 	return 0;
 }
@@ -1361,6 +1419,10 @@ static int i2s_gd32_trigger(const struct device *dev, enum i2s_dir dir, enum i2s
 				return ret;
 			}
 
+			if (gd32_i2s_arms_on_ws(&data->tx)) {
+				gd32_i2s_enable_on_ws(&data->tx, gd32_i2s_rx_reg(dev), cfg->reg);
+			}
+
 			key = irq_lock();
 			if (!data->rx.starting || !data->tx.starting ||
 			    data->rx.state != I2S_STATE_READY ||
@@ -1488,6 +1550,10 @@ duplex_prepare_failed:
 			stream->starting = false;
 			irq_unlock(key);
 			return ret;
+		}
+		if (gd32_i2s_arms_on_ws(stream)) {
+			gd32_i2s_enable_on_ws(stream,
+					      dir == I2S_DIR_TX ? cfg->reg : gd32_i2s_rx_reg(dev), 0U);
 		}
 
 		key = irq_lock();
@@ -1798,6 +1864,7 @@ static int i2s_gd32_init(const struct device *dev)
 		.clkid = DT_INST_CLOCKS_CELL(inst, id),                                            \
 		.reset = RESET_DT_SPEC_INST_GET(inst),                                             \
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),                                      \
+		.ws_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, ws_gpios, {0}),                          \
 		.mck_enabled = DT_INST_PROP_OR(inst, mck_enabled, 0),                              \
 		.irq_configure = i2s_gd32_irq_configure_##inst,                                    \
 		.dma_rx = DMA_INITIALIZER(inst, rx),                                               \
