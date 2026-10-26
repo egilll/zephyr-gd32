@@ -189,15 +189,20 @@ static uint32_t gd32_i2s_frame_bytes(const struct i2s_config *cfg)
 	return 2U * gd32_i2s_word_bytes(cfg);
 }
 
-static void gd32_i2s_rx_errors_clear(uint32_t reg)
+/*
+ * Empties the receive buffer and clears its errors. A word received just before the last stop
+ * stays in SPI_DATA; the DMA would read it first, and every frame of the new stream would then
+ * pair one frame's right channel with the next frame's left.
+ */
+static void gd32_i2s_rx_flush(uint32_t reg)
 {
 	volatile uint32_t clear_read;
 
-	if ((SPI_STAT(reg) & SPI_STAT_RXORERR) != 0U) {
+	while ((SPI_STAT(reg) & SPI_STAT_RBNE) != 0U) {
 		clear_read = SPI_DATA(reg);
-		clear_read = SPI_STAT(reg);
-		(void)clear_read;
 	}
+	clear_read = SPI_STAT(reg);
+	(void)clear_read;
 	SPI_STAT(reg) &= ~SPI_STAT_FERR;
 }
 
@@ -1022,7 +1027,7 @@ static int gd32_i2s_stream_start(struct stream *stream)
 			return ret;
 		}
 
-		gd32_i2s_rx_errors_clear(rx_reg);
+		gd32_i2s_rx_flush(rx_reg);
 		SPI_CTL1(rx_reg) |= SPI_CTL1_ERRIE;
 		spi_dma_enable(rx_reg, SPI_DMA_RECEIVE);
 		if (!gd32_i2s_arms_on_ws(stream)) {
