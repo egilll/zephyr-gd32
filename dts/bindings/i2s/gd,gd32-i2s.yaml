@@ -44,4 +44,4 @@ properties:
       target must be enabled before its master starts a frame; with this
       property it arms in the half frame before the next frame starts, so it
       can start while the master is already clocking. The pin stays muxed to
-      the I2S.
+      the I2S. Philips and justified formats only; PCM targets enable at once.

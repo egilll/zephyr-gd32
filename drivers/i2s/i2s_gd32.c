@@ -893,16 +893,19 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 /*
  * A target has to be enabled before its master starts a frame (GD32F4xx user manual, I2S slave
  * transmission and reception sequences). Enabled part way through a frame it raises a frame
- * error or swaps the channels. With ws-gpios the target arms in step with a master that is
- * already clocking: Philips frames start as WS falls, so it arms while WS is high; justified and
- * PCM frames start as WS rises, so it arms while WS is low. Waiting for the other level first
- * catches the start of a half frame, which leaves the whole half for the enable.
+ * error. With ws-gpios the target arms in step with a master that is already clocking: Philips
+ * frames start as WS falls, so it arms while WS is high; justified frames start as WS rises, so
+ * it arms while WS is low. Waiting for the other level first catches the start of a half frame,
+ * which leaves the whole half for the enable. PCM's WS is a pulse too short to poll for, so PCM
+ * targets enable at once.
  */
 static bool gd32_i2s_arms_on_ws(const struct stream *stream)
 {
 	const struct i2s_gd32_config *cfg = stream->dev->config;
+	const uint32_t format = stream->cfg.format & I2S_FMT_DATA_FORMAT_MASK;
 
-	return !stream->master && cfg->ws_gpio.port != NULL;
+	return !stream->master && cfg->ws_gpio.port != NULL &&
+	       format != I2S_FMT_DATA_FORMAT_PCM_SHORT && format != I2S_FMT_DATA_FORMAT_PCM_LONG;
 }
 
 static bool gd32_i2s_wait_ws(const struct gpio_dt_spec *ws, int level, uint32_t deadline)
@@ -919,8 +922,8 @@ static bool gd32_i2s_wait_ws(const struct gpio_dt_spec *ws, int level, uint32_t 
 }
 
 /* Enables `first` and `second` (or 0) in the half frame before the next frame starts. Without
- * WS edges within a few frames the master is not clocking yet, which is what the target needs,
- * so it enables them at once.
+ * WS edges within two frames the master is not clocking yet, the case the manual describes, so it
+ * enables them at once. With the master clocking, interrupts stay locked for at most a frame.
  */
 static void gd32_i2s_enable_on_ws(const struct stream *stream, uint32_t first, uint32_t second)
 {
@@ -928,7 +931,7 @@ static void gd32_i2s_enable_on_ws(const struct stream *stream, uint32_t first, u
 	const uint32_t format = stream->cfg.format & I2S_FMT_DATA_FORMAT_MASK;
 	const int arm_level = format == I2S_FMT_DATA_FORMAT_I2S ? 1 : 0;
 	const uint32_t frames = MAX(stream->cfg.frame_clk_freq, 1U);
-	const uint32_t window = 4U * (sys_clock_hw_cycles_per_sec() / frames);
+	const uint32_t window = 2U * (sys_clock_hw_cycles_per_sec() / frames);
 	unsigned int key = irq_lock();
 	const uint32_t deadline = k_cycle_get_32() + window;
 
@@ -1783,6 +1786,10 @@ static int i2s_gd32_init(const struct device *dev)
 	}
 
 	if (!device_is_ready(cfg->dma_tx.dev) || !device_is_ready(cfg->dma_rx.dev)) {
+		return -ENODEV;
+	}
+
+	if (cfg->ws_gpio.port != NULL && !gpio_is_ready_dt(&cfg->ws_gpio)) {
 		return -ENODEV;
 	}
 
