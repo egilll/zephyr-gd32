@@ -1120,7 +1120,10 @@ static void dma_gd32_isr(const struct device *dev)
 		uint32_t fifo_flag =
 			gd32_dma_interrupt_flag_get(cfg->reg, i, GD32_DMA_FLAG_FIFO_EVENT);
 		uint32_t ftfflag = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_FTF);
-		uint32_t htfflag = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_HTF);
+		/* HTFIF is set whether or not it is enabled; report it only where asked for. */
+		uint32_t htfflag = (GD32_DMA_CHCTL(cfg->reg, i) & DMA_CHXCTL_HTFIE) != 0U
+					   ? gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_HTF)
+					   : 0U;
 		bool channel_enabled = dma_gd32_channel_enabled(cfg, i);
 		uint32_t remaining = gd32_dma_transfer_number_get(cfg->reg, i);
 
