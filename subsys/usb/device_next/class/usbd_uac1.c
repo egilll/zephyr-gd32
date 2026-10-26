@@ -125,6 +125,11 @@ struct uac1_cfg {
 
 	const struct uac1_fu_cfg *fu_cfg;
 	struct uac1_stream_runtime *streams;
+	struct usbd_desc_node *const name_desc;
+	uint8_t *const fs_iad;
+	uint8_t *const hs_iad;
+	uint8_t *const fs_ac;
+	uint8_t *const hs_ac;
 	uint8_t status_ep;
 	uint8_t num_ifaces;
 	uint8_t num_fu;
@@ -1377,14 +1382,46 @@ static void uac1_disable(struct usbd_class_data *const c_data)
 	uac1_notify_selected(c_data, selected, UAC1_STREAM_DISABLED);
 }
 
+/* Offsets of iFunction in the Interface Association descriptor and of
+ * iInterface in the Standard AC Interface descriptor.
+ */
+#define UAC1_IAD_IFUNCTION_OFFSET	7
+#define UAC1_AC_IINTERFACE_OFFSET	8
+
+static void uac1_set_name_index(const struct uac1_cfg *cfg, uint8_t idx)
+{
+	uint8_t *const iads[] = {cfg->fs_iad, cfg->hs_iad};
+	uint8_t *const acs[] = {cfg->fs_ac, cfg->hs_ac};
+
+	for (size_t i = 0; i < ARRAY_SIZE(iads); i++) {
+		if (iads[i] != NULL) {
+			iads[i][UAC1_IAD_IFUNCTION_OFFSET] = idx;
+		}
+		if (acs[i] != NULL) {
+			acs[i][UAC1_AC_IINTERFACE_OFFSET] = idx;
+		}
+	}
+}
+
 static int uac1_init(struct usbd_class_data *const c_data)
 {
+	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
 	const struct device *dev = usbd_class_get_private(c_data);
+	const struct uac1_cfg *cfg = dev->config;
 	struct uac1_ctx *ctx = dev->data;
 
 	if (ctx->ops == NULL) {
 		LOG_ERR("Application did not register UAC1 ops");
 		return -EINVAL;
+	}
+
+	if (cfg->name_desc != NULL) {
+		if (!usbd_str_desc_get_idx(cfg->name_desc) &&
+		    usbd_add_descriptor(uds_ctx, cfg->name_desc)) {
+			LOG_ERR("Failed to add function name string descriptor");
+		} else {
+			uac1_set_name_index(cfg, usbd_str_desc_get_idx(cfg->name_desc));
+		}
 	}
 
 	return 0;
@@ -1557,6 +1594,9 @@ static struct usbd_class_api uac1_api = {
 #define COUNT_FU(node)								\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uac1_feature_unit), (+ 1))
 
+/* Expands the node before DESCRIPTOR_NAME pastes it into a name. */
+#define UAC1_INSTANCE_DESCRIPTOR(prefix, node) DESCRIPTOR_NAME(prefix, node)
+
 #define DEFINE_UAC1_CLASS_DATA(inst)						\
 	BUILD_ASSERT(UAC1_ALLOWED_AT_FULL_SPEED(DT_DRV_INST(inst)) ||		\
 		     UAC1_ALLOWED_AT_HIGH_SPEED(DT_DRV_INST(inst)),		\
@@ -1612,8 +1652,23 @@ static struct usbd_class_api uac1_api = {
 	};									\
 	USBD_DEFINE_CLASS(uac1_##inst, &uac1_api,				\
 			  (void *)DEVICE_DT_GET(DT_DRV_INST(inst)), NULL);	\
+	IF_ENABLED(DT_INST_NODE_HAS_PROP(inst, label), (			\
+	USBD_DESC_STRING_DEFINE(uac1_name_desc_##inst,				\
+				DT_INST_PROP(inst, label),			\
+				USBD_DUT_STRING_INTERFACE);			\
+	))									\
 	static const struct uac1_cfg uac1_cfg_##inst = {			\
 		.c_data = &uac1_##inst,						\
+		.name_desc = COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, label),	\
+					 (&uac1_name_desc_##inst), (NULL)),	\
+		.fs_iad = COND_CODE_1(UAC1_ALLOWED_AT_FULL_SPEED(DT_DRV_INST(inst)),\
+			(UAC1_INSTANCE_DESCRIPTOR(fs_iad, DT_DRV_INST(inst))), (NULL)),	\
+		.hs_iad = COND_CODE_1(UAC1_ALLOWED_AT_HIGH_SPEED(DT_DRV_INST(inst)),\
+			(UAC1_INSTANCE_DESCRIPTOR(hs_iad, DT_DRV_INST(inst))), (NULL)),	\
+		.fs_ac = COND_CODE_1(UAC1_ALLOWED_AT_FULL_SPEED(DT_DRV_INST(inst)),\
+			(UAC1_INSTANCE_DESCRIPTOR(fs_ac_interface, DT_DRV_INST(inst))), (NULL)),\
+		.hs_ac = COND_CODE_1(UAC1_ALLOWED_AT_HIGH_SPEED(DT_DRV_INST(inst)),\
+			(UAC1_INSTANCE_DESCRIPTOR(hs_ac_interface, DT_DRV_INST(inst))), (NULL)),\
 		COND_CODE_1(UAC1_ALLOWED_AT_FULL_SPEED(DT_DRV_INST(inst)),	\
 			(.fs_descriptors = uac1_fs_desc_##inst,			\
 			 .fs_data_ep = uac1_fs_data_ep_##inst,		\

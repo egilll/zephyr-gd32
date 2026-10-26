@@ -7,6 +7,7 @@
 		full-speed;
 		high-speed;
 		interrupt-endpoint;
+		label = "Duplex audio";
 
 		playback_input: playback_input {
 			compatible = "zephyr,uac1-input-terminal";
