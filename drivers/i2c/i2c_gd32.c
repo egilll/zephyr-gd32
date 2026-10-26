@@ -708,8 +708,11 @@ static void i2c_gd32_log_err(struct i2c_gd32_data *data)
 		LOG_ERR("Arbitration lost");
 	}
 
+	/* A device that is absent or still in reset does not acknowledge; the caller gets -EIO and
+	 * decides whether that is an error.
+	 */
 	if (data->errs & I2C_GD32_ERR_AERR) {
-		LOG_ERR("No ACK received");
+		LOG_DBG("No ACK received");
 	}
 
 	if (data->errs & I2C_GD32_ERR_OUERR) {
