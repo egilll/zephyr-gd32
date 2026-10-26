@@ -769,6 +769,11 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	ARG_UNUSED(dma_dev);
 	ARG_UNUSED(channel);
 
+	/* Only whole blocks complete a bank; a half transfer is never one. */
+	if (status > 0) {
+		return;
+	}
+
 	/* dma_stop() can leave one already-pending completion in the IRQ path. */
 	if (stream->state != I2S_STATE_RUNNING && stream->state != I2S_STATE_STOPPING &&
 	    !stream->starting) {
