@@ -413,12 +413,40 @@ static void dwmac_rx_refill_thread(void *arg1, void *unused1, void *unused2)
 	}
 }
 
+#if defined(CONFIG_NET_STATISTICS_ETHERNET)
+/*
+ * Frames the DMA flushed for want of a receive descriptor, and frames the
+ * receive FIFO dropped. Both counters clear when read, so they are read in
+ * one access and accumulated under the lock. They are sampled on every
+ * interrupt and statistics request, so a count can be lost only when more
+ * events than a counter holds happen between two samples.
+ */
+static void dwmac_count_missed_frames(const struct device *dev)
+{
+	struct dwmac_priv *p = dev->data;
+
+	K_SPINLOCK(&p->spinlock) {
+		uint32_t reg = DWMAC_REG_READ(DWMAC_DMAMFBOCR);
+
+		p->stats.error_details.rx_missed_errors += FIELD_GET(DWMAC_DMAMFBOCR_MFC, reg);
+		p->stats.error_details.rx_over_errors += FIELD_GET(DWMAC_DMAMFBOCR_MFA, reg);
+	}
+}
+#else
+static inline void dwmac_count_missed_frames(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+}
+#endif
+
 void dwmac_isr(const struct device *dev)
 {
 	uint32_t status;
 
 	status = DWMAC_REG_READ(DWMAC_DMASR);
 	DWMAC_REG_WRITE(DWMAC_DMASR, status);
+
+	dwmac_count_missed_frames(dev);
 
 	LOG_DBG("DMA status 0x%08x", status);
 
@@ -685,6 +713,8 @@ int dwmac_probe(const struct device *dev)
 static struct net_stats_eth *dwmac_stats(const struct device *dev, struct net_if *iface __unused)
 {
 	struct dwmac_priv *p = dev->data;
+
+	dwmac_count_missed_frames(dev);
 
 	return &p->stats;
 }

@@ -1435,6 +1435,7 @@ extern const struct ethernet_api dwmac_api;
 #define DWMAC_DMASR        (DWMAC_DMA_OFFSET + 0x0014)
 #define DWMAC_DMAOMR       (DWMAC_DMA_OFFSET + 0x0018)
 #define DWMAC_DMAIER       (DWMAC_DMA_OFFSET + 0x001C)
+#define DWMAC_DMAMFBOCR    (DWMAC_DMA_OFFSET + 0x0020)
 #define DWMAC_HWFR         (DWMAC_DMA_OFFSET + 0x0058)
 
 /* MAC control bits */
@@ -1467,6 +1468,10 @@ extern const struct ethernet_api dwmac_api;
 #define DWMAC_DMAOMR_RSF   BIT(25)
 #define DWMAC_DMAOMR_TTC   GENMASK(16, 14)
 #define DWMAC_DMAOMR_RTC   GENMASK(4, 3)
+
+/* DMA missed frame and buffer overflow counter bits, cleared on read */
+#define DWMAC_DMAMFBOCR_MFC GENMASK(15, 0)
+#define DWMAC_DMAMFBOCR_MFA GENMASK(27, 17)
 
 /* DMA bus mode bits */
 #define DWMAC_DMABMR_SR    BIT(0)
