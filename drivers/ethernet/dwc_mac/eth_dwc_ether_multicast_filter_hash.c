@@ -42,6 +42,13 @@ static void dwmac_mcast_hash_cb(struct net_if *iface, const struct net_eth_mcast
 	hash_table[index / 32] |= BIT(index % 32);
 }
 
+/*
+ * Updates run outside the stack's membership lock. Without this one, an
+ * update could program a table built before a later update had begun,
+ * after that update programmed its own, and lose a group until the next.
+ */
+static K_MUTEX_DEFINE(dwmac_mcast_filter_lock);
+
 void dwmac_setup_multicast_filter(const struct device *dev, const struct ethernet_filter *filter)
 {
 	struct dwmac_priv *p = dev->data;
@@ -49,9 +56,11 @@ void dwmac_setup_multicast_filter(const struct device *dev, const struct etherne
 
 	ARG_UNUSED(filter);
 
+	k_mutex_lock(&dwmac_mcast_filter_lock, K_FOREVER);
 	net_eth_mcast_addr_foreach(p->iface, dwmac_mcast_hash_cb, hash_table);
 
 	for (unsigned int i = 0; i < DWMAC_MCAST_HASH_WORDS; i++) {
 		DWMAC_REG_WRITE(DWMAC_MCAST_HASH_TABLE_REG(i), hash_table[i]);
 	}
+	k_mutex_unlock(&dwmac_mcast_filter_lock);
 }

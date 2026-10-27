@@ -53,6 +53,14 @@ static void dwmac_mcast_perfect_cb(struct net_if *iface,
 	DWMAC_REG_WRITE(DWMAC_MCAST_ADDR_LOW(*count), sys_get_le32(mcast_addr->addr.addr));
 }
 
+/*
+ * Updates run outside the stack's membership lock. Without this one, two
+ * updates could interleave their entries, or an update could program the
+ * groups it saw after a later update had programmed more, and lose a group
+ * until the next.
+ */
+static K_MUTEX_DEFINE(dwmac_mcast_filter_lock);
+
 void dwmac_setup_multicast_filter(const struct device *dev, const struct ethernet_filter *filter)
 {
 	struct dwmac_priv *p = dev->data;
@@ -60,6 +68,7 @@ void dwmac_setup_multicast_filter(const struct device *dev, const struct etherne
 
 	ARG_UNUSED(filter);
 
+	k_mutex_lock(&dwmac_mcast_filter_lock, K_FOREVER);
 	net_eth_mcast_addr_foreach(p->iface, dwmac_mcast_perfect_cb, &count);
 
 	if (NET_ETH_MCAST_FILTER_COUNT > DWMAC_MULTICAST_PERFECT_SLOTS) {
@@ -80,4 +89,5 @@ void dwmac_setup_multicast_filter(const struct device *dev, const struct etherne
 	     i <= DWMAC_MULTICAST_PERFECT_SLOTS; i++) {
 		DWMAC_REG_WRITE(DWMAC_MCAST_ADDR_HIGH(i), 0);
 	}
+	k_mutex_unlock(&dwmac_mcast_filter_lock);
 }
