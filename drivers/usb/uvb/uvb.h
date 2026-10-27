@@ -40,6 +40,8 @@ enum uvb_event_type {
 	UVB_EVT_REPLY,
 	/** Device activity event */
 	UVB_EVT_DEVICE_ACT,
+	/** Start of Frame event */
+	UVB_EVT_SOF,
 };
 
 /**

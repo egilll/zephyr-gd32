@@ -221,6 +221,9 @@ static ALWAYS_INLINE void udc_vrt_thread_handler(void *arg)
 		case UVB_EVT_REQUEST:
 			err = vrt_handle_request(dev, vrt_ev->pkt);
 			break;
+		case UVB_EVT_SOF:
+			udc_submit_sof_event(dev);
+			break;
 		default:
 			break;
 		};
@@ -246,6 +249,24 @@ static void vrt_submit_uvb_event(const struct device *dev,
 
 	vrt_ev->type = type;
 	vrt_ev->pkt = pkt;
+	k_fifo_put(&priv->fifo, vrt_ev);
+}
+
+/*
+ * SOF follows the other bus events through the FIFO so the stack sees them in
+ * bus order. A SOF that finds no free event is dropped, as a missed SOF would be.
+ */
+static void vrt_submit_sof_event(const struct device *dev)
+{
+	struct udc_vrt_data *priv = udc_get_private(dev);
+	struct udc_vrt_event *vrt_ev;
+
+	if (k_mem_slab_alloc(&udc_vrt_slab, (void **)&vrt_ev, K_NO_WAIT) != 0) {
+		return;
+	}
+
+	vrt_ev->type = UVB_EVT_SOF;
+	vrt_ev->pkt = NULL;
 	k_fifo_put(&priv->fifo, vrt_ev);
 }
 
@@ -277,6 +298,11 @@ static void udc_vrt_uvb_cb(const void *const vrt_priv,
 	case UVB_EVT_REQUEST:
 		if (udc_is_enabled(dev) && priv->addr == pkt->addr) {
 			vrt_submit_uvb_event(dev, type, pkt);
+		}
+		break;
+	case UVB_EVT_SOF:
+		if (udc_is_enabled(dev)) {
+			vrt_submit_sof_event(dev);
 		}
 		break;
 	default:
