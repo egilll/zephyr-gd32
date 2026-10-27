@@ -83,7 +83,7 @@ ZTEST(uac1_descriptors, test_duplex_interface_and_endpoint_assignment)
 	zassert_equal(sys_le16_to_cpu(playback->wMaxPacketSize), 196U);
 	zassert_equal(sys_le16_to_cpu(capture->wMaxPacketSize), 196U);
 	zassert_equal(((const uint8_t *)playback)[8], feedback->bEndpointAddress);
-	zassert_equal(((const uint8_t *)feedback)[7], 0U);
+	zassert_equal(((const uint8_t *)feedback)[7], 1U);
 }
 
 ZTEST(uac1_descriptors, test_high_speed_feedback_and_polling_encoding)

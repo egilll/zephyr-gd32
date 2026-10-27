@@ -9,7 +9,8 @@ This sample demonstrates USB Audio Class 1 playback (Host -> Device) using an
 isochronous OUT endpoint and an explicit feedback endpoint.
 
 The asynchronous stream uses a 1 ms Full-Speed data interval
-(``bInterval=1``) and feedback interval (``bRefresh=0``). The feedback value
+(``bInterval=1``) and refreshes its feedback every 2 ms (``bRefresh=1``, the
+shortest interval Audio 1.0 allows). The feedback value
 uses a low-pass filtered buffer level and bounded proportional correction. On
 GD32, its baseline comes from the frame rate actually produced by PLLI2S rather
 than the requested rate.
