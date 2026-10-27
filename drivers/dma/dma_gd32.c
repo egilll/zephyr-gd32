@@ -97,6 +97,8 @@ struct dma_gd32_channel {
 #define DMA_GD32_CHANNEL_FIFO_MODE  BIT(2)
 #define DMA_GD32_CHANNEL_POISONED   BIT(3)
 #define DMA_GD32_CHANNEL_SWITCH_BUF BIT(4)
+/* The memory the channel was on when it started or last reported a completion */
+#define DMA_GD32_CHANNEL_ON_MEMORY1 BIT(5)
 #define DMA_GD32_STOP_TIMEOUT_MS    2U
 
 struct dma_gd32_data {
@@ -839,6 +841,76 @@ static int dma_gd32_config(const struct device *dev, uint32_t channel, struct dm
 	return 0;
 }
 
+/* Whether a switch-buffer channel is on its second memory. */
+static bool dma_gd32_on_memory1(const struct dma_gd32_config *cfg, uint32_t ch)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+	return gd32_dma_uses_memory1(cfg->reg, ch);
+#else
+	ARG_UNUSED(cfg);
+	ARG_UNUSED(ch);
+	return false;
+#endif
+}
+
+static void dma_gd32_note_memory(struct dma_gd32_channel *channel, bool on_memory1)
+{
+	channel->flags &= ~DMA_GD32_CHANNEL_ON_MEMORY1;
+	if (on_memory1) {
+		channel->flags |= DMA_GD32_CHANNEL_ON_MEMORY1;
+	}
+}
+
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+/*
+ * Gives a running switch-buffer channel the buffer it moves to next. If the channel has switched
+ * since the last completion reported, the next buffer is not the one the caller expects, so this
+ * fails with -EBUSY and the caller hears of the switch from its callback. The hardware only
+ * accepts a new address for the buffer it is not accessing: if the channel switches between the
+ * check and the write, the write raises a transfer access error and the channel stops after the
+ * transfer it is making from the old buffer. That fails with -EIO, and the callback reports it.
+ */
+static int dma_gd32_reload_next_buffer(const struct device *dev, uint32_t ch, uint32_t src,
+				       uint32_t dst, size_t size)
+{
+	const struct dma_gd32_config *cfg = dev->config;
+	const struct dma_gd32_channel *channel = &((struct dma_gd32_data *)dev->data)->channels[ch];
+	const bool to_peripheral = channel->direction == MEMORY_TO_PERIPHERAL;
+	const uint32_t memory_address = to_peripheral ? src : dst;
+	const uint32_t peripheral_address = to_peripheral ? dst : src;
+	bool on_memory1;
+
+	if ((channel->flags & DMA_GD32_CHANNEL_SWITCH_BUF) == 0U) {
+		return -EBUSY;
+	}
+
+	/* Both buffers share the transfer count, so they have one length. */
+	if (size != channel->block_size || peripheral_address != channel->peripheral_address ||
+	    (memory_address % channel->memory_width) != 0U) {
+		return -EINVAL;
+	}
+
+	/* The buffer is read before the flag: a switch in between leaves the flag set. */
+	on_memory1 = gd32_dma_uses_memory1(cfg->reg, ch);
+	if (gd32_dma_interrupt_flag_get(cfg->reg, ch, DMA_FLAG_FTF) != 0U) {
+		return -EBUSY;
+	}
+
+	if (on_memory1) {
+		gd32_dma_memory_address_config(cfg->reg, ch, memory_address);
+	} else {
+		gd32_dma_memory1_address_config(cfg->reg, ch, memory_address);
+	}
+
+	/* The channel finishes its current transfer before stopping, still on the old buffer. */
+	if (gd32_dma_interrupt_flag_get(cfg->reg, ch, GD32_DMA_FLAG_ERRORS) != 0U) {
+		return -EIO;
+	}
+
+	return 0;
+}
+#endif
+
 static int dma_gd32_reload(const struct device *dev, uint32_t ch, uint32_t src, uint32_t dst,
 			   size_t size)
 {
@@ -857,14 +929,15 @@ static int dma_gd32_reload(const struct device *dev, uint32_t ch, uint32_t src, 
 		return -EINVAL;
 	}
 	if (dma_gd32_channel_enabled(cfg, ch)) {
-		/*
-		 * MBS can change between selecting the inactive address register and
-		 * writing it.  In switch-buffer mode that race writes the active bank,
-		 * raises TAE, and terminates the channel.  Keep both addresses immutable
-		 * for the whole running epoch; clients refill the inactive buffers in
-		 * place after querying dma_gd32_switch_buffer_active().
-		 */
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
+		return dma_gd32_reload_next_buffer(dev, ch, src, dst, size);
+#else
 		return -EBUSY;
+#endif
+	}
+	if ((data->channels[ch].flags & DMA_GD32_CHANNEL_SWITCH_BUF) != 0U) {
+		/* Stopped, by an error its callback has yet to report: it is configured anew. */
+		return -EIO;
 	}
 
 	if ((size == 0U) || (data->channels[ch].periph_width == 0U) ||
@@ -910,6 +983,7 @@ static int dma_gd32_reload(const struct device *dev, uint32_t ch, uint32_t src, 
 	if ((data->channels[ch].flags & DMA_GD32_CHANNEL_FIFO_MODE) != 0U) {
 		gd32_dma_fifo_error_interrupt_enable(cfg->reg, ch);
 	}
+	dma_gd32_note_memory(&data->channels[ch], dma_gd32_on_memory1(cfg, ch));
 	gd32_dma_channel_enable(cfg->reg, ch);
 
 	return 0;
@@ -976,6 +1050,7 @@ static int dma_gd32_start(const struct device *dev, uint32_t ch)
 	if ((data->channels[ch].flags & DMA_GD32_CHANNEL_FIFO_MODE) != 0U) {
 		gd32_dma_fifo_error_interrupt_enable(cfg->reg, ch);
 	}
+	dma_gd32_note_memory(&data->channels[ch], dma_gd32_on_memory1(cfg, ch));
 	gd32_dma_channel_enable(cfg->reg, ch);
 
 	return 0;
@@ -1011,6 +1086,8 @@ static int dma_gd32_stop(const struct device *dev, uint32_t ch)
 		data->channels[ch].flags |= DMA_GD32_CHANNEL_POISONED;
 		return -ETIMEDOUT;
 	}
+	/* Stopped at last: the channel can be configured again. */
+	data->channels[ch].flags &= ~DMA_GD32_CHANNEL_POISONED;
 
 	gd32_dma_interrupt_flag_clear(cfg->reg, ch,
 				      DMA_FLAG_FTF | DMA_FLAG_HTF | GD32_DMA_FLAG_ERRORS |
@@ -1038,36 +1115,6 @@ static int dma_gd32_get_status(const struct device *dev, uint32_t ch, struct dma
 	stat->busy = dma_gd32_channel_enabled(cfg, ch);
 
 	return 0;
-}
-
-int dma_gd32_switch_buffer_active(const struct device *dev, uint32_t ch, uint8_t *active_bank)
-{
-#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_dma_v1)
-	const struct dma_gd32_config *cfg;
-	struct dma_gd32_data *data;
-
-	if (dev == NULL || active_bank == NULL) {
-		return -EINVAL;
-	}
-
-	cfg = dev->config;
-	data = dev->data;
-	if (ch >= cfg->channels ||
-	    (data->channels[ch].flags & DMA_GD32_CHANNEL_CONFIGURED) == 0U) {
-		return -EINVAL;
-	}
-	if ((data->channels[ch].flags & DMA_GD32_CHANNEL_SWITCH_BUF) == 0U) {
-		return -ENOTSUP;
-	}
-
-	*active_bank = gd32_dma_uses_memory1(cfg->reg, ch) ? 1U : 0U;
-	return 0;
-#else
-	ARG_UNUSED(dev);
-	ARG_UNUSED(ch);
-	ARG_UNUSED(active_bank);
-	return -ENOTSUP;
-#endif
 }
 
 static bool dma_gd32_api_chan_filter(const struct device *dev, int ch, void *filter_param)
@@ -1108,24 +1155,46 @@ static int dma_gd32_init(const struct device *dev)
 	return 0;
 }
 
+/**
+ * Each completion of a switch-buffer channel moves it to the other memory. If it is still on the
+ * memory it was on at the last completion, more than one buffer completed before the interrupt
+ * was serviced; if it moved after its flags were sampled, the completion flag that move raised
+ * was cleared with them. Either way the caller can no longer tell which buffer is free, so this
+ * reports an error. `sampled_memory1` is the memory the channel was on when its flags were read.
+ */
+static int dma_gd32_switch_buffer_completed(const struct dma_gd32_config *cfg,
+					    struct dma_gd32_channel *channel, uint32_t ch,
+					    bool sampled_memory1)
+{
+	bool was_on_memory1 = (channel->flags & DMA_GD32_CHANNEL_ON_MEMORY1) != 0U;
+
+	dma_gd32_note_memory(channel, sampled_memory1);
+
+	return sampled_memory1 != was_on_memory1 && dma_gd32_on_memory1(cfg, ch) == sampled_memory1
+		       ? 0
+		       : -EIO;
+}
+
 static void dma_gd32_isr(const struct device *dev)
 {
 	const struct dma_gd32_config *cfg = dev->config;
 	struct dma_gd32_data *data = dev->data;
 
 	for (uint32_t i = 0; i < cfg->channels; i++) {
+		/* Only the flags read here are cleared: one raised meanwhile waits for the next pass. */
 		uint32_t errflag = gd32_dma_interrupt_flag_get(cfg->reg, i, GD32_DMA_FLAG_ERRORS);
 		uint32_t exception_flag =
 			gd32_dma_interrupt_flag_get(cfg->reg, i, GD32_DMA_FLAG_EXCEPTIONS);
 		uint32_t fifo_flag =
 			gd32_dma_interrupt_flag_get(cfg->reg, i, GD32_DMA_FLAG_FIFO_EVENT);
 		uint32_t ftfflag = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_FTF);
+		uint32_t htf_raised = gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_HTF);
 		/* HTFIF is set whether or not it is enabled; report it only where asked for. */
-		uint32_t htfflag = (GD32_DMA_CHCTL(cfg->reg, i) & DMA_CHXCTL_HTFIE) != 0U
-					   ? gd32_dma_interrupt_flag_get(cfg->reg, i, DMA_FLAG_HTF)
-					   : 0U;
+		uint32_t htfflag =
+			(GD32_DMA_CHCTL(cfg->reg, i) & DMA_CHXCTL_HTFIE) != 0U ? htf_raised : 0U;
 		bool channel_enabled = dma_gd32_channel_enabled(cfg, i);
 		uint32_t remaining = gd32_dma_transfer_number_get(cfg->reg, i);
+		bool on_memory1 = dma_gd32_on_memory1(cfg, i);
 
 		if (errflag == 0 && exception_flag == 0 && fifo_flag == 0 && ftfflag == 0 &&
 		    htfflag == 0) {
@@ -1154,9 +1223,16 @@ static void dma_gd32_isr(const struct device *dev)
 		}
 
 		gd32_dma_interrupt_flag_clear(cfg->reg, i,
-					      DMA_FLAG_FTF | DMA_FLAG_HTF | GD32_DMA_FLAG_ERRORS |
-						      GD32_DMA_FLAG_EXCEPTIONS |
-						      GD32_DMA_FLAG_FIFO_EVENT);
+					      (errflag != 0U ? GD32_DMA_FLAG_ERRORS : 0U) |
+						      (exception_flag != 0U ? GD32_DMA_FLAG_EXCEPTIONS
+									    : 0U) |
+						      (fifo_flag != 0U ? GD32_DMA_FLAG_FIFO_EVENT : 0U) |
+						      (ftfflag != 0U ? DMA_FLAG_FTF : 0U) |
+						      (htf_raised != 0U ? DMA_FLAG_HTF : 0U));
+		if (status == 0 && (data->channels[i].flags & DMA_GD32_CHANNEL_SWITCH_BUF) != 0U) {
+			status = dma_gd32_switch_buffer_completed(cfg, &data->channels[i], i,
+								  on_memory1);
+		}
 
 		if (((exception_flag != 0U) || (fifo_flag != 0U)) && (status > 0)) {
 			LOG_DBG("%s ch%" PRIu32 " nonfatal exception ex=0x%x fifo=0x%x", dev->name,
