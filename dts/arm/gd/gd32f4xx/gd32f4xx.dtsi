@@ -257,6 +257,8 @@
 			resets = <&rctl GD32_RESET_ENET>;
 			reset-names = "mac";
 			phy-connection-type = "rmii";
+			snps,multicast-filter-bins = <64>;
+			snps,perfect-filter-entries = <4>;
 			status = "disabled";
 
 			mdio: mdio {
