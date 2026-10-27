@@ -300,6 +300,9 @@ static void dwmac_receive(const struct device *dev)
 			p->rx_pkt = net_pkt_rx_alloc_on_iface(p->iface, K_NO_WAIT);
 			if (p->rx_pkt == NULL) {
 				eth_stats_update_errors_rx(p->iface);
+#if defined(CONFIG_NET_STATISTICS_ETHERNET)
+				p->stats.error_details.rx_no_buffer_count++;
+#endif
 			}
 		}
 
