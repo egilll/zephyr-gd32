@@ -1455,16 +1455,30 @@ extern const struct ethernet_api dwmac_api;
 
 /* DMA status bits */
 #define DWMAC_DMASR_TI     BIT(0)
+#define DWMAC_DMASR_TPS    BIT(1)
 #define DWMAC_DMASR_TBUS   BIT(2)
+#define DWMAC_DMASR_TJT    BIT(3)
+#define DWMAC_DMASR_RO     BIT(4)
+#define DWMAC_DMASR_TU     BIT(5)
 #define DWMAC_DMASR_RI     BIT(6)
 #define DWMAC_DMASR_RBUS   BIT(7)
+#define DWMAC_DMASR_RPS    BIT(8)
+#define DWMAC_DMASR_RWT    BIT(9)
+#define DWMAC_DMASR_ETI    BIT(10)
+#define DWMAC_DMASR_FBE    BIT(13)
 #define DWMAC_DMASR_AIS    BIT(15)
+
+/* abnormal events other than running out of receive descriptors */
+#define DWMAC_DMASR_ABNORMAL_ERRORS (DWMAC_DMASR_TPS | DWMAC_DMASR_TJT | DWMAC_DMASR_RO | \
+				     DWMAC_DMASR_TU | DWMAC_DMASR_RPS | DWMAC_DMASR_RWT | \
+				     DWMAC_DMASR_ETI | DWMAC_DMASR_FBE)
 
 /* DMA operation mode bits */
 #define DWMAC_DMAOMR_SR    BIT(1)
 #define DWMAC_DMAOMR_OSF   BIT(2)
 #define DWMAC_DMAOMR_ST    BIT(13)
 #define DWMAC_DMAOMR_TSF   BIT(21)
+#define DWMAC_DMAOMR_DFF   BIT(24)
 #define DWMAC_DMAOMR_RSF   BIT(25)
 #define DWMAC_DMAOMR_TTC   GENMASK(16, 14)
 #define DWMAC_DMAOMR_RTC   GENMASK(4, 3)

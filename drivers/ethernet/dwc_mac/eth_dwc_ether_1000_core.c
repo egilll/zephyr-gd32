@@ -23,6 +23,14 @@ LOG_MODULE_REGISTER(dwmac_core, CONFIG_ETHERNET_LOG_LEVEL);
 #include "../eth.h"
 
 #define RX_FRAG_SIZE  CONFIG_NET_BUF_DATA_SIZE
+
+/*
+ * The longest frame handed to the stack: a full MTU behind a VLAN tag and
+ * any DSA tag, with the FCS the MAC leaves on frames that carry a length
+ * rather than a type.
+ */
+#define DWMAC_RX_MAX_FRAME (NET_ETH_MTU + sizeof(struct net_eth_vlan_hdr) + DSA_TAG_SIZE + 4)
+
 #define TX_AVAIL_WAIT K_MSEC(1)
 
 #define INC_WRAP(idx, size) ((idx) = ((idx) + 1) % (size))
@@ -324,6 +332,22 @@ static void dwmac_receive(const struct device *dev)
 		}
 		net_pkt_frag_add(p->rx_pkt, frag);
 
+		if (p->rx_bytes > DWMAC_RX_MAX_FRAME) {
+			/*
+			 * Longer than any frame the stack takes. Drop it now rather
+			 * than hold buffers for the rest of it, which a long enough
+			 * frame could need more of than the pool has, and discard
+			 * the fragments still to come up to the next first one.
+			 */
+			eth_stats_update_errors_rx(p->iface);
+#if defined(CONFIG_NET_STATISTICS_ETHERNET)
+			p->stats.error_details.rx_length_errors++;
+#endif
+			net_pkt_unref(p->rx_pkt);
+			p->rx_pkt = NULL;
+			continue;
+		}
+
 		if ((des0 & RDES0_LS) != 0U) {
 			if ((des0 & RDES0_ES) == 0U) {
 				dwmac_receive_timestamp(p->rx_pkt, d);
@@ -450,7 +474,12 @@ void dwmac_isr(const struct device *dev)
 
 	LOG_DBG("DMA status 0x%08x", status);
 
-	if ((status & DWMAC_DMASR_AIS) != 0) {
+	/*
+	 * Report the abnormal events whose interrupts are enabled, but not
+	 * running out of receive descriptors, which is expected (see below).
+	 */
+	if ((status & DWMAC_DMASR_AIS) != 0U &&
+	    (status & DWMAC_REG_READ(DWMAC_DMAIER) & DWMAC_DMASR_ABNORMAL_ERRORS) != 0U) {
 		LOG_ERR("abnormal interrupt status (0x%08x)", status);
 	}
 
@@ -458,7 +487,14 @@ void dwmac_isr(const struct device *dev)
 		dwmac_tx_release(dev);
 	}
 
-	if ((status & DWMAC_DMASR_RI) != 0) {
+	/*
+	 * A frame that needs more descriptors than are posted fills them all
+	 * and the DMA waits for more with the rest of it, raising no receive
+	 * interrupt as the frame is not complete. Reclaim those descriptors
+	 * when the DMA reports that it ran out, or nothing would ever post
+	 * the ones it waits for.
+	 */
+	if ((status & (DWMAC_DMASR_RI | DWMAC_DMASR_RBUS)) != 0) {
 		dwmac_receive(dev);
 	}
 }
@@ -581,11 +617,19 @@ static void dwmac_iface_init(struct net_if *iface)
 			K_ESSENTIAL, K_NO_WAIT);
 	k_thread_name_set(&p->rx_refill_thread, "dwmac_rx_refill");
 
+	/*
+	 * Running out of receive descriptors needs handling only when the DMA
+	 * keeps the frame it has none for (see dwmac_isr()). When it flushes,
+	 * as some integrations configure it to, it would only interrupt for
+	 * every frame arriving while the ring is starved.
+	 */
 	DWMAC_REG_WRITE(DWMAC_DMAIER,
 			DWMAC_DMAIER_NISE |
 			DWMAC_DMAIER_RIE |
 			DWMAC_DMAIER_TIE |
-			DWMAC_DMAIER_AISE);
+			DWMAC_DMAIER_AISE |
+			((DWMAC_REG_READ(DWMAC_DMAOMR) & DWMAC_DMAOMR_DFF) != 0U ?
+			 DWMAC_DMAIER_RBUIE : 0U));
 
 	DWMAC_REG_WRITE(DWMAC_DMAOMR,
 			DWMAC_REG_READ(DWMAC_DMAOMR) |
@@ -680,7 +724,11 @@ int dwmac_probe(const struct device *dev)
 		DWMAC_REG_WRITE(DWMAC_MMC_IPC_RX_INTERRUPT_MASK, UINT32_MAX);
 	}
 
-	DWMAC_REG_WRITE(DWMAC_DMAOMR, DWMAC_DMAOMR_TSF | DWMAC_DMAOMR_RSF);
+	/*
+	 * Without DFF the receive DMA flushes a frame it has no descriptor for;
+	 * with it the frame waits in the receive FIFO until one is posted.
+	 */
+	DWMAC_REG_WRITE(DWMAC_DMAOMR, DWMAC_DMAOMR_TSF | DWMAC_DMAOMR_DFF | DWMAC_DMAOMR_RSF);
 
 	ret = dwmac_platform_init(dev);
 	if (ret < 0) {
