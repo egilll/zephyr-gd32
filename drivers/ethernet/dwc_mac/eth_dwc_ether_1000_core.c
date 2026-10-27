@@ -307,7 +307,8 @@ static void dwmac_receive(const struct device *dev)
 
 		if ((des0 & RDES0_LS) != 0U) {
 			bytes_so_far = RX_LEN_FROM_RDES0(des0);
-			if (bytes_so_far < p->rx_bytes) {
+			/* the final fragment holds what the earlier ones did not, within its buffer */
+			if (bytes_so_far < p->rx_bytes || bytes_so_far - p->rx_bytes > frag->size) {
 				eth_stats_update_errors_rx(p->iface);
 				net_pkt_unref(p->rx_pkt);
 				p->rx_pkt = NULL;
