@@ -598,6 +598,19 @@ static void setup_ipv4_addr(struct net_sockaddr_in *local_addr)
 }
 #endif /* CONFIG_NET_IPV4 */
 
+/* Take a socket that is not going to be polled out of the poll set, so that
+ * a later registration does not hand the socket service its closed descriptor.
+ */
+static void forget_fd(int sock)
+{
+	ARRAY_FOR_EACH(fds, j) {
+		if (fds[j].fd == sock) {
+			fds[j].fd = -1;
+			break;
+		}
+	}
+}
+
 static int init_listener(void)
 {
 	int ret, ok = 0;
@@ -647,6 +660,7 @@ static int init_listener(void)
 		if (ret < 0) {
 			NET_DBG("Cannot register %s %s socket service (%d)",
 				"IPv6", "LLMNR", ret);
+			forget_fd(ipv6);
 			zsock_close(ipv6);
 		} else {
 			ok++;
@@ -694,6 +708,7 @@ ipv6_out:
 		if (ret < 0) {
 			NET_DBG("Cannot register %s %s socket service (%d)",
 				"IPv4", "LLMNR", ret);
+			forget_fd(ipv4);
 			zsock_close(ipv4);
 		} else {
 			ok++;
