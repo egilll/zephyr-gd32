@@ -76,6 +76,10 @@ void dwmac_setup_multicast_filter(const struct device *dev, const struct etherne
 
 		if (count > DWMAC_MULTICAST_PERFECT_SLOTS) {
 			/* the addresses do not fit into the entries, accept all multicast */
+			if ((reg_val & DWMAC_PASS_ALL_MCAST_BIT) == 0U) {
+				LOG_WRN("%u multicast addresses for %u entries, passing all multicast",
+					count, (unsigned int)DWMAC_MULTICAST_PERFECT_SLOTS);
+			}
 			DWMAC_REG_WRITE(DWMAC_PASS_ALL_MCAST_REG,
 					reg_val | DWMAC_PASS_ALL_MCAST_BIT);
 		} else {
