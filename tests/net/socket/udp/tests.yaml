@@ -11,6 +11,10 @@ tests:
   net.socket.udp:
     extra_configs:
       - CONFIG_NET_TC_THREAD_COOPERATIVE=y
+  net.socket.udp.rcvbuf:
+    extra_configs:
+      - CONFIG_NET_CONTEXT_RCVBUF=y
+      - CONFIG_NET_CONTEXT_RCVBUF_DGRAM_DEFAULT=1024
   net.socket.udp.preempt:
     extra_configs:
       - CONFIG_NET_TC_THREAD_PREEMPTIVE=y
