@@ -189,6 +189,28 @@ static int trigger_work(struct zsock_pollfd *pev)
 	return call_work(pev, event);
 }
 
+/* Pause before rebuilding after a poll that returned no events, doubling while it repeats */
+#define SOCKET_SERVICE_REBUILD_BACKOFF_MIN_MS 10
+#define SOCKET_SERVICE_REBUILD_BACKOFF_MAX_MS 1000
+
+/* Wait before rebuilding the poll array after a poll that failed or reported
+ * nothing, so that a descriptor that keeps doing so cannot keep this thread
+ * from letting lower priority ones run. A registration ends the wait: the
+ * rebuild it asks for may be what puts things right.
+ */
+static void rebuild_backoff(int restart_fd, int backoff_ms)
+{
+	struct zsock_pollfd restart = {
+		.fd = restart_fd,
+		.events = ZSOCK_POLLIN,
+	};
+	zvfs_eventfd_t value;
+
+	if (zsock_poll(&restart, 1, backoff_ms) > 0) {
+		(void)zvfs_eventfd_read(restart_fd, &value);
+	}
+}
+
 static void socket_service_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -196,6 +218,7 @@ static void socket_service_thread(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	int ret, i, fd, count = 0;
+	int backoff_ms = 0;
 	zvfs_eventfd_t value;
 
 	STRUCT_SECTION_COUNT(net_socket_service_desc, &ret);
@@ -266,16 +289,21 @@ restart:
 
 	while (true) {
 		ret = zsock_poll(ctx.events, count + 1, -1);
-		if (ret < 0) {
-			ret = -errno;
-			NET_ERR("poll failed (%d), rebuilding socket service", ret);
+		if (ret <= 0) {
+			/* A failed poll, or one with nothing to report although it
+			 * has no timeout: leaving the loop would stop every service
+			 * for good, so rebuild instead.
+			 */
+			ret = ret < 0 ? -errno : 0;
+			backoff_ms = CLAMP(backoff_ms * 2, SOCKET_SERVICE_REBUILD_BACKOFF_MIN_MS,
+					   SOCKET_SERVICE_REBUILD_BACKOFF_MAX_MS);
+			NET_ERR("poll %s (%d), rebuilding socket service in %d ms",
+				ret < 0 ? "failed" : "returned no events", ret, backoff_ms);
+			rebuild_backoff(ctx.events[0].fd, backoff_ms);
 			goto restart;
 		}
 
-		if (ret == 0) {
-			/* should not happen because timeout is -1 */
-			break;
-		}
+		backoff_ms = 0;
 
 		/* Process work here */
 		for (i = 1; i < (count + 1); i++) {

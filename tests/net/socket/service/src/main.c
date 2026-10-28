@@ -205,9 +205,13 @@ ZTEST(net_socket_service, test_service_sync)
 struct reconfig_mock_fd {
 	struct k_sem readable;
 	struct k_sem prepared;
+	struct k_sem failed;
 	struct k_sem closed;
 	struct k_sem wrong_events;
 	atomic_t prepare_error;
+	atomic_t update_empty;
+	atomic_t always_empty;
+	atomic_t always_fail;
 	short expected_events;
 };
 
@@ -215,9 +219,13 @@ static void reconfig_mock_init(struct reconfig_mock_fd *mock)
 {
 	k_sem_init(&mock->readable, 0, 1);
 	k_sem_init(&mock->prepared, 0, UINT_MAX);
+	k_sem_init(&mock->failed, 0, UINT_MAX);
 	k_sem_init(&mock->closed, 0, 1);
 	k_sem_init(&mock->wrong_events, 0, 1);
 	atomic_clear(&mock->prepare_error);
+	atomic_clear(&mock->update_empty);
+	atomic_clear(&mock->always_empty);
+	atomic_clear(&mock->always_fail);
 	mock->expected_events = -1;
 }
 
@@ -245,7 +253,11 @@ static int reconfig_mock_ioctl(void *obj, unsigned int request, va_list args)
 		pev = va_arg(args, struct k_poll_event **);
 		pev_end = va_arg(args, struct k_poll_event *);
 		prepare_error = atomic_set(&mock->prepare_error, 0);
+		if (prepare_error == 0) {
+			prepare_error = atomic_get(&mock->always_fail);
+		}
 		if (prepare_error != 0) {
+			k_sem_give(&mock->failed);
 			return prepare_error;
 		}
 
@@ -268,7 +280,9 @@ static int reconfig_mock_ioctl(void *obj, unsigned int request, va_list args)
 		pfd = va_arg(args, struct zsock_pollfd *);
 		pev = va_arg(args, struct k_poll_event **);
 
-		if ((*pev)->state == K_POLL_STATE_SEM_AVAILABLE) {
+		/* update_empty reports nothing once, whatever woke the poll */
+		if ((*pev)->state == K_POLL_STATE_SEM_AVAILABLE &&
+		    atomic_set(&mock->update_empty, 0) == 0 && !atomic_get(&mock->always_empty)) {
 			pfd->revents = pfd->events;
 		}
 
@@ -474,6 +488,161 @@ ZTEST(net_socket_service, test_poll_error_recovery)
 	zassert_ok(prepared, "Service thread did not recover from poll error");
 	zassert_ok(ret, "Cannot close service (%d)", ret);
 	zassert_ok(closed, "Service fd was not closed");
+}
+
+static struct reconfig_mock_fd wakeup_mock;
+K_SEM_DEFINE(wakeup_called, 0, UINT_MAX);
+
+static void wakeup_handler(struct net_socket_service_event *pev)
+{
+	ARG_UNUSED(pev);
+
+	(void)k_sem_take(&wakeup_mock.readable, K_NO_WAIT);
+	k_sem_give(&wakeup_called);
+}
+
+NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(wakeup_service, wakeup_handler, 1);
+
+/*
+ * A wakeup can leave poll() with nothing to report, as when a polled socket
+ * is closed and its descriptor reused. The service thread must poll again
+ * rather than stop, which would leave every service dead.
+ */
+ZTEST(net_socket_service, test_wakeup_without_events)
+{
+	struct zsock_pollfd pollfd = {.events = ZSOCK_POLLIN};
+	int called, fd, ret;
+
+	reconfig_mock_init(&wakeup_mock);
+	k_sem_reset(&wakeup_called);
+	fd = reconfig_mock_alloc(&wakeup_mock);
+	zassert_true(fd >= 0, "Cannot allocate fd (%d)", fd);
+
+	pollfd.fd = fd;
+	ret = net_socket_service_register(&wakeup_service, &pollfd, 1, NULL);
+	if (ret != 0) {
+		(void)zvfs_close(fd);
+	}
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+	zassert_ok(k_sem_take(&wakeup_mock.prepared, RECONFIG_TIMEOUT),
+		   "Service did not poll the fd");
+
+	atomic_set(&wakeup_mock.update_empty, 1);
+	k_sem_give(&wakeup_mock.readable);
+	called = k_sem_take(&wakeup_called, RECONFIG_TIMEOUT);
+
+	(void)net_socket_service_unregister(&wakeup_service);
+	(void)zvfs_close(fd);
+
+	zassert_ok(called, "Service stopped after a wakeup without events");
+}
+
+static struct reconfig_mock_fd stuck_mock;
+static struct reconfig_mock_fd late_mock;
+K_SEM_DEFINE(late_called, 0, UINT_MAX);
+
+static void stuck_handler(struct net_socket_service_event *pev)
+{
+	ARG_UNUSED(pev);
+}
+
+static void late_handler(struct net_socket_service_event *pev)
+{
+	ARG_UNUSED(pev);
+
+	(void)k_sem_take(&late_mock.readable, K_NO_WAIT);
+	k_sem_give(&late_called);
+}
+
+NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(stuck_service, stuck_handler, 1);
+NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(late_service, late_handler, 1);
+
+/*
+ * A descriptor that keeps waking poll() with nothing to report makes the
+ * service thread back off between rebuilds, but a service registered
+ * meanwhile must not wait the back-off out.
+ */
+ZTEST(net_socket_service, test_registration_ends_rebuild_backoff)
+{
+	struct zsock_pollfd stuck = {.events = ZSOCK_POLLIN};
+	struct zsock_pollfd late = {.events = ZSOCK_POLLIN};
+	int called, ret;
+
+	reconfig_mock_init(&stuck_mock);
+	reconfig_mock_init(&late_mock);
+	k_sem_reset(&late_called);
+	stuck.fd = reconfig_mock_alloc(&stuck_mock);
+	late.fd = reconfig_mock_alloc(&late_mock);
+	zassert_true(stuck.fd >= 0 && late.fd >= 0, "Cannot allocate fds");
+
+	/* Always readable, never reporting it */
+	atomic_set(&stuck_mock.always_empty, 1);
+	k_sem_give(&stuck_mock.readable);
+	ret = net_socket_service_register(&stuck_service, &stuck, 1, NULL);
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+
+	/* Each rebuild prepares the descriptor again. After the ninth, the
+	 * thread waits out its longest back-off, a second: register within it.
+	 */
+	for (int i = 0; i < 9; i++) {
+		ret = k_sem_take(&stuck_mock.prepared, K_SECONDS(2));
+		zassert_ok(ret, "The service thread stopped rebuilding");
+	}
+	k_msleep(50);
+	zassert_equal(k_sem_count_get(&stuck_mock.prepared), 0,
+		      "The back-off was over before the registration");
+
+	k_sem_give(&late_mock.readable);
+	ret = net_socket_service_register(&late_service, &late, 1, NULL);
+	called = k_sem_take(&late_called, K_MSEC(500));
+
+	(void)net_socket_service_unregister(&late_service);
+	(void)net_socket_service_unregister(&stuck_service);
+	(void)zvfs_close(late.fd);
+	(void)zvfs_close(stuck.fd);
+
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+	zassert_ok(called, "A registration waited out the rebuild back-off");
+}
+
+/*
+ * A descriptor that fails every poll makes the service thread rebuild, but
+ * with a back-off rather than at once, and its service is served again once
+ * the descriptor recovers.
+ */
+ZTEST(net_socket_service, test_failing_poll_backs_off)
+{
+	struct zsock_pollfd pollfd = {.events = ZSOCK_POLLIN};
+	int64_t start, elapsed;
+	int called, prepares, ret;
+
+	reconfig_mock_init(&wakeup_mock);
+	k_sem_reset(&wakeup_called);
+	pollfd.fd = reconfig_mock_alloc(&wakeup_mock);
+	zassert_true(pollfd.fd >= 0, "Cannot allocate fd (%d)", pollfd.fd);
+
+	atomic_set(&wakeup_mock.always_fail, -EIO);
+	ret = net_socket_service_register(&wakeup_service, &pollfd, 1, NULL);
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+	zassert_ok(k_sem_take(&wakeup_mock.failed, RECONFIG_TIMEOUT), "Service did not poll");
+	k_sem_reset(&wakeup_mock.failed);
+	start = k_uptime_get();
+
+	k_msleep(500);
+	prepares = k_sem_count_get(&wakeup_mock.failed);
+	elapsed = k_uptime_get() - start;
+
+	atomic_clear(&wakeup_mock.always_fail);
+	k_sem_give(&wakeup_mock.readable);
+	called = k_sem_take(&wakeup_called, K_SECONDS(2));
+
+	(void)net_socket_service_unregister(&wakeup_service);
+	(void)zvfs_close(pollfd.fd);
+
+	/* The back-off doubles from 10 ms up to a second */
+	zassert_true(prepares > 0 && prepares <= 8 + elapsed / 1000, "%d rebuilds in %lld ms",
+		     prepares, elapsed);
+	zassert_ok(called, "The service was not served once its descriptor recovered");
 }
 
 ZTEST(net_socket_service, test_close_from_callback)
