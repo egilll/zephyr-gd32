@@ -1731,7 +1731,11 @@ def test_qemuhandler_handle(
     def mock_path_exists(name, *args, **kwargs):
         return exists_pid_fn
 
-    def mock_popen(command, stdout=None, stdin=None, stderr=None, cwd=None):
+    sessions = []
+
+    def mock_popen(command, stdout=None, stdin=None, stderr=None, cwd=None,
+                   start_new_session=False):
+        sessions.append(start_new_session)
         return mock.Mock(
             __enter__=mock.Mock(return_value=mock_process),
             __exit__=mock.Mock(return_value=None),
@@ -1777,6 +1781,8 @@ def test_qemuhandler_handle(
         handler.handle(harness)
 
     assert all([expected_log in caplog.text for expected_log in expected_logs])
+    # QEMU and its lifeline each run in a session of their own
+    assert sessions[-2:] == [True, True]
 
 
 def test_qemuhandler_get_fifo(mocked_instance):
