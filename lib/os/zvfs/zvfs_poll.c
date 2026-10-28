@@ -17,9 +17,41 @@ bool net_socket_is_tls(void *obj);
 #define net_socket_is_tls(obj) false
 #endif
 
+/*
+ * How long a wait cut short by a descriptor that is already ready may last.
+ * The first is immediate. Once short waits have come up empty, a descriptor
+ * may be claiming to be ready without ever reporting it, so the waits that
+ * follow last a little longer each time, up to 100 ms, rather than make poll()
+ * spin: one that does become ready is still reported at the end of the wait,
+ * or sooner if another descriptor wakes it.
+ */
+/* Enough empty short waits for the next one to last its longest */
+#define SHORT_WAITS_MAX 8
+
+static k_timeout_t short_wait(k_timepoint_t end, int empty_short_waits)
+{
+	k_timeout_t left = sys_timepoint_timeout(end);
+	k_timeout_t pause;
+
+	if (empty_short_waits == 0) {
+		return K_NO_WAIT;
+	}
+
+	pause = K_MSEC(MIN(1 << (empty_short_waits - 1), 100));
+	if (K_TIMEOUT_EQ(left, K_FOREVER) || left.ticks > pause.ticks) {
+		return pause;
+	}
+
+	return left;
+}
+
 int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 {
 	bool retry;
+	bool ready;
+	bool cancelled;
+	int empty_short_waits = 0;
+	k_timeout_t wait;
 	int ret = 0;
 	int i;
 	struct zvfs_pollfd *pfd;
@@ -35,6 +67,8 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 
 	end = sys_timepoint_calc(timeout);
 
+again:
+	ready = false;
 	pev = poll_events;
 	for (pfd = fds, i = nfds; i--; pfd++) {
 		void *ctx;
@@ -61,8 +95,7 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 			 * this case, we still perform a k_poll to pick up
 			 * as many events as possible, but without any wait.
 			 */
-			timeout = K_NO_WAIT;
-			end = sys_timepoint_calc(timeout);
+			ready = true;
 			result = 0;
 		} else if (result == -EXDEV) {
 			/* If POLL_PREPARE returned EXDEV, it means
@@ -93,25 +126,33 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 	if (offload) {
 		int poll_timeout;
 
-		if (K_TIMEOUT_EQ(timeout, K_FOREVER)) {
+		/* A retry below may get here with part of the time used up */
+		wait = sys_timepoint_timeout(end);
+
+		if (ready) {
+			poll_timeout = 0;
+		} else if (K_TIMEOUT_EQ(wait, K_FOREVER)) {
 			poll_timeout = SYS_FOREVER_MS;
 		} else {
-			poll_timeout = k_ticks_to_ms_floor32(timeout.ticks);
+			poll_timeout = k_ticks_to_ms_floor32(wait.ticks);
 		}
 
 		return zvfs_fdtable_call_ioctl(offl_vtable, offl_ctx, ZFD_IOCTL_POLL_OFFLOAD, fds,
 					       nfds, poll_timeout);
 	}
 
-	timeout = sys_timepoint_timeout(end);
+	wait = ready ? short_wait(end, empty_short_waits) : sys_timepoint_timeout(end);
+	cancelled = false;
 
 	do {
-		ret = k_poll(poll_events, pev - poll_events, timeout);
+		ret = k_poll(poll_events, pev - poll_events, wait);
 		/* EAGAIN when timeout expired, EINTR when cancelled (i.e. EOF) */
 		if (ret != 0 && ret != -EAGAIN && ret != -EINTR) {
 			errno = -ret;
 			return -1;
 		}
+
+		cancelled = cancelled || ret == -EINTR;
 
 		retry = false;
 		ret = 0;
@@ -158,13 +199,35 @@ int zvfs_poll_internal(struct zvfs_pollfd *fds, int nfds, k_timeout_t timeout)
 				break;
 			}
 
-			timeout = sys_timepoint_timeout(end);
+			/* A descriptor that is ready without an event to wait on
+			 * is still only checked at the end of each wait.
+			 */
+			if (ready) {
+				empty_short_waits = MIN(empty_short_waits + 1, SHORT_WAITS_MAX);
+				wait = short_wait(end, empty_short_waits);
+			} else {
+				wait = sys_timepoint_timeout(end);
+			}
 
-			if (K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+			if (K_TIMEOUT_EQ(wait, K_NO_WAIT)) {
 				break;
 			}
 		}
 	} while (retry);
+
+	/*
+	 * A wait that was cancelled, or cut short by a descriptor that was
+	 * already ready, can end with nothing to report: a polled socket was
+	 * closed and its descriptor reused by one that is not ready, or what
+	 * was ready is gone by now. poll() returns 0 only once the timeout has
+	 * expired, so prepare and wait again until then.
+	 */
+	if (ret == 0 && (ready || cancelled) && !sys_timepoint_expired(end)) {
+		if (ready) {
+			empty_short_waits = MIN(empty_short_waits + 1, SHORT_WAITS_MAX);
+		}
+		goto again;
+	}
 
 	return ret;
 }
