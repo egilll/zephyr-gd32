@@ -936,6 +936,41 @@ class DeviceHandler(Handler):
             self.run_custom_script(post_script, timeout)
 
 
+# Kills the QEMU process group once the twister process that started it is
+# gone, however it went: twister holds the only write end of its stdin, so a
+# twister killed outright (SIGKILL, a closed terminal) still closes it.
+_QEMU_LIFELINE = """
+import os, signal, sys, time
+pgid = int(sys.argv[1])
+sys.stdin.buffer.read()
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    try:
+        os.killpg(pgid, sig)
+        for _ in range(20):
+            time.sleep(0.05)
+            os.killpg(pgid, 0)
+    except ProcessLookupError:
+        break
+"""
+
+
+def _start_qemu_lifeline(pgid):
+    return subprocess.Popen(
+        [sys.executable, "-c", _QEMU_LIFELINE, str(pgid)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _end_qemu_lifeline(lifeline):
+    with contextlib.suppress(OSError):
+        lifeline.stdin.close()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        lifeline.wait(5)
+
+
 class QEMUHandlerBase(Handler):
     """Shared behaviour for the POSIX and Windows QEMU handlers.
 
@@ -1232,52 +1267,60 @@ class QEMUHandler(QEMUHandlerBase):
         # As in BinaryHandler._handle: no terminal stdin for QEMU while the
         # --console-monitor UI owns the terminal.
         stdin = subprocess.DEVNULL if console_ui_active() else None
+        # QEMU runs in a process group of its own, which the lifeline
+        # takes down should twister die without stopping it.
         with open(self.stdout_fn, "w") as stdout_fp, \
             open(self.stderr_fn, "w") as stderr_fp, subprocess.Popen(
             command,
             stdin=stdin,
             stdout=stdout_fp,
             stderr=stderr_fp,
-            cwd=self.build_dir
+            cwd=self.build_dir,
+            start_new_session=True
         ) as proc:
             logger.debug(f"Spawning QEMUHandler Thread for {self.name}")
-
+            lifeline = _start_qemu_lifeline(proc.pid)
             try:
-                proc.wait(self.get_test_timeout())
-            except subprocess.TimeoutExpired:
-                # sometimes QEMU can't handle SIGTERM signal correctly
-                # in that case kill -9 QEMU process directly and leave
-                # twister to judge testing result by console output
-
-                failure_type = self.FailureType.TIMEOUT
-                self.terminate(proc)
-                if harness.status == TwisterStatus.PASS:
-                    self.returncode = 0
-                else:
-                    self.returncode = proc.returncode
-            else:
-                if os.path.exists(self.pid_fn):
-                    with open(self.pid_fn) as pid_file:
-                        qemu_pid = int(pid_file.read())
-                logger.debug(f"No timeout, return code from QEMU ({qemu_pid}): {proc.returncode}")
-                self.returncode = proc.returncode
-            # Need to wait for harness to finish processing
-            # output from QEMU. Otherwise it might miss some
-            # messages.
-            self.thread.join(max(thread_max_time - time.time(), 0))
-            if self.thread.is_alive():
-                logger.debug("Timed out while monitoring QEMU output")
-
-            if os.path.exists(self.pid_fn):
                 try:
-                    with open(self.pid_fn) as pid_file:
-                        qemu_pid = int(pid_file.read())
-                    os.unlink(self.pid_fn)
-                except FileNotFoundError:
-                    # QEMU may have exited and removed its own pid file
-                    # between the existence check above and the unlink
-                    # here. Don't let that crash the whole pipeline.
-                    pass
+                    proc.wait(self.get_test_timeout())
+                except subprocess.TimeoutExpired:
+                    # sometimes QEMU can't handle SIGTERM signal correctly
+                    # in that case kill -9 QEMU process directly and leave
+                    # twister to judge testing result by console output
+
+                    failure_type = self.FailureType.TIMEOUT
+                    self.terminate(proc)
+                    if harness.status == TwisterStatus.PASS:
+                        self.returncode = 0
+                    else:
+                        self.returncode = proc.returncode
+                else:
+                    if os.path.exists(self.pid_fn):
+                        with open(self.pid_fn) as pid_file:
+                            qemu_pid = int(pid_file.read())
+                    logger.debug(
+                        f"No timeout, return code from QEMU ({qemu_pid}): {proc.returncode}"
+                    )
+                    self.returncode = proc.returncode
+                # Need to wait for harness to finish processing
+                # output from QEMU. Otherwise it might miss some
+                # messages.
+                self.thread.join(max(thread_max_time - time.time(), 0))
+                if self.thread.is_alive():
+                    logger.debug("Timed out while monitoring QEMU output")
+
+                if os.path.exists(self.pid_fn):
+                    try:
+                        with open(self.pid_fn) as pid_file:
+                            qemu_pid = int(pid_file.read())
+                        os.unlink(self.pid_fn)
+                    except FileNotFoundError:
+                        # QEMU may have exited and removed its own pid file
+                        # between the existence check above and the unlink
+                        # here. Don't let that crash the whole pipeline.
+                        pass
+            finally:
+                _end_qemu_lifeline(lifeline)
 
         logger.debug(f"return code from QEMU ({qemu_pid}): {self.returncode}")
 
