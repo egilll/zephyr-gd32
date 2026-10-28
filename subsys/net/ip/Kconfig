@@ -631,6 +631,22 @@ config NET_CONTEXT_RCVBUF
 	  If is possible to define the maximum socket receive buffer per socket.
 	  The default value is set by CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE. For
 	  TCP sockets, the rcvbuf will determine the receive window size.
+	  For datagram sockets, it bounds the buffer space the datagrams
+	  waiting to be read may hold.
+
+config NET_CONTEXT_RCVBUF_DGRAM_DEFAULT
+	int "Default receive buffer of datagram sockets"
+	depends on NET_CONTEXT_RCVBUF
+	default 0
+	range 0 65535
+	help
+	  The receive buffer a new UDP or raw IP socket starts with, in bytes
+	  of network buffer space (the size of the buffers a datagram occupies,
+	  not its length); SO_RCVBUF changes it. A datagram that would exceed it
+	  is dropped (a UDP one counted as a UDP drop), unless the queue is
+	  empty. Without a bound, a socket that is not read keeps every
+	  datagram it receives, until the receive buffers run out for the rest
+	  of the stack. 0 means no bound.
 
 config NET_CONTEXT_SNDBUF
 	bool "Add SNDBUF support to net_context"
