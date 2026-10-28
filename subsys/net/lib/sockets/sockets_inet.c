@@ -66,6 +66,81 @@ static int fifo_wait_non_empty(struct k_fifo *fifo, k_timeout_t timeout)
 	return k_poll(events, ARRAY_SIZE(events), timeout);
 }
 
+#if defined(CONFIG_NET_CONTEXT_RCVBUF)
+/* Datagrams queued by zsock_received_cb() are charged to the socket. Packet
+ * sockets share zsock_flush_queue() but queue on their own, uncharged.
+ */
+static bool dgram_charged(struct net_context *ctx)
+{
+	net_sa_family_t family = net_context_get_family(ctx);
+
+	return (family == NET_AF_INET || family == NET_AF_INET6) &&
+	       net_context_get_type(ctx) != NET_SOCK_STREAM;
+}
+
+/* The buffer space a queued datagram holds, whatever its length. A buffer
+ * of a fixed size pool holds a whole block, however little it was sized for.
+ */
+static size_t dgram_queued_size(struct net_pkt *pkt)
+{
+	size_t size = 0;
+
+	for (struct net_buf *buf = pkt->buffer; buf != NULL; buf = buf->frags) {
+		struct net_buf_pool *pool = net_buf_pool_get(buf->pool_id);
+
+		size += MAX((size_t)buf->size, pool->alloc->max_alloc_size);
+	}
+
+	return size;
+}
+
+/* Whether a datagram fits the socket's receive buffer; charges it if so.
+ * Called with the socket lock held, so admissions do not race.
+ */
+static bool dgram_admit(struct net_context *ctx, struct net_pkt *pkt)
+{
+	size_t limit = ctx->options.rcvbuf;
+	size_t size = dgram_queued_size(pkt);
+	size_t queued = (size_t)atomic_get(&ctx->recv_q_size);
+
+	/* 0 is no bound; an empty queue takes any datagram, however large */
+	if (limit != 0 && !k_fifo_is_empty(&ctx->recv_q) && size > limit - MIN(queued, limit)) {
+		return false;
+	}
+
+	(void)atomic_add(&ctx->recv_q_size, (atomic_val_t)size);
+	return true;
+}
+
+static void dgram_dequeued(struct net_context *ctx, struct net_pkt *pkt)
+{
+	if (dgram_charged(ctx)) {
+		(void)atomic_sub(&ctx->recv_q_size, (atomic_val_t)dgram_queued_size(pkt));
+	}
+}
+#else
+static inline bool dgram_charged(struct net_context *ctx)
+{
+	ARG_UNUSED(ctx);
+
+	return false;
+}
+
+static inline bool dgram_admit(struct net_context *ctx, struct net_pkt *pkt)
+{
+	ARG_UNUSED(ctx);
+	ARG_UNUSED(pkt);
+
+	return true;
+}
+
+static inline void dgram_dequeued(struct net_context *ctx, struct net_pkt *pkt)
+{
+	ARG_UNUSED(ctx);
+	ARG_UNUSED(pkt);
+}
+#endif /* CONFIG_NET_CONTEXT_RCVBUF */
+
 static void zsock_flush_queue(struct net_context *ctx)
 {
 	bool is_listen = net_context_get_state(ctx) == NET_CONTEXT_LISTENING;
@@ -83,6 +158,7 @@ static void zsock_flush_queue(struct net_context *ctx)
 			net_context_put(p);
 		} else {
 			NET_DBG("discarding pkt %p", p);
+			dgram_dequeued(ctx, p);
 			net_pkt_unref(p);
 		}
 	}
@@ -129,6 +205,12 @@ static int zsock_socket_internal(int family, int type, int proto)
 
 	/* recv_q and accept_q are in union */
 	k_fifo_init(&ctx->recv_q);
+
+#if defined(CONFIG_NET_CONTEXT_RCVBUF)
+	if (type != NET_SOCK_STREAM) {
+		ctx->options.rcvbuf = CONFIG_NET_CONTEXT_RCVBUF_DGRAM_DEFAULT;
+	}
+#endif
 
 	/* Condition variable is used to avoid keeping lock for a long time
 	 * when waiting data to be received
@@ -276,6 +358,13 @@ static void zsock_received_cb(struct net_context *ctx,
 	}
 
 	/* Normal packet */
+	if (dgram_charged(ctx) && !dgram_admit(ctx, pkt)) {
+		NET_DBG("%sctx=%p, pkt=%p: receive buffer full", "DROP: ", ctx, pkt);
+		net_stats_update_per_proto_drop(net_pkt_iface(pkt), net_context_get_proto(ctx));
+		net_pkt_unref(pkt);
+		goto unlock;
+	}
+
 	net_pkt_set_eof(pkt, false);
 
 	net_pkt_set_rx_stats_tick(pkt, k_cycle_get_32());
@@ -1288,6 +1377,9 @@ static ssize_t zsock_recv_dgram(struct net_context *ctx,
 		pkt = k_fifo_peek_head(&ctx->recv_q);
 	} else {
 		pkt = k_fifo_get(&ctx->recv_q, timeout);
+		if (pkt != NULL) {
+			dgram_dequeued(ctx, pkt);
+		}
 	}
 
 	if (!pkt) {

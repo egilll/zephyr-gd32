@@ -305,6 +305,11 @@ __net_socket struct net_context {
 		struct k_fifo accept_q;
 	};
 
+#if defined(CONFIG_NET_CONTEXT_RCVBUF)
+	/** Buffer space held by the datagrams waiting in recv_q */
+	atomic_t recv_q_size;
+#endif
+
 	struct {
 		/** Condition variable used when receiving data */
 		struct k_condvar recv;
