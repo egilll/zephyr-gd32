@@ -645,6 +645,41 @@ ZTEST(net_socket_service, test_failing_poll_backs_off)
 	zassert_ok(called, "The service was not served once its descriptor recovered");
 }
 
+/* A registration with too many descriptors must leave the one it would replace. */
+ZTEST(net_socket_service, test_too_many_fds_keeps_registration)
+{
+	struct zsock_pollfd pollfd[2] = {
+		{.events = ZSOCK_POLLIN},
+		{.fd = -1, .events = ZSOCK_POLLIN},
+	};
+	int called, fd, ret;
+
+	reconfig_mock_init(&wakeup_mock);
+	k_sem_reset(&wakeup_called);
+	fd = reconfig_mock_alloc(&wakeup_mock);
+	zassert_true(fd >= 0, "Cannot allocate fd (%d)", fd);
+
+	pollfd[0].fd = fd;
+	ret = net_socket_service_register(&wakeup_service, pollfd, 1, NULL);
+	if (ret != 0) {
+		(void)zvfs_close(fd);
+	}
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+	zassert_ok(k_sem_take(&wakeup_mock.prepared, RECONFIG_TIMEOUT),
+		   "Service did not poll the fd");
+
+	ret = net_socket_service_register(&wakeup_service, pollfd, ARRAY_SIZE(pollfd), NULL);
+
+	k_sem_give(&wakeup_mock.readable);
+	called = k_sem_take(&wakeup_called, RECONFIG_TIMEOUT);
+
+	(void)net_socket_service_unregister(&wakeup_service);
+	(void)zvfs_close(fd);
+
+	zassert_equal(ret, -ENOMEM, "Oversized registration returned %d", ret);
+	zassert_ok(called, "The registration in place was dropped");
+}
+
 ZTEST(net_socket_service, test_close_from_callback)
 {
 	struct zsock_pollfd pollfd = {.events = ZSOCK_POLLIN};

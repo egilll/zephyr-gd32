@@ -82,6 +82,15 @@ int z_impl_net_socket_service_register(const struct net_socket_service_desc *svc
 		goto out;
 	}
 
+	/* Refuse before touching the registration it would replace */
+	if (fds != NULL && len > svc->pev_len) {
+		NET_DBG("Too many file descriptors, "
+			"max is %d for service %p",
+			svc->pev_len, svc);
+		ret = -ENOMEM;
+		goto out;
+	}
+
 	if ((fds != NULL) || (user_data != NET_SOCKET_SERVICE_CLOSE_SOCKETS)) {
 		cleanup_svc_events(svc);
 	} else {
@@ -89,14 +98,6 @@ int z_impl_net_socket_service_register(const struct net_socket_service_desc *svc
 	}
 
 	if (fds != NULL) {
-		if (len > svc->pev_len) {
-			NET_DBG("Too many file descriptors, "
-				"max is %d for service %p",
-				svc->pev_len, svc);
-			ret = -ENOMEM;
-			goto out;
-		}
-
 		for (i = 0; i < len; i++) {
 			svc->pev[i].event = fds[i];
 			svc->pev[i].user_data = user_data;
