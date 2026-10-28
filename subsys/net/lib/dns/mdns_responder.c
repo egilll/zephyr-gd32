@@ -2703,6 +2703,9 @@ static int register_dispatcher(struct mdns_responder_context *ctx,
 			       struct zsock_pollfd *fds,
 			       size_t fds_len)
 {
+	int prev_fd;
+	int ret;
+
 	ctx->dispatcher.type = DNS_SOCKET_RESPONDER;
 	ctx->dispatcher.cb = dispatcher_cb;
 	ctx->dispatcher.fds = fds;
@@ -2712,13 +2715,6 @@ static int register_dispatcher(struct mdns_responder_context *ctx,
 	ctx->dispatcher.mdns_ctx = ctx;
 	ctx->dispatcher.pair = NULL;
 	ctx->dispatcher.ifindex = ifindex;
-
-	/* Mark the fd so that "net sockets" can show it. This is needed if there
-	 * is already a socket bound to same port and the dispatcher will mux
-	 * the connections. Without this, the FD in "net sockets" services list will
-	 * show the socket descriptor value as -1.
-	 */
-	svc->pev[0].event.fd = ctx->sock;
 
 	if (IS_ENABLED(CONFIG_NET_IPV6) && local->sa_family == NET_AF_INET6) {
 		if (local_len < sizeof(struct net_sockaddr_in6)) {
@@ -2738,7 +2734,21 @@ static int register_dispatcher(struct mdns_responder_context *ctx,
 		return -ENOTSUP;
 	}
 
-	return dns_dispatcher_register(&ctx->dispatcher);
+	/* Mark the fd so that "net sockets" can show it. This is needed if there
+	 * is already a socket bound to same port and the dispatcher will mux
+	 * the connections. Without this, the FD in "net sockets" services list will
+	 * show the socket descriptor value as -1. A registration that fails puts
+	 * back what was there, as the socket is then closed.
+	 */
+	prev_fd = svc->pev[0].event.fd;
+	svc->pev[0].event.fd = ctx->sock;
+
+	ret = dns_dispatcher_register(&ctx->dispatcher);
+	if (ret < 0 && ret != -EALREADY) {
+		svc->pev[0].event.fd = prev_fd;
+	}
+
+	return ret;
 }
 
 #if defined(CONFIG_MDNS_RESPONDER_PROBE)
@@ -2920,6 +2930,11 @@ static int init_listener(void)
 		if (ret < 0 && ret != -EALREADY) {
 			NET_DBG("Cannot register %s %s socket service (%d)",
 				"IPv6", "mDNS", ret);
+			/* Give back the slot this socket took, so that neither
+			 * a later registration nor teardown sees it once closed.
+			 */
+			ipv6_fds[--fds_pos].fd = -1;
+			v6_ctx[i].sock = -1;
 			zsock_close(v6);
 		} else {
 			ok++;
@@ -3005,6 +3020,11 @@ static int init_listener(void)
 		if (ret < 0 && ret != -EALREADY) {
 			NET_DBG("Cannot register %s %s socket service (%d)",
 				"IPv4", "mDNS", ret);
+			/* Give back the slot this socket took, so that neither
+			 * a later registration nor teardown sees it once closed.
+			 */
+			ipv4_fds[--fds_pos].fd = -1;
+			v4_ctx[i].sock = -1;
 			zsock_close(v4);
 		} else {
 			ok++;
