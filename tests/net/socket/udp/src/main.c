@@ -4585,6 +4585,92 @@ ZTEST(net_socket_udp, test_v6_rebinding)
 	test_rebinding_common(NET_AF_INET6);
 }
 
+#if defined(CONFIG_NET_CONTEXT_RCVBUF)
+static void rcvbuf_send(int sock, struct net_sockaddr_in *to, int count)
+{
+	for (int i = 0; i < count; i++) {
+		zassert_equal(zsock_sendto(sock, TEST_STR_SMALL, strlen(TEST_STR_SMALL), 0,
+					   (struct net_sockaddr *)to, sizeof(*to)),
+			      strlen(TEST_STR_SMALL), "sendto failed");
+	}
+	/* Let the loopback deliver them */
+	k_msleep(100);
+}
+
+static int rcvbuf_drain(int sock)
+{
+	int received = 0;
+
+	while (zsock_recv(sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT) >= 0) {
+		received++;
+	}
+	zassert_equal(errno, EAGAIN, "recv failed (%d)", errno);
+	return received;
+}
+#endif
+
+ZTEST(net_socket_udp, test_dgram_rcvbuf)
+{
+#if defined(CONFIG_NET_CONTEXT_RCVBUF)
+	struct net_sockaddr_in client_addr;
+	struct net_sockaddr_in server_addr;
+	net_socklen_t optlen = sizeof(int);
+	int client_sock;
+	int server_sock;
+	int rcvbuf = -1;
+
+	prepare_sock_udp_v4(MY_IPV4_ADDR, ANY_PORT, &client_sock, &client_addr);
+	prepare_sock_udp_v4(MY_IPV4_ADDR, SERVER_PORT, &server_sock, &server_addr);
+	zassert_ok(zsock_bind(server_sock, (struct net_sockaddr *)&server_addr,
+			      sizeof(server_addr)));
+
+	/* A new datagram socket starts with the configured default */
+	zassert_ok(zsock_getsockopt(server_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVBUF, &rcvbuf,
+				    &optlen));
+	zassert_equal(rcvbuf, CONFIG_NET_CONTEXT_RCVBUF_DGRAM_DEFAULT);
+
+	/* An empty queue takes a datagram larger than the bound, nothing more */
+	rcvbuf = 1;
+	zassert_ok(zsock_setsockopt(server_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVBUF, &rcvbuf,
+				    sizeof(rcvbuf)));
+	rcvbuf_send(client_sock, &server_addr, 3);
+	zassert_equal(rcvbuf_drain(server_sock), 1, "the bound did not hold");
+
+	/* A small datagram takes one network buffer: room for exactly three */
+	rcvbuf = 3 * CONFIG_NET_BUF_DATA_SIZE;
+	zassert_ok(zsock_setsockopt(server_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVBUF, &rcvbuf,
+				    sizeof(rcvbuf)));
+	rcvbuf_send(client_sock, &server_addr, 5);
+
+	/* Reading one gives its space back while the others stay queued */
+	zassert_true(zsock_recv(server_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT) >= 0,
+		     "recv failed");
+	rcvbuf_send(client_sock, &server_addr, 2);
+
+	/* A peeked datagram still holds its space */
+	zassert_true(zsock_recv(server_sock, rx_buf, sizeof(rx_buf),
+				ZSOCK_MSG_PEEK | ZSOCK_MSG_DONTWAIT) >= 0, "peek failed");
+	rcvbuf_send(client_sock, &server_addr, 1);
+	zassert_equal(rcvbuf_drain(server_sock), 3, "the queue did not hold exactly three");
+
+	/* Draining gave every datagram's space back */
+	rcvbuf_send(client_sock, &server_addr, 4);
+	zassert_equal(rcvbuf_drain(server_sock), 3, "space was not given back");
+
+	/* 0 lifts the bound */
+	rcvbuf = 0;
+	zassert_ok(zsock_setsockopt(server_sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVBUF, &rcvbuf,
+				    sizeof(rcvbuf)));
+	rcvbuf_send(client_sock, &server_addr, 3);
+	zassert_equal(rcvbuf_drain(server_sock), 3, "unbounded socket dropped datagrams");
+
+	zassert_ok(zsock_close(client_sock));
+	zassert_ok(zsock_close(server_sock));
+#else
+	ztest_test_skip();
+#endif
+}
+
 static void after(void *arg)
 {
 	ARG_UNUSED(arg);
