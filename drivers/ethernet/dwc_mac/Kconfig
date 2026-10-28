@@ -117,6 +117,18 @@ config ETH_DWMAC_MMU
 	  This enables the Synopsys DesignWare MAC driver on MMU based
 	  platforms.
 
+config ETH_DWC_ETHER_1000_CORE_MMC_IPC
+	bool
+	depends on ETH_DWC_ETHER_1000_CORE
+	default n if ETH_GD32_DWC_ETHER_1000
+	default y
+	help
+	  The MAC may have the MMC receive checksum offload counters, at
+	  offset 0x200, and the driver masks their interrupts unless the
+	  hardware feature register says the type 2 receive checksum
+	  engine they come with is absent. GD32F4xx MACs have neither the
+	  counters nor that register.
+
 config ETH_DWC_ETHER_1000_CORE_EDFE
 	bool
 	depends on ETH_DWC_ETHER_1000_CORE

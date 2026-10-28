@@ -641,7 +641,15 @@ int dwmac_probe(const struct device *dev)
 	 */
 	DWMAC_REG_WRITE(DWMAC_MMC_RX_INTERRUPT_MASK, UINT32_MAX);
 	DWMAC_REG_WRITE(DWMAC_MMC_TX_INTERRUPT_MASK, UINT32_MAX);
-	DWMAC_REG_WRITE(DWMAC_MMC_IPC_RX_INTERRUPT_MASK, UINT32_MAX);
+	/*
+	 * The receive checksum offload counters, and their mask, come with the
+	 * type 2 receive checksum engine. Skip them where the hardware feature
+	 * register says it is absent, or the integration has none.
+	 */
+	if (IS_ENABLED(CONFIG_ETH_DWC_ETHER_1000_CORE_MMC_IPC) &&
+	    (p->feature0 == 0U || (p->feature0 & DWMAC_HWFR_RXCHKV2) != 0U)) {
+		DWMAC_REG_WRITE(DWMAC_MMC_IPC_RX_INTERRUPT_MASK, UINT32_MAX);
+	}
 
 	DWMAC_REG_WRITE(DWMAC_DMAOMR, DWMAC_DMAOMR_TSF | DWMAC_DMAOMR_RSF);
 
