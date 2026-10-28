@@ -206,10 +206,14 @@ config ETH_DWC_ETHER_TX_HW_CHECKSUM_EN
 config ETH_DWC_ETHER_RX_HW_CHECKSUM
 	bool "Use RX hardware checksum"
 	select NET_CHECKSUM_OFFLOAD_SUPPORTED if NET_L2_ETHERNET
+	default n if ETH_GD32_DWC_ETHER_1000
 	default y
 	help
 	  Enable receive checksum offload to enhance throughput
 	  performances.
+
+	  Off by default on GD32F4xx: with it, the MAC drops valid frames
+	  whose IPv4 header checksum is 0x0000 (GD32F45x/F40x errata 2.14.2).
 
 config ETH_DWC_ETHER_RX_HW_CHECKSUM_EN
 	bool
