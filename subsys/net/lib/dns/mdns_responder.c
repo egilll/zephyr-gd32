@@ -3024,6 +3024,20 @@ static int init_listener(void)
 static K_MUTEX_DEFINE(reconfigure_lock);
 static void mdns_leave_groups_cb(struct net_if *iface, void *user_data);
 
+/* Take a socket out of a poll set shared by the listeners of one family, so
+ * that unregistering its dispatcher does not hand the socket service a set
+ * that still holds a descriptor about to be closed and reused.
+ */
+static void mdns_forget_fd(struct zsock_pollfd *fds, size_t fds_len, int sock)
+{
+	for (size_t i = 0; i < fds_len; i++) {
+		if (fds[i].fd == sock) {
+			fds[i].fd = -1;
+			break;
+		}
+	}
+}
+
 /* Tear down every listener socket and its dispatcher registration. The sockets
  * are recreated for the interfaces that remain enabled by init_listener().
  */
@@ -3037,6 +3051,7 @@ static void mdns_close_listeners(void)
 			continue;
 		}
 
+		mdns_forget_fd(ipv6_fds, ARRAY_SIZE(ipv6_fds), sock);
 		(void)dns_dispatcher_unregister(&v6_ctx[i].dispatcher);
 		(void)zsock_close(sock);
 		v6_ctx[i].sock = -1;
@@ -3051,6 +3066,7 @@ static void mdns_close_listeners(void)
 			continue;
 		}
 
+		mdns_forget_fd(ipv4_fds, ARRAY_SIZE(ipv4_fds), sock);
 		(void)dns_dispatcher_unregister(&v4_ctx[i].dispatcher);
 		(void)zsock_close(sock);
 		v4_ctx[i].sock = -1;
