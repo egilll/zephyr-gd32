@@ -10,6 +10,7 @@
 
 #include <zephyr/cache.h>
 #include <zephyr/device.h>
+#include <zephyr/devicetree/nvmem.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/pinctrl.h>
