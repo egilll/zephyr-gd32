@@ -303,6 +303,100 @@ ZTEST(dns_dispatcher, test_dispatcher_null_slot_dropped)
 	dns_dispatcher_svc_handler(&pev);
 }
 
+static atomic_t stale_hits;
+static atomic_t fresh_hits;
+
+static int stale_cb(struct dns_socket_dispatcher *ctx, int sock, struct net_sockaddr *addr,
+		    size_t addrlen, struct net_buf *buf, size_t data_len)
+{
+	atomic_inc(&stale_hits);
+	return test_dispatch_cb(ctx, sock, addr, addrlen, buf, data_len);
+}
+
+static int fresh_cb(struct dns_socket_dispatcher *ctx, int sock, struct net_sockaddr *addr,
+		    size_t addrlen, struct net_buf *buf, size_t data_len)
+{
+	atomic_inc(&fresh_hits);
+	return test_dispatch_cb(ctx, sock, addr, addrlen, buf, data_len);
+}
+
+/* A dispatcher whose registration fails must leave no dispatch slot behind:
+ * once its socket is closed and the descriptor reused, data on that descriptor
+ * belongs to the dispatcher registered with it.
+ */
+ZTEST(dns_dispatcher, test_failed_register_leaves_no_slot)
+{
+	static struct dns_socket_dispatcher failed;
+	static struct dns_socket_dispatcher fresh;
+	/* More descriptors than test_pair_svc holds, so that registering fails */
+	static struct zsock_pollfd failed_fds[2];
+	static struct zsock_pollfd fresh_fds[1];
+	/* Identifier, then flags with QR set: an answer, which goes to a resolver */
+	static const uint8_t answer[] = {0x12, 0x34, 0x80, 0x00};
+	struct net_sockaddr_in failed_local = {
+		.sin_family = NET_AF_INET,
+		.sin_port = net_htons(65124),
+	};
+	struct net_sockaddr_in fresh_local = {
+		.sin_family = NET_AF_INET,
+		.sin_port = net_htons(65125),
+	};
+	struct net_sockaddr_in to = fresh_local;
+	int sock, fresh_sock, client, ret;
+
+	atomic_clear(&stale_hits);
+	atomic_clear(&fresh_hits);
+
+	sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(sock >= 0, "Cannot create socket");
+	failed_fds[0].fd = sock;
+	failed_fds[0].events = ZSOCK_POLLIN;
+	failed_fds[1].fd = -1;
+	failed.type = DNS_SOCKET_RESOLVER;
+	failed.cb = stale_cb;
+	failed.fds = failed_fds;
+	failed.fds_len = ARRAY_SIZE(failed_fds);
+	failed.sock = sock;
+	failed.svc = &test_pair_svc;
+	memcpy(&failed.local_addr_storage, &failed_local, sizeof(failed_local));
+
+	ret = dns_dispatcher_register(&failed);
+	zassert_equal(ret, -ENOMEM, "Registration did not fail (%d)", ret);
+	(void)zsock_close(sock);
+
+	fresh_sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_equal(fresh_sock, sock, "Descriptor %d not reused (%d)", sock, fresh_sock);
+	fresh_fds[0].fd = fresh_sock;
+	fresh_fds[0].events = ZSOCK_POLLIN;
+	fresh.type = DNS_SOCKET_RESOLVER;
+	fresh.cb = fresh_cb;
+	fresh.fds = fresh_fds;
+	fresh.fds_len = ARRAY_SIZE(fresh_fds);
+	fresh.sock = fresh_sock;
+	fresh.svc = &test_pair_svc;
+	memcpy(&fresh.local_addr_storage, &fresh_local, sizeof(fresh_local));
+	zassert_ok(dns_dispatcher_register(&fresh), "Cannot register dispatcher");
+
+	client = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(client >= 0, "Cannot create client socket");
+	to.sin_addr = my_addr2;
+	ret = zsock_sendto(client, answer, sizeof(answer), 0, (struct net_sockaddr *)&to,
+			   sizeof(to));
+
+	for (int i = 0; i < 50 && atomic_get(&fresh_hits) == 0 && atomic_get(&stale_hits) == 0;
+	     i++) {
+		k_msleep(10);
+	}
+
+	(void)dns_dispatcher_unregister(&fresh);
+	(void)zsock_close(fresh_sock);
+	(void)zsock_close(client);
+
+	zassert_equal(ret, sizeof(answer), "Cannot send (%d)", errno);
+	zassert_equal(atomic_get(&stale_hits), 0, "Data went to the failed dispatcher");
+	zassert_true(atomic_get(&fresh_hits) > 0, "Data did not reach the dispatcher");
+}
+
 ZTEST(dns_dispatcher, test_dns_dispatcher_ephemeral_ports)
 {
 	static const char * const servers[] = { DNS_NAME_IPV4, DNS2_NAME_IPV4, NULL };
