@@ -53,3 +53,37 @@ ZTEST_USER_F(net_socketpair, test_read_nonblock)
 			"actual: %d", errno);
 	}
 }
+
+ZTEST_USER_F(net_socketpair, test_write_dontwait)
+{
+	int res;
+
+	for (size_t i = 0; i < 2; ++i) {
+		/* fill up the buffer of a blocking socket */
+		for (size_t k = 0; k < CONFIG_NET_SOCKETPAIR_BUFFER_SIZE;
+			++k) {
+			res = zsock_send(fixture->sv[i], "x", 1, 0);
+			zassert_equal(res, 1, "send() failed: %d", errno);
+		}
+
+		/* then, try to write one more byte without waiting */
+		res = zsock_send(fixture->sv[i], "x", 1, ZSOCK_MSG_DONTWAIT);
+		zassert_equal(res, -1, "expected send to fail");
+		zassert_equal(errno, EAGAIN, "errno: expected: EAGAIN "
+			"actual: %d", errno);
+	}
+}
+
+ZTEST_USER_F(net_socketpair, test_read_dontwait)
+{
+	int res;
+	char c;
+
+	for (size_t i = 0; i < 2; ++i) {
+		/* try to read one byte from a blocking socket without waiting */
+		res = zsock_recv(fixture->sv[i], &c, 1, ZSOCK_MSG_DONTWAIT);
+		zassert_equal(res, -1, "expected recv() to fail");
+		zassert_equal(errno, EAGAIN, "errno: expected: EAGAIN "
+			"actual: %d", errno);
+	}
+}

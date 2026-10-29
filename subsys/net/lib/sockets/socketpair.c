@@ -397,7 +397,7 @@ out:
  * @return on success, a number > 0 representing the number of bytes written
  * @return -1 on error, with @ref errno set appropriately.
  */
-static ssize_t spair_write(void *obj, const void *buffer, size_t count)
+static ssize_t spair_write_flags(void *obj, const void *buffer, size_t count, bool dontwait)
 {
 	int res;
 	size_t avail;
@@ -416,7 +416,7 @@ static ssize_t spair_write(void *obj, const void *buffer, size_t count)
 	}
 
 	res = k_sem_take(&spair->sem, K_NO_WAIT);
-	is_nonblock = sock_is_nonblock(spair);
+	is_nonblock = dontwait || sock_is_nonblock(spair);
 	if (res < 0) {
 		if (is_nonblock) {
 			errno = EAGAIN;
@@ -430,7 +430,7 @@ static ssize_t spair_write(void *obj, const void *buffer, size_t count)
 			res = -1;
 			goto out;
 		}
-		is_nonblock = sock_is_nonblock(spair);
+		is_nonblock = dontwait || sock_is_nonblock(spair);
 	}
 
 	have_local_sem = true;
@@ -570,6 +570,11 @@ out:
 	return res;
 }
 
+static ssize_t spair_write(void *obj, const void *buffer, size_t count)
+{
+	return spair_write_flags(obj, buffer, count, false);
+}
+
 /**
  * Read data from one end of a @ref spair
  *
@@ -604,7 +609,7 @@ out:
  * @return on success, a number > 0 representing the number of bytes written
  * @return -1 on error, with @ref errno set appropriately.
  */
-static ssize_t spair_read(void *obj, void *buffer, size_t count)
+static ssize_t spair_read_flags(void *obj, void *buffer, size_t count, bool dontwait)
 {
 	int res;
 	bool is_connected;
@@ -622,7 +627,7 @@ static ssize_t spair_read(void *obj, void *buffer, size_t count)
 	}
 
 	res = k_sem_take(&spair->sem, K_NO_WAIT);
-	is_nonblock = sock_is_nonblock(spair);
+	is_nonblock = dontwait || sock_is_nonblock(spair);
 	if (res < 0) {
 		if (is_nonblock) {
 			errno = EAGAIN;
@@ -636,7 +641,7 @@ static ssize_t spair_read(void *obj, void *buffer, size_t count)
 			res = -1;
 			goto out;
 		}
-		is_nonblock = sock_is_nonblock(spair);
+		is_nonblock = dontwait || sock_is_nonblock(spair);
 	}
 
 	have_local_sem = true;
@@ -738,6 +743,11 @@ out:
 	}
 
 	return res;
+}
+
+static ssize_t spair_read(void *obj, void *buffer, size_t count)
+{
+	return spair_read_flags(obj, buffer, count, false);
 }
 
 static int zsock_poll_prepare_ctx(struct spair *const spair,
@@ -1043,18 +1053,16 @@ static ssize_t spair_sendto(void *obj, const void *buf, size_t len,
 			    int flags, const struct net_sockaddr *dest_addr,
 			    net_socklen_t addrlen)
 {
-	ARG_UNUSED(flags);
 	ARG_UNUSED(dest_addr);
 	ARG_UNUSED(addrlen);
 
-	return spair_write(obj, buf, len);
+	return spair_write_flags(obj, buf, len, (flags & ZSOCK_MSG_DONTWAIT) != 0);
 }
 
 static ssize_t spair_sendmsg(void *obj, const struct net_msghdr *msg,
 			     int flags)
 {
-	ARG_UNUSED(flags);
-
+	const bool dontwait = (flags & ZSOCK_MSG_DONTWAIT) != 0;
 	int res;
 	size_t len = 0;
 	bool is_connected;
@@ -1070,7 +1078,7 @@ static ssize_t spair_sendmsg(void *obj, const struct net_msghdr *msg,
 
 	is_connected = sock_is_connected(spair);
 	avail = is_connected ? spair_write_avail(spair) : 0;
-	is_nonblock = sock_is_nonblock(spair);
+	is_nonblock = dontwait || sock_is_nonblock(spair);
 
 	for (size_t i = 0; i < msg->msg_iovlen; ++i) {
 		/* check & msg->msg_iov[i]? */
@@ -1096,8 +1104,8 @@ static ssize_t spair_sendmsg(void *obj, const struct net_msghdr *msg,
 	}
 
 	for (size_t i = 0; i < msg->msg_iovlen; ++i) {
-		res = spair_write(spair, msg->msg_iov[i].iov_base,
-			msg->msg_iov[i].iov_len);
+		res = spair_write_flags(spair, msg->msg_iov[i].iov_base,
+			msg->msg_iov[i].iov_len, dontwait);
 		if (res == -1) {
 			goto out;
 		}
@@ -1113,9 +1121,7 @@ static ssize_t spair_recvfrom(void *obj, void *buf, size_t max_len,
 			      int flags, struct net_sockaddr *src_addr,
 			      net_socklen_t *addrlen)
 {
-	(void)flags;
 	(void)src_addr;
-	(void)addrlen;
 
 	if (addrlen != NULL) {
 		/* Protocol (PF_UNIX) does not support addressing with connected
@@ -1130,7 +1136,7 @@ static ssize_t spair_recvfrom(void *obj, void *buf, size_t max_len,
 		*addrlen = 0;
 	}
 
-	return spair_read(obj, buf, max_len);
+	return spair_read_flags(obj, buf, max_len, (flags & ZSOCK_MSG_DONTWAIT) != 0);
 }
 
 static int spair_getsockopt(void *obj, int level, int optname,
