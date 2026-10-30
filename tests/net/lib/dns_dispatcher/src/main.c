@@ -397,6 +397,59 @@ ZTEST(dns_dispatcher, test_failed_register_leaves_no_slot)
 	zassert_true(atomic_get(&fresh_hits) > 0, "Data did not reach the dispatcher");
 }
 
+/* A datagram on a socket whose dispatch slot is empty (the socket was just
+ * unregistered, or its descriptor left polled) must still be read. Left
+ * queued, it keeps the socket readable, so the socket service calls the
+ * handler again at once, in a loop that starves every thread of lower
+ * priority.
+ */
+ZTEST(dns_dispatcher, test_null_slot_datagram_is_consumed)
+{
+	static const uint8_t answer[] = {0x12, 0x34, 0x80, 0x00};
+	struct net_sockaddr_in local = {
+		.sin_family = NET_AF_INET,
+		.sin_port = net_htons(65127),
+	};
+	struct net_sockaddr_in to = local;
+	struct zsock_pollfd pollfd = {.events = ZSOCK_POLLIN};
+	struct net_socket_service_event pev = {
+		.event = {
+			.events = ZSOCK_POLLIN,
+			.revents = ZSOCK_POLLIN,
+		},
+	};
+	uint8_t buf[sizeof(answer)];
+	int sock, client, ready, ret, err;
+
+	sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(sock >= 0, "Cannot create socket");
+	zassert_ok(zsock_bind(sock, (struct net_sockaddr *)&local, sizeof(local)),
+		   "Cannot bind (%d)", errno);
+	client = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(client >= 0, "Cannot create client socket");
+	to.sin_addr = my_addr2;
+	(void)zsock_sendto(client, answer, sizeof(answer), 0, (struct net_sockaddr *)&to,
+			   sizeof(to));
+	pollfd.fd = sock;
+	ready = zsock_poll(&pollfd, 1, 1000);
+
+	/* No dispatcher in the socket's slot */
+	struct dns_socket_dispatcher *table[sock + 1];
+
+	memset(table, 0, sizeof(table));
+	pev.event.fd = sock;
+	pev.user_data = table;
+	dns_dispatcher_svc_handler(&pev);
+
+	ret = zsock_recv(sock, buf, sizeof(buf), ZSOCK_MSG_DONTWAIT);
+	err = errno;
+	(void)zsock_close(client);
+	(void)zsock_close(sock);
+
+	zassert_equal(ready, 1, "The datagram did not arrive");
+	zassert_true(ret < 0 && err == EAGAIN, "The datagram was left queued (%d)", ret);
+}
+
 #define STALE_HANDLER_STACK_SIZE 2048
 
 static K_THREAD_STACK_DEFINE(stale_handler_stack, STALE_HANDLER_STACK_SIZE);
