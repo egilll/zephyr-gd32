@@ -142,7 +142,7 @@ int sntp_send_async(struct sntp_ctx *ctx);
  * @param ts Timestamp including integer and fractional seconds since
  * 1 Jan 1970 (output).
  *
- * @return 0 if ok, <0 if error
+ * @return 0 if ok, -EAGAIN if there was nothing to read yet, <0 if error
  */
 int sntp_read_async(struct net_socket_service_event *event, struct sntp_time *ts);
 

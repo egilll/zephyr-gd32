@@ -154,6 +154,10 @@ static void sntp_async_service_handler(struct net_socket_service_event *pev)
 	int ret;
 
 	ret = sntp_read_async(pev, &ts);
+	if (ret == -EAGAIN) {
+		/* Nothing to read after all; the timeout covers no response */
+		return;
+	}
 	if (ret < 0) {
 		LOG_ERR("Failed to read SNTP response (%d)", ret);
 		goto out;

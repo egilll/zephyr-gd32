@@ -329,7 +329,10 @@ int sntp_read_async(struct net_socket_service_event *event, struct sntp_time *ts
 	struct sntp_pkt buf = {0};
 	int rcvd;
 
-	rcvd = zsock_recv(ctx->sock.fd, (uint8_t *)&buf, sizeof(buf), 0);
+	/* Do not wait: this runs on the socket service thread, and the event
+	 * may be stale by now, which would stall every socket it serves.
+	 */
+	rcvd = zsock_recv(ctx->sock.fd, (uint8_t *)&buf, sizeof(buf), ZSOCK_MSG_DONTWAIT);
 	if (rcvd < 0) {
 		return -errno;
 	}
