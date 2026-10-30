@@ -298,8 +298,9 @@ restart:
 			ret = ret < 0 ? -errno : 0;
 			backoff_ms = CLAMP(backoff_ms * 2, SOCKET_SERVICE_REBUILD_BACKOFF_MIN_MS,
 					   SOCKET_SERVICE_REBUILD_BACKOFF_MAX_MS);
-			NET_ERR("poll %s (%d), rebuilding socket service in %d ms",
-				ret < 0 ? "failed" : "returned no events", ret, backoff_ms);
+			NET_ERR_RATELIMIT("poll %s (%d), rebuilding socket service in %d ms",
+					  ret < 0 ? "failed" : "returned no events", ret,
+					  backoff_ms);
 			rebuild_backoff(ctx.events[0].fd, backoff_ms);
 			goto restart;
 		}
