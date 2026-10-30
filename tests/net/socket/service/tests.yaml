@@ -7,3 +7,11 @@ tests:
       - net
       - socket
       - poll
+  net.socket.service.high_priority:
+    min_ram: 21
+    tags:
+      - net
+      - socket
+      - poll
+    extra_configs:
+      - CONFIG_NET_SOCKETS_SERVICE_THREAD_PRIO=10

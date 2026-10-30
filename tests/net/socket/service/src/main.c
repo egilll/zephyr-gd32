@@ -982,3 +982,86 @@ ZTEST(net_socket_service, test_reconfigure_from_callback)
 }
 
 ZTEST_SUITE(net_socket_service, NULL, NULL, NULL, NULL, NULL);
+
+#define UNREAD_PORT 4250
+
+static atomic_t unread_calls;
+static atomic_t witness_runs;
+
+/* Leaves the datagram queued, as the DNS dispatcher once did */
+static void unread_handler(struct net_socket_service_event *pev)
+{
+	ARG_UNUSED(pev);
+
+	atomic_inc(&unread_calls);
+}
+
+NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(unread_service, unread_handler, 1);
+
+static K_THREAD_STACK_DEFINE(witness_stack, 512);
+static struct k_thread witness_thread;
+
+static void witness(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (true) {
+		atomic_inc(&witness_runs);
+		k_yield();
+	}
+}
+
+/*
+ * A handler that leaves its socket readable makes every poll() return at
+ * once. The service thread must still let threads of lower priority run; on a
+ * device, starving them set off the task watchdog.
+ */
+ZTEST(net_socket_service, test_unread_socket_does_not_starve_threads)
+{
+	struct net_sockaddr_in6 c_addr, s_addr;
+	struct zsock_pollfd pollfd = {.events = ZSOCK_POLLIN};
+	static const uint8_t datagram[] = {1, 2, 3, 4};
+	uint8_t buf[sizeof(datagram)];
+	int c_sock, s_sock, ret;
+	long runs, calls;
+
+	prepare_sock_udp_v6(MY_IPV6_ADDR, ANY_PORT, &c_sock, &c_addr);
+	prepare_sock_udp_v6(MY_IPV6_ADDR, UNREAD_PORT, &s_sock, &s_addr);
+	zassert_ok(zsock_bind(s_sock, (struct net_sockaddr *)&s_addr, sizeof(s_addr)),
+		   "Cannot bind (%d)", errno);
+	(void)zsock_sendto(c_sock, datagram, sizeof(datagram), 0,
+			   (struct net_sockaddr *)&s_addr, sizeof(s_addr));
+	pollfd.fd = s_sock;
+	zassert_equal(zsock_poll(&pollfd, 1, 1000), 1, "The datagram did not arrive");
+
+	k_thread_create(&witness_thread, witness_stack, K_THREAD_STACK_SIZEOF(witness_stack),
+			witness, NULL, NULL, NULL, K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	atomic_clear(&unread_calls);
+
+	ret = net_socket_service_register(&unread_service, &pollfd, 1, NULL);
+	k_msleep(20);
+
+	/* The witness must keep running, not just once */
+	for (int window = 0; window < 4; window++) {
+		atomic_clear(&witness_runs);
+		atomic_clear(&unread_calls);
+		k_msleep(50);
+		runs = atomic_get(&witness_runs);
+		calls = atomic_get(&unread_calls);
+		if (runs == 0 || calls == 0) {
+			break;
+		}
+	}
+
+	(void)net_socket_service_unregister(&unread_service);
+	(void)zsock_recv(s_sock, buf, sizeof(buf), ZSOCK_MSG_DONTWAIT);
+	k_thread_abort(&witness_thread);
+	(void)zsock_close(c_sock);
+	(void)zsock_close(s_sock);
+
+	zassert_ok(ret, "Cannot register service (%d)", ret);
+	zassert_true(calls > 0, "The handler stopped being called");
+	zassert_true(runs > 0, "A thread of lower priority did not run for 50 ms");
+}
