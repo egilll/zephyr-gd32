@@ -397,6 +397,88 @@ ZTEST(dns_dispatcher, test_failed_register_leaves_no_slot)
 	zassert_true(atomic_get(&fresh_hits) > 0, "Data did not reach the dispatcher");
 }
 
+#define STALE_HANDLER_STACK_SIZE 2048
+
+static K_THREAD_STACK_DEFINE(stale_handler_stack, STALE_HANDLER_STACK_SIZE);
+static struct k_thread stale_handler_thread;
+
+static void stale_handler(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	dns_dispatcher_svc_handler(p1);
+}
+
+/* A socket polled readable may be closed, and its descriptor reused by one
+ * with nothing queued, before the socket service dispatches the event. The
+ * handler must then return rather than wait for data on the new socket: it
+ * runs on the socket service thread, which would stall every socket it serves.
+ */
+ZTEST(dns_dispatcher, test_stale_readiness_does_not_block)
+{
+	static struct dns_socket_dispatcher fresh;
+	static struct zsock_pollfd fresh_fds[1];
+	struct net_sockaddr_in local = {
+		.sin_family = NET_AF_INET,
+		.sin_port = net_htons(65126),
+	};
+	struct net_socket_service_event pev = {
+		.event = {
+			.revents = ZSOCK_POLLIN,
+		},
+	};
+	/* Longer than the test waits, so that a handler that does wait still
+	 * returns, and releases the dispatcher lock, before unregistering.
+	 */
+	struct zsock_timeval rcvtimeo = {
+		.tv_sec = 2,
+	};
+	int sock, ret;
+
+	sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(sock >= 0, "Cannot create socket");
+	ret = zsock_setsockopt(sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &rcvtimeo,
+			       sizeof(rcvtimeo));
+	if (ret != 0) {
+		(void)zsock_close(sock);
+	}
+	zassert_ok(ret, "Cannot set receive timeout");
+	fresh_fds[0].fd = sock;
+	fresh_fds[0].events = ZSOCK_POLLIN;
+	fresh.type = DNS_SOCKET_RESOLVER;
+	fresh.cb = test_dispatch_cb;
+	fresh.fds = fresh_fds;
+	fresh.fds_len = ARRAY_SIZE(fresh_fds);
+	fresh.sock = sock;
+	fresh.svc = &test_pair_svc;
+	memcpy(&fresh.local_addr_storage, &local, sizeof(local));
+	ret = dns_dispatcher_register(&fresh);
+	if (ret != 0) {
+		(void)zsock_close(sock);
+	}
+	zassert_ok(ret, "Cannot register dispatcher");
+
+	/* What the socket service would hand over for the old socket */
+	pev.event.fd = sock;
+	pev.user_data = test_pair_svc.pev[0].user_data;
+
+	k_thread_create(&stale_handler_thread, stale_handler_stack,
+			K_THREAD_STACK_SIZEOF(stale_handler_stack), stale_handler, &pev, NULL,
+			NULL, K_PRIO_PREEMPT(0), 0, K_NO_WAIT);
+	ret = k_thread_join(&stale_handler_thread, K_SECONDS(1));
+	if (ret != 0) {
+		/* Its receive timeout ends the wait */
+		zassert_ok(k_thread_join(&stale_handler_thread, K_SECONDS(3)),
+			   "The handler kept waiting after its receive timeout");
+	}
+
+	(void)dns_dispatcher_unregister(&fresh);
+	(void)zsock_close(sock);
+
+	zassert_ok(ret, "The handler waited for data on a socket with nothing queued");
+}
+
 ZTEST(dns_dispatcher, test_dns_dispatcher_ephemeral_ports)
 {
 	static const char * const servers[] = { DNS_NAME_IPV4, DNS2_NAME_IPV4, NULL };
