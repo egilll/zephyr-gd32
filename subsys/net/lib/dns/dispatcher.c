@@ -213,8 +213,8 @@ static int recv_data(struct net_socket_service_event *pev)
 		uint8_t discard;
 
 		/* Flush the pending datagram to release its net_pkt and avoid RX starvation. */
-		if (zsock_recvfrom(pev->event.fd, &discard, sizeof(discard), 0,
-				   NULL, NULL) < 0) {
+		if (zsock_recvfrom(pev->event.fd, &discard, sizeof(discard),
+				   ZSOCK_MSG_DONTWAIT, NULL, NULL) < 0) {
 			NET_DBG("DNS discard recv failed (%d)", errno);
 		}
 
@@ -222,11 +222,21 @@ static int recv_data(struct net_socket_service_event *pev)
 		goto unlock;
 	}
 
+	/* Do not wait for data: the socket polled readable may since have been
+	 * closed and its descriptor reused by a socket with nothing queued.
+	 * Blocking there would stall the socket service thread, and every
+	 * socket it serves, until a datagram arrives.
+	 */
 	ret = zsock_recvfrom(pev->event.fd, dns_data->data,
-			     net_buf_max_len(dns_data), 0,
+			     net_buf_max_len(dns_data), ZSOCK_MSG_DONTWAIT,
 			     net_sad(&addr), &addrlen);
 	if (ret < 0) {
 		ret = -errno;
+		if (ret == -EAGAIN) {
+			ret = 0;
+			goto free_buf;
+		}
+
 		NET_ERR("recv failed on IPv%d socket (%d)",
 			family == NET_AF_INET ? 4 : 6, -ret);
 		goto free_buf;
