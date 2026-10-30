@@ -194,6 +194,14 @@ static int trigger_work(struct zsock_pollfd *pev)
 #define SOCKET_SERVICE_REBUILD_BACKOFF_MIN_MS 10
 #define SOCKET_SERVICE_REBUILD_BACKOFF_MAX_MS 1000
 
+/* Rounds of dispatched events after which the thread sleeps a tick. A
+ * handler that leaves its socket ready makes poll() return at once round
+ * after round, and without a pause this thread would keep every thread of
+ * lower priority from running. Whether a poll() blocked cannot be told
+ * reliably, so the pause comes after every so many rounds.
+ */
+#define SOCKET_SERVICE_ROUNDS_PER_PAUSE 64
+
 /* Wait before rebuilding the poll array after a poll that failed or reported
  * nothing, so that a descriptor that keeps doing so cannot keep this thread
  * from letting lower priority ones run. A registration ends the wait: the
@@ -220,6 +228,7 @@ static void socket_service_thread(void *p1, void *p2, void *p3)
 
 	int ret, i, fd, count = 0;
 	int backoff_ms = 0;
+	int rounds = 0;
 	zvfs_eventfd_t value;
 
 	STRUCT_SECTION_COUNT(net_socket_service_desc, &ret);
@@ -306,6 +315,11 @@ restart:
 		}
 
 		backoff_ms = 0;
+
+		if (++rounds >= SOCKET_SERVICE_ROUNDS_PER_PAUSE) {
+			rounds = 0;
+			k_sleep(K_TICKS(1));
+		}
 
 		/* Process work here */
 		for (i = 1; i < (count + 1); i++) {
