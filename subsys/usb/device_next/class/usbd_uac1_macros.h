@@ -31,6 +31,11 @@
 #define IS_ARRAY_SORTED(node, prop)						\
 	DT_FOREACH_PROP_ELEM_SEP(node, prop, ARRAY_ELEMENT_LESS_THAN_NEXT, (&&))
 
+/*
+ * Interface numbers and endpoint addresses below are only initial values: the
+ * stack assigns the final ones when it initializes the configuration, and the
+ * class reads and links them at runtime.
+ */
 #define FIRST_INTERFACE_NUMBER			0x00
 #define FIRST_IN_EP_ADDR			0x81
 #define FIRST_OUT_EP_ADDR			0x01
@@ -426,6 +431,9 @@
 #define AC_TOTAL_LENGTH(node)							\
 	(AC_HEADER_DESCRIPTOR_LENGTH(node) + ENTITY_HEADERS_LENGTH(node))
 
+/* Offset of baInterfaceNr(1) in the Class-Specific AC Interface Header Descriptor */
+#define AC_HEADER_INTERFACE_NUMBERS_OFFSET	8
+
 #define AC_INTERFACE_HEADER_DESCRIPTOR(node)					\
 	AC_HEADER_DESCRIPTOR_LENGTH(node),		/* bLength */		\
 	CS_INTERFACE,					/* bDescriptorType */	\
@@ -435,13 +443,23 @@
 	UAC1_NUM_AUDIOSTREAMING(node),			/* bInCollection */	\
 	DT_FOREACH_CHILD(node, AS_INTERFACE_NUMBER_IF_AUDIOSTREAMING)
 
+/* Each speed has its own header, as the stack may number interfaces per speed. */
 #define AC_INTERFACE_HEADER_DESCRIPTOR_ARRAY(node)				\
-	static uint8_t DESCRIPTOR_NAME(ac_header, node)[] = {			\
-		AC_INTERFACE_HEADER_DESCRIPTOR(node)				\
-	};
+	IF_ENABLED(UAC1_ALLOWED_AT_FULL_SPEED(node), (				\
+		static uint8_t DESCRIPTOR_NAME(fs_ac_header, node)[] = {	\
+			AC_INTERFACE_HEADER_DESCRIPTOR(node)			\
+		};								\
+	))									\
+	IF_ENABLED(UAC1_ALLOWED_AT_HIGH_SPEED(node), (				\
+		static uint8_t DESCRIPTOR_NAME(hs_ac_header, node)[] = {	\
+			AC_INTERFACE_HEADER_DESCRIPTOR(node)			\
+		};								\
+	))
 
-#define AC_INTERFACE_HEADER_DESCRIPTOR_PTR(node)				\
-	(struct usb_desc_header *) &DESCRIPTOR_NAME(ac_header, node),
+#define AC_INTERFACE_HEADER_FS_DESCRIPTOR_PTR(node)				\
+	(struct usb_desc_header *) &DESCRIPTOR_NAME(fs_ac_header, node),
+#define AC_INTERFACE_HEADER_HS_DESCRIPTOR_PTR(node)				\
+	(struct usb_desc_header *) &DESCRIPTOR_NAME(hs_ac_header, node),
 
 /* Standard AS Interface Descriptor */
 #define AS_INTERFACE_DESCRIPTOR(node, alternate, numendpoints)			\
@@ -519,6 +537,8 @@
 				     "UAC1 requires 1ms HS polling (bInterval=4)");\
 		))								\
 		IF_ENABLED(AS_HAS_EXPLICIT_FEEDBACK_ENDPOINT(node), (		\
+			BUILD_ASSERT(IN_RANGE(DT_PROP(node, feedback_refresh), 1, 9),\
+				     "UAC1 feedback-refresh must be 1 (2 ms) to 9 (512 ms)");\
 			IF_ENABLED(UAC1_ALLOWED_AT_FULL_SPEED(DT_PARENT(node)), (\
 				BUILD_ASSERT(AS_FEEDBACK_EP_BINTERVAL(node) == 1,	\
 					     "UAC1 requires 1ms FS feedback polling");\
@@ -620,7 +640,7 @@
 	AS_FEEDBACK_EP_ATTR,				/* bmAttributes */	\
 	U16_LE(mps),					/* wMaxPacketSize */	\
 	binterval,					/* bInterval */		\
-	DT_PROP_OR(node, feedback_refresh, 1),		/* bRefresh */		\
+	DT_PROP(node, feedback_refresh),		/* bRefresh */		\
 	0x00						/* bSynchAddress */
 
 #define AS_EXPLICIT_FEEDBACK_FS_DESCRIPTOR_ARRAY(node)				\
@@ -704,19 +724,17 @@
 	IF_ENABLED(DT_PROP(node, interrupt_endpoint), (				\
 		AC_ENDPOINT_DESCRIPTOR_ARRAY(node)))
 
-#define UAC1_AUDIO_CONTROL_COMMON_DESCRIPTOR_PTRS(node)				\
-	AC_INTERFACE_HEADER_DESCRIPTOR_PTR(node)				\
-	ENTITY_HEADERS_PTRS(node)
-
 #define UAC1_AUDIO_CONTROL_FS_DESCRIPTOR_PTRS(node)				\
 	AC_INTERFACE_FS_DESCRIPTOR_PTR(node)					\
-	UAC1_AUDIO_CONTROL_COMMON_DESCRIPTOR_PTRS(node)			\
+	AC_INTERFACE_HEADER_FS_DESCRIPTOR_PTR(node)				\
+	ENTITY_HEADERS_PTRS(node)						\
 	IF_ENABLED(DT_PROP(node, interrupt_endpoint), (				\
 		AC_ENDPOINT_FS_DESCRIPTOR_PTR(node)))
 
 #define UAC1_AUDIO_CONTROL_HS_DESCRIPTOR_PTRS(node)				\
 	AC_INTERFACE_HS_DESCRIPTOR_PTR(node)					\
-	UAC1_AUDIO_CONTROL_COMMON_DESCRIPTOR_PTRS(node)			\
+	AC_INTERFACE_HEADER_HS_DESCRIPTOR_PTR(node)				\
+	ENTITY_HEADERS_PTRS(node)						\
 	IF_ENABLED(DT_PROP(node, interrupt_endpoint), (				\
 		AC_ENDPOINT_HS_DESCRIPTOR_PTR(node)))
 

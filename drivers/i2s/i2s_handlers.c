@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <string.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/internal/syscall_handler.h>
 #include <zephyr/drivers/i2s.h>
@@ -61,6 +63,8 @@ static inline int z_vrfy_i2s_timing_get(const struct device *dev, enum i2s_dir d
 	struct i2s_timing snapshot;
 	int ret;
 
+	/* Padding is copied out too, so none of it may hold kernel stack contents. */
+	memset(&snapshot, 0, sizeof(snapshot));
 	K_OOPS(K_SYSCALL_OBJ(dev, K_OBJ_DRIVER_I2S));
 	ret = z_impl_i2s_timing_get(dev, dir, &snapshot);
 	if (ret == 0) {

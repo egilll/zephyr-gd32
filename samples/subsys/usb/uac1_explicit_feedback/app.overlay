@@ -41,7 +41,6 @@
 			compatible = "zephyr,uac1-audio-streaming";
 			linked-terminal = <&in_terminal>;
 			sync-type = "asynchronous";
-			feedback-refresh = <0>;
 			sampling-frequencies = <48000>;
 			subslot-size = <2>;
 			bit-resolution = <16>;

@@ -215,6 +215,14 @@ static int queue_i2s_block(struct usb_i2s_ctx *ctx)
 		return -EAGAIN;
 	}
 	if (k_mem_slab_alloc(&i2s_tx_slab, &block, K_NO_WAIT) != 0) {
+		/*
+		 * A stream that failed keeps its blocks until it is prepared again, so a
+		 * full slab may mean an error; preparing only succeeds after one.
+		 */
+		if (ctx->i2s_started &&
+		    i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE) == 0) {
+			uac1_reset_i2s_ctx(ctx);
+		}
 		return -ENOMEM;
 	}
 	if (ring_buf_get(&pcm_fifo, block, I2S_BLOCK_SIZE) != I2S_BLOCK_SIZE) {

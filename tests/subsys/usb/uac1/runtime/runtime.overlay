@@ -1,0 +1,56 @@
+/*
+ * Copyright (c) 2026 Ylhyra ehf.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	zephyr_uhc0: uhc_vrt0 {
+		compatible = "zephyr,uhc-virtual";
+
+		zephyr_udc0: udc_vrt0 {
+			compatible = "zephyr,udc-virtual";
+			num-bidir-endpoints = <8>;
+			maximum-speed = "full-speed";
+		};
+	};
+
+	/* A second function, registered after uac1_duplex, whose numbers all move. */
+	uac1_mono: usb_audio1_mono {
+		compatible = "zephyr,uac1";
+		status = "okay";
+		full-speed;
+		label = "Mono audio";
+
+		mono_input: mono_input {
+			compatible = "zephyr,uac1-input-terminal";
+			terminal-type = <USB_TERMINAL_STREAMING>;
+			channels = <1>;
+			channel-config = <0x0000>;
+		};
+
+		mono_feature: mono_feature {
+			compatible = "zephyr,uac1-feature-unit";
+			data-source = <&mono_input>;
+			controls = <0x03>;
+			channel-controls = <0x00>;
+			volume-min = <(-26 * 886)>;
+			volume-max = <0>;
+			volume-res = <26>;
+		};
+
+		mono_output: mono_output {
+			compatible = "zephyr,uac1-output-terminal";
+			terminal-type = <OUTPUT_TERMINAL_SPEAKER>;
+			data-source = <&mono_feature>;
+		};
+
+		mono_stream: mono_stream {
+			compatible = "zephyr,uac1-audio-streaming";
+			linked-terminal = <&mono_input>;
+			sync-type = "asynchronous";
+			sampling-frequencies = <48000>;
+			subslot-size = <2>;
+			bit-resolution = <16>;
+		};
+	};
+};

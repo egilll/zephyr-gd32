@@ -425,6 +425,7 @@ static void xfer_work_handler(struct k_work *work)
 		switch (ev->type) {
 		case UHC_VRT_EVT_SOF:
 			priv->frame_number++;
+			(void)uvb_advert(priv->host_node, UVB_EVT_SOF, NULL);
 			vrt_xfer_cleanup_cancelled(dev);
 			vrt_assemble_frame(dev);
 			schedule = true;

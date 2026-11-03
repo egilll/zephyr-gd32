@@ -7,3 +7,13 @@ tests:
       - qemu_cortex_m3
     integration_platforms:
       - native_sim/native/64
+  usb.uac1.runtime:
+    tags:
+      - usb
+    platform_allow:
+      - qemu_cortex_m3
+    integration_platforms:
+      - qemu_cortex_m3
+    extra_args:
+      - EXTRA_CONF_FILE=runtime/runtime.conf
+      - EXTRA_DTC_OVERLAY_FILE=runtime/runtime.overlay

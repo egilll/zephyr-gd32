@@ -9,3 +9,8 @@ zephyr_library_include_directories(
 )
 
 target_sources(app PRIVATE src/uac1_desc.c)
+
+if(CONFIG_USBD_AUDIO1_CLASS)
+  target_include_directories(app PRIVATE ${ZEPHYR_BASE}/subsys/usb/host)
+  target_sources(app PRIVATE src/uac1_runtime.c)
+endif()

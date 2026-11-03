@@ -41,6 +41,14 @@ extern "C" {
 	})
 
 /**
+ * @brief Number of transfers the class keeps queued on each isochronous endpoint
+ *
+ * An application that serves several streams from one buffer pool needs this
+ * many buffers for each stream it receives or transmits concurrently.
+ */
+#define USBD_UAC1_BUFFERS_PER_STREAM 2
+
+/**
  * @brief USB Audio Class 1 Feature Unit control selectors
  *
  * Values are defined by USB Audio Device Class 1.0 (Appendix A.12).
@@ -97,9 +105,12 @@ struct uac1_ops {
 	/**
 	 * @brief AudioStreaming lifecycle callback
 	 *
-	 * This callback executes in the cooperative USB device thread and must not
-	 * block. The selected alternate setting is preserved across suspend and
-	 * resume.
+	 * This callback is the authority on whether a stream carries audio: the
+	 * class only acquires buffers for a stream between its ACTIVATED or
+	 * RESUMED and its next DEACTIVATED, SUSPENDED or DISABLED event. It
+	 * executes in the cooperative USB device thread, or in the thread calling
+	 * usbd_disable() for DISABLED, and must not block. The selected alternate
+	 * setting is preserved across suspend and resume.
 	 *
 	 * @param dev USB Audio 1 device
 	 * @param terminal Terminal ID linked to AudioStreaming interface
@@ -138,7 +149,9 @@ struct uac1_ops {
 	 * @brief Release an AudioStreaming OUT receive buffer
 	 *
 	 * Releases a buffer obtained from @ref rx_buf_acquire. This callback is
-	 * made exactly once for every successfully acquired buffer.
+	 * made exactly once for every successfully acquired buffer. A transfer
+	 * that was cancelled, or that completed after its stream stopped, is
+	 * released with a negative status and must be discarded.
 	 * This callback is mandatory to register for devices receiving USB
 	 * audio from the USB host.
 	 *
@@ -146,7 +159,8 @@ struct uac1_ops {
 	 * @param terminal Input Terminal ID linked to AudioStreaming interface
 	 * @param buf Buffer previously obtained via @ref rx_buf_acquire
 	 * @param size Number of bytes written to buffer
-	 * @param status 0 on completion or negative errno on cancellation/failure
+	 * @param status 0 on completion, -ECONNABORTED if cancelled or stale, or
+	 *               another negative errno on failure
 	 * @param user_data Opaque user data pointer
 	 */
 	void (*rx_buf_release)(const struct device *dev, uint8_t terminal,
@@ -179,7 +193,8 @@ struct uac1_ops {
 	 * @brief Release an AudioStreaming IN transmit buffer
 	 *
 	 * This callback is made exactly once for every successfully acquired
-	 * transmit buffer.
+	 * transmit buffer. A transfer that was cancelled, or that completed after
+	 * its stream stopped, is released with a negative status.
 	 *
 	 * @param dev USB Audio 1 device
 	 * @param terminal Output Terminal ID linked to AudioStreaming interface
@@ -247,7 +262,10 @@ struct uac1_ops {
 	 * @brief Feature Unit control update callback
 	 *
 	 * Notifies application that the host has updated a Feature Unit control
-	 * (e.g. mute or volume).
+	 * (e.g. mute or volume). This callback executes in the cooperative USB
+	 * device thread while the control request is in progress and must not
+	 * block. Mute and volume are independent controls: a volume update does
+	 * not change mute, and the volume 0x8000 means -infinity dB.
 	 *
 	 * @param dev USB Audio 1 device
 	 * @param unit_id Feature Unit ID
@@ -262,6 +280,15 @@ struct uac1_ops {
 				 const struct uac1_feature_update *update,
 				 void *user_data);
 };
+
+/**
+ * @brief Get the name a USB Audio 1 function is registered by.
+ *
+ * @param dev USB Audio 1 device instance
+ *
+ * @return Class instance name to pass to usbd_register_class()
+ */
+const char *usbd_uac1_class_name(const struct device *dev);
 
 /**
  * @brief Register USB Audio 1 application callbacks.
@@ -281,7 +308,8 @@ int usbd_uac1_set_ops(const struct device *dev,
  *
  * This is intended for controls changed outside USB, such as a physical mute
  * button or volume encoder. If the AudioControl interrupt endpoint is enabled,
- * a status notification is sent to the host.
+ * a status notification is sent to the host, after any notification still in
+ * flight.
  *
  * @param dev USB Audio 1 device.
  * @param unit_id Feature Unit ID.
@@ -300,6 +328,10 @@ int usbd_uac1_feature_set(const struct device *dev, uint8_t unit_id, uint8_t con
 
 /**
  * @brief Send an AudioControl interrupt status notification.
+ *
+ * The status word has Interrupt Pending (D7) set. Hosts respond with
+ * GET_STAT, which returns a null packet, or by reading the originator's
+ * controls.
  *
  * @param dev USB Audio 1 device.
  * @param origin Status originator type.
