@@ -2806,18 +2806,24 @@ static inline void dwc2_handle_oepint(const struct device *dev)
 /* In DWC2 otg context incomplete isochronous IN transfer means that the host
  * did not issue IN token to at least one isochronous endpoint and software has
  * find on which endpoints the data is no longer valid and discard it.
+ *
+ * Only an endpoint armed for the current (micro)frame missed its opportunity.
+ * An endpoint already armed for the next frame, e.g. after its transfer for
+ * this frame completed, still holds valid data and must not be discarded.
  */
 static void dwc2_handle_incompisoin(const struct device *dev)
 {
 	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
 	struct udc_dwc2_data *const priv = udc_get_private(dev);
 	mem_addr_t gintsts_reg = (mem_addr_t)&base->gintsts;
+	const uint32_t dsts = sys_read32((mem_addr_t)&base->dsts);
 	const uint32_t mask =
 		USB_DWC2_DEPCTL_EPENA | USB_DWC2_DEPCTL_EPTYPE_MASK |
-		USB_DWC2_DEPCTL_USBACTEP;
+		USB_DWC2_DEPCTL_DPID | USB_DWC2_DEPCTL_USBACTEP;
 	const uint32_t val =
 		USB_DWC2_DEPCTL_EPENA |
 		usb_dwc2_set_depctl_eptype(USB_DWC2_DEPCTL_EPTYPE_ISO) |
+		((usb_dwc2_get_dsts_soffn(dsts) & 1) ? USB_DWC2_DEPCTL_DPID : 0) |
 		USB_DWC2_DEPCTL_USBACTEP;
 	uint32_t eps = priv->iso_enabled & 0x0000FFFFUL;
 	uint16_t rearm = 0;
