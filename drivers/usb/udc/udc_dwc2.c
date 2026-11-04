@@ -2601,7 +2601,7 @@ static inline void dwc2_handle_iepint(const struct device *dev)
 				/* Data is no longer relevant, discard it */
 				buf = udc_buf_get(cfg);
 				if (buf) {
-					udc_submit_ep_event(dev, buf, 0);
+					udc_submit_ep_event(dev, buf, -EXDEV);
 				}
 
 				/* Try to queue next packet before SOF */
@@ -2786,7 +2786,7 @@ static inline void dwc2_handle_oepint(const struct device *dev)
 				/* Discard disabled transfer buffer */
 				buf = udc_buf_get(cfg);
 				if (buf) {
-					udc_submit_ep_event(dev, buf, 0);
+					udc_submit_ep_event(dev, buf, -EXDEV);
 				}
 
 				/* Try to queue next packet before SOF */
