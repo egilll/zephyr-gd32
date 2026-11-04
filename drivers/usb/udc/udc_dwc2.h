@@ -46,6 +46,8 @@ struct dwc2_vendor_quirks {
 	int (*pre_hibernation_exit)(const struct device *dev);
 	/* INEPNAKEFF remains asserted while an IN endpoint is NAKing */
 	bool inepnakeff_level;
+	/* Read the RX FIFO head before popping it (GD32 USBFS). */
+	bool rx_fifo_read_before_pop;
 };
 
 /* Registers that have to be stored before Partial Power Down or Hibernation */
@@ -225,6 +227,17 @@ static inline bool dwc2_quirk_inepnakeff_level(const struct device *dev)
 			(config->quirks;))
 
 	return quirks != NULL && quirks->inepnakeff_level;
+}
+
+static inline bool dwc2_quirk_rx_fifo_read_before_pop(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	const struct dwc2_vendor_quirks *const quirks =
+		COND_CODE_1(IS_EQ(DT_NUM_INST_STATUS_OKAY(snps_dwc2), 1),
+			(UDC_DWC2_VENDOR_QUIRK_GET(0); ARG_UNUSED(config);),
+			(config->quirks;))
+
+	return quirks != NULL && quirks->rx_fifo_read_before_pop;
 }
 
 #endif /* ZEPHYR_DRIVERS_USB_UDC_DWC2_H */

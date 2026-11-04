@@ -132,6 +132,7 @@ static inline int gd32_usb_disable_embedded_phy(const struct device *dev)
 		.pre_enable = gd32_usbfs_pre_enable_##n,                                \
 		.post_enable = gd32_usbfs_post_enable_##n,                              \
 		.disable = gd32_usb_disable_embedded_phy,                               \
+		.rx_fifo_read_before_pop = true,                                        \
 		.inepnakeff_level = true,                                               \
 	};
 

@@ -538,6 +538,65 @@ static int dwc2_tx_fifo_write(const struct device *dev,
 	return 0;
 }
 
+/* Free space summed over the TX FIFOs that may hold IN data */
+static inline uint32_t dwc2_tx_fifo_space(const struct device *dev)
+{
+	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
+	struct udc_dwc2_data *const priv = udc_get_private(dev);
+	uint32_t space = sys_read32((mem_addr_t)&base->in_ep[0].dtxfsts);
+
+	for (uint8_t i = 1U; i < priv->ineps; i++) {
+		if (priv->txf_set & BIT(i)) {
+			space += sys_read32((mem_addr_t)&base->in_ep[i].dtxfsts);
+		}
+	}
+
+	return space;
+}
+
+static inline uint32_t dwc2_read_rx_word(const struct device *dev, mem_addr_t pop_reg)
+{
+	if (dwc2_quirk_rx_fifo_read_before_pop(dev)) {
+		struct usb_dwc2_reg *const base = dwc2_get_base(dev);
+		const mem_addr_t grxstsr_reg = (mem_addr_t)&base->grxstsr;
+		uint32_t space = dwc2_tx_fifo_space(dev);
+		uint32_t word;
+
+		/* On GD32 USBFS, an RX FIFO read that coincides with the core
+		 * fetching IN data from a TX FIFO can return that TX word. Read
+		 * the head through GRXSTSR, which does not pop, until two reads
+		 * agree and no TX FIFO space was freed meanwhile, then pop it.
+		 * Nothing writes the FIFOs while this runs in the ISR, so
+		 * unchanged space means the core fetched nothing during the
+		 * reads. Should the space keep changing, settle for two agreeing
+		 * reads, which have never both been wrong in testing.
+		 */
+		for (unsigned int i = 0U; ; i++) {
+			uint32_t again, now;
+
+			word = sys_read32(grxstsr_reg);
+			again = sys_read32(grxstsr_reg);
+			now = dwc2_tx_fifo_space(dev);
+			if (word == again && (now == space || i >= 8U)) {
+				break;
+			}
+
+			if (i == 32U) {
+				LOG_ERR("Unstable RX FIFO read");
+				break;
+			}
+
+			space = now;
+		}
+
+		(void)sys_read32((mem_addr_t)&base->grxstsp);
+
+		return word;
+	}
+
+	return sys_read32(pop_reg);
+}
+
 static inline int dwc2_read_fifo(const struct device *dev, const uint8_t ep,
 				 struct net_buf *const buf, const size_t size)
 {
@@ -548,14 +607,14 @@ static inline int dwc2_read_fifo(const struct device *dev, const uint8_t ep,
 	/* FIFO access is always in 32-bit words */
 
 	for (uint32_t n = 0; n < (len / d); n++) {
-		net_buf_add_le32(buf, sys_read32(UDC_DWC2_EP_FIFO(base, ep)));
+		net_buf_add_le32(buf, dwc2_read_rx_word(dev, UDC_DWC2_EP_FIFO(base, ep)));
 	}
 
 	if (len % d) {
 		uint8_t r[4];
 
 		/* Get the remaining */
-		sys_put_le32(sys_read32(UDC_DWC2_EP_FIFO(base, ep)), r);
+		sys_put_le32(dwc2_read_rx_word(dev, UDC_DWC2_EP_FIFO(base, ep)), r);
 		for (uint32_t i = 0U; i < (len % d); i++) {
 			net_buf_add_u8(buf, r[i]);
 		}
@@ -563,7 +622,7 @@ static inline int dwc2_read_fifo(const struct device *dev, const uint8_t ep,
 
 	if (unlikely(size > len)) {
 		for (uint32_t n = 0; n < DIV_ROUND_UP(size - len, d); n++) {
-			(void)sys_read32(UDC_DWC2_EP_FIFO(base, ep));
+			(void)dwc2_read_rx_word(dev, UDC_DWC2_EP_FIFO(base, ep));
 		}
 	}
 
@@ -2485,13 +2544,13 @@ static inline int dwc2_read_fifo_setup(const struct device *dev, uint8_t ep,
 	 * there will be a next net_buf for the setup packet.
 	 */
 	for (offset = 0; offset < MIN(size, 8); offset += 4) {
-		sys_put_le32(sys_read32(UDC_DWC2_EP_FIFO(base, ep)),
+		sys_put_le32(dwc2_read_rx_word(dev, UDC_DWC2_EP_FIFO(base, ep)),
 			     &priv->setup[offset]);
 	}
 
 	/* On protocol error simply discard extra data */
 	while (offset < size) {
-		sys_read32(UDC_DWC2_EP_FIFO(base, ep));
+		dwc2_read_rx_word(dev, UDC_DWC2_EP_FIFO(base, ep));
 		offset += 4;
 	}
 
@@ -2508,7 +2567,7 @@ static inline void dwc2_handle_rxflvl(const struct device *dev)
 	uint32_t bcnt;
 	uint8_t ep;
 
-	grxstsp = sys_read32((mem_addr_t)&base->grxstsp);
+	grxstsp = dwc2_read_rx_word(dev, (mem_addr_t)&base->grxstsp);
 	ep = usb_dwc2_get_grxstsp_epnum(grxstsp);
 	bcnt = usb_dwc2_get_grxstsp_bcnt(grxstsp);
 	pktsts = usb_dwc2_get_grxstsp_pktsts(grxstsp);
