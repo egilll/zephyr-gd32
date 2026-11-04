@@ -826,6 +826,27 @@ static int dwc2_handle_evt_din(const struct device *dev,
 	return udc_submit_ep_event(dev, buf, 0);
 }
 
+/* Hands back a finished isochronous transfer and arms the next queued one,
+ * from interrupt context.
+ */
+static void dwc2_finish_iso(const struct device *dev,
+			    struct udc_ep_config *const cfg)
+{
+	struct net_buf *buf = udc_buf_get(cfg);
+
+	if (buf == NULL) {
+		return;
+	}
+
+	if (USB_EP_DIR_IS_OUT(cfg->addr) && dwc2_in_buffer_dma_mode(dev)) {
+		sys_cache_data_invd_range(buf->data, buf->len);
+	}
+
+	udc_ep_set_busy(cfg, false);
+	udc_submit_ep_event(dev, buf, 0);
+	dwc2_handle_xfer_next(dev, cfg);
+}
+
 static void dwc2_backup_registers(const struct device *dev)
 {
 	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
@@ -2539,6 +2560,13 @@ static inline void dwc2_handle_in_xfercompl(const struct device *dev,
 		return;
 	}
 
+	if (dwc2_ep_is_iso(ep_cfg) && buf->len == 0) {
+		/* Arm the next packet before the next frame, as for ISO OUT */
+		k_event_post(&priv->ep_disabled, BIT(ep_idx));
+		dwc2_finish_iso(dev, ep_cfg);
+		return;
+	}
+
 	atomic_set_bit(&priv->xfer_finished, ep_idx);
 	k_event_post(&priv->ep_disabled, BIT(ep_idx));
 	k_event_post(&priv->drv_evt, BIT(DWC2_DRV_EVT_EP_FINISHED));
@@ -2704,6 +2732,12 @@ static inline void dwc2_handle_out_xfercompl(const struct device *dev,
 	if (!is_iso && bcnt && (bcnt % udc_mps_ep_size(ep_cfg)) == 0 &&
 	    net_buf_tailroom(buf)) {
 		dwc2_prep_rx(dev, buf, ep_cfg);
+	} else if (is_iso) {
+		/* The next packet arrives in the next frame, possibly before the
+		 * driver thread runs: hand this one back and arm the next here.
+		 */
+		k_event_post(&priv->ep_disabled, BIT(16 + ep_idx));
+		dwc2_finish_iso(dev, ep_cfg);
 	} else {
 		atomic_set_bit(&priv->xfer_finished, 16 + ep_idx);
 		k_event_post(&priv->ep_disabled, BIT(16 + ep_idx));
