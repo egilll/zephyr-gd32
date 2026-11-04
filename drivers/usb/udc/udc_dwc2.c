@@ -154,6 +154,16 @@ static inline bool dwc2_in_buffer_dma_mode(const struct device *dev)
 	return IS_ENABLED(CONFIG_UDC_DWC2_DMA) && priv->bufferdma;
 }
 
+/* The (micro-)frame in progress, read from the core: the number cached at SOF
+ * can be one behind by the time a transfer is armed or retired.
+ */
+static inline uint32_t dwc2_current_frame(const struct device *dev)
+{
+	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
+
+	return usb_dwc2_get_dsts_soffn(sys_read32((mem_addr_t)&base->dsts));
+}
+
 /* Get DOEPCTLn or DIEPCTLn register address */
 static mem_addr_t dwc2_get_dxepctl_reg(const struct device *dev, const uint8_t ep)
 {
@@ -477,7 +487,7 @@ static int dwc2_tx_fifo_write(const struct device *dev,
 		/* Queue transfer on next SOF. TODO: allow stack to explicitly
 		 * specify on which (micro-)frame the data should be sent.
 		 */
-		if (priv->sof_num & 1) {
+		if (dwc2_current_frame(dev) & 1) {
 			diepctl |= USB_DWC2_DEPCTL_SETEVENFR;
 		} else {
 			diepctl |= USB_DWC2_DEPCTL_SETODDFR;
@@ -617,7 +627,7 @@ static void dwc2_prep_rx(const struct device *dev, struct net_buf *buf,
 
 		if (!IS_ENABLED(CONFIG_UDC_DWC2_PTI)) {
 			/* Set the Even/Odd (micro-)frame appropriately */
-			if (priv->sof_num & 1) {
+			if (dwc2_current_frame(dev) & 1) {
 				doepctl |= USB_DWC2_DEPCTL_SETEVENFR;
 			} else {
 				doepctl |= USB_DWC2_DEPCTL_SETODDFR;
@@ -2872,7 +2882,7 @@ static void dwc2_handle_incompisoout(const struct device *dev)
 	const uint32_t val =
 		USB_DWC2_DEPCTL_EPENA |
 		usb_dwc2_set_depctl_eptype(USB_DWC2_DEPCTL_EPTYPE_ISO) |
-		((priv->sof_num & 1) ? USB_DWC2_DEPCTL_DPID : 0) |
+		((dwc2_current_frame(dev) & 1) ? USB_DWC2_DEPCTL_DPID : 0) |
 		USB_DWC2_DEPCTL_USBACTEP;
 	uint32_t eps = (priv->iso_enabled & 0xFFFF0000UL) >> 16;
 	uint16_t rearm = 0;
