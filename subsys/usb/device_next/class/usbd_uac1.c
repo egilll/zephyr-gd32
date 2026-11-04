@@ -1170,6 +1170,8 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 
 	if (err == -ECONNABORTED) {
 		LOG_DBG("request ep 0x%02x, len %u cancelled", ep, buf->len);
+	} else if (err == -EXDEV) {
+		LOG_DBG("request ep 0x%02x, len %u missed its frame", ep, buf->len);
 	} else if (err) {
 		LOG_ERR("request ep 0x%02x, len %u failed: %d", ep, buf->len, err);
 	}
@@ -1206,7 +1208,8 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 	}
 
 	net_buf_unref(buf);
-	if (status != 0) {
+	/* A transfer whose frame passed leaves the stream running, so the next one is queued */
+	if (status != 0 && status != -EXDEV) {
 		return 0;
 	}
 
