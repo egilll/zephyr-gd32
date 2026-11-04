@@ -108,6 +108,8 @@ struct stream {
 	int64_t stop_deadline;
 	bool master;
 	bool drain;
+	/* A stopping transmit stream has been given its closing block of silence */
+	bool silenced;
 };
 
 struct i2s_gd32_data {
@@ -461,6 +463,17 @@ static const char *gd32_i2s_tx_complete_locked(struct stream *stream)
 
 	if (stream->state == I2S_STATE_RUNNING || stream->drain) {
 		(void)queue_get(stream->msgq, &next, &size, 0);
+	}
+	if (next == NULL && stream->state == I2S_STATE_STOPPING && !stream->silenced) {
+		/* The bank left without a block replays the last one until the stream stops, and a
+		 * target then repeats the last word it was given. Ending on silence keeps both quiet.
+		 */
+		stream->silenced = true;
+		if (k_mem_slab_alloc(stream->cfg.mem_slab, &next, K_NO_WAIT) == 0) {
+			memset(next, 0, stream->cfg.block_size);
+		} else {
+			next = NULL;
+		}
 	}
 
 	if (gd32_i2s_reload(stream, gd32_i2s_banks_fill_next(&stream->banks, next)) < 0) {
@@ -909,6 +922,7 @@ static int gd32_i2s_stream_start(struct stream *stream)
 	key = k_spin_lock(&data->lock);
 	stream->retired = NULL;
 	stream->drain = false;
+	stream->silenced = false;
 	stream->finishing = false;
 	stream->completed = false;
 	stream->block_cycles =
