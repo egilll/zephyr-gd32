@@ -1040,6 +1040,7 @@ static void dwc2_finish_iso(const struct device *dev,
 		}
 		priv->feedback_seen = true;
 		priv->feedback_last_frame = observed;
+		priv->feedback_last_uptime = k_uptime_get_32();
 		priv->feedback_completions++;
 	}
 	buf = udc_buf_get(cfg);
@@ -3631,6 +3632,8 @@ int udc_dwc2_diagnostics_get(const struct device *dev, struct udc_dwc2_diagnosti
 		.feedback_gap_two = priv->feedback_gap_two,
 		.feedback_gap_larger = priv->feedback_gap_larger,
 		.feedback_gap_max = priv->feedback_gap_max,
+		.feedback_age_ms = priv->feedback_seen ?
+			k_uptime_get_32() - priv->feedback_last_uptime : UINT32_MAX,
 	};
 	for (unsigned int i = 0; i < ARRAY_SIZE(priv->iso_slots); ++i) {
 		out->active_iso_requests += priv->iso_slots[i].request != NULL;

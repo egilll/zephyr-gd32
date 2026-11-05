@@ -37,6 +37,8 @@ struct udc_dwc2_diagnostics {
 	uint32_t feedback_gap_two;
 	uint32_t feedback_gap_larger;
 	uint32_t feedback_gap_max;
+	/** Milliseconds since a successful feedback transfer, UINT32_MAX if none. */
+	uint32_t feedback_age_ms;
 	bool quarantined;
 };
 int udc_dwc2_diagnostics_get(const struct device *dev, struct udc_dwc2_diagnostics *out);

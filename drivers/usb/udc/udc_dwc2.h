@@ -112,6 +112,7 @@ struct udc_dwc2_data {
 	uint32_t feedback_gap_larger;
 	uint32_t feedback_gap_max;
 	uint16_t feedback_last_frame;
+	uint32_t feedback_last_uptime;
 	bool feedback_seen;
 	struct dwc2_reg_backup backup;
 	uint32_t ghwcfg1;
