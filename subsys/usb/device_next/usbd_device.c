@@ -374,7 +374,9 @@ int usbd_disable(struct usbd_context *const uds_ctx)
 		LOG_ERR("Failed to disable USB device");
 	}
 
-	uds_ctx->status.enabled = false;
+	if (ret == 0) {
+		uds_ctx->status.enabled = false;
+	}
 
 	usbd_device_unlock(uds_ctx);
 

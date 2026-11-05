@@ -7,6 +7,7 @@
 #define ZEPHYR_INCLUDE_DRIVERS_USB_UDC_DWC2_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <zephyr/device.h>
 
 /**
@@ -19,6 +20,33 @@
  *
  * @return Cycle counter value from k_cycle_get_32().
  */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 uint32_t udc_dwc2_sof_cycle_get(const struct device *dev);
+
+struct udc_dwc2_diagnostics {
+	uint32_t rx_read_attempts;
+	uint32_t rx_read_max_attempts;
+	uint32_t rx_read_failures;
+	uint32_t maximum_isr_cycles;
+	uint32_t active_iso_requests;
+	uint32_t feedback_completions;
+	uint32_t feedback_gap_one;
+	uint32_t feedback_gap_two;
+	uint32_t feedback_gap_larger;
+	uint32_t feedback_gap_max;
+	bool quarantined;
+};
+int udc_dwc2_diagnostics_get(const struct device *dev, struct udc_dwc2_diagnostics *out);
+
+#if defined(CONFIG_UDC_DWC2_TEST_HOOKS)
+int udc_dwc2_test_quarantine(const struct device *dev, bool fail_reset);
+void udc_dwc2_test_reset_failure_set(const struct device *dev, bool fail_reset);
+#endif
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ZEPHYR_INCLUDE_DRIVERS_USB_UDC_DWC2_H_ */

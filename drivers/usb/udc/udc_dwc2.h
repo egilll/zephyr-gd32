@@ -12,6 +12,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <usb_dwc2_hw.h>
+#include "udc_dwc2_iso.h"
 
 /* Required by DEVICE_MMIO_NAMED_* macros */
 #define DEV_CFG(_dev) ((const struct udc_dwc2_config *)(_dev)->config)
@@ -94,6 +95,24 @@ struct udc_dwc2_data {
 	atomic_t xfer_new;
 	/* Finished transactions (IN on bits 0-15, OUT on bits 16-31) */
 	atomic_t xfer_finished;
+	/** Requests remain owned by the controller while cancellation is unresolved. */
+	atomic_t quiescing;
+	atomic_t faulted;
+#if defined(CONFIG_UDC_DWC2_TEST_HOOKS)
+	atomic_t test_reset_failure;
+	atomic_t test_flush_failure;
+#endif
+	uint32_t rx_read_attempts;
+	uint32_t rx_read_max_attempts;
+	uint32_t rx_read_failures;
+	uint32_t maximum_isr_cycles;
+	uint32_t feedback_completions;
+	uint32_t feedback_gap_one;
+	uint32_t feedback_gap_two;
+	uint32_t feedback_gap_larger;
+	uint32_t feedback_gap_max;
+	uint16_t feedback_last_frame;
+	bool feedback_seen;
 	struct dwc2_reg_backup backup;
 	uint32_t ghwcfg1;
 	uint32_t max_xfersize;
@@ -102,6 +121,7 @@ struct udc_dwc2_data {
 	uint32_t rx_siz[16];
 	/* Isochronous endpoint enabled (IN on bits 0-15, OUT on bits 16-31) */
 	uint32_t iso_enabled;
+	struct dwc2_iso_slot iso_slots[32];
 	/* Return code from disable executed synchronously in driver thread */
 	int disable_status;
 	uint16_t iso_in_rearm;

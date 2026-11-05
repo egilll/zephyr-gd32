@@ -44,6 +44,7 @@ struct uac1_buf_info {
 	uint32_t generation;
 	uint8_t as_idx;
 	uint8_t kind;
+	uint16_t prepared_size;
 };
 
 UDC_BUF_POOL_DEFINE(uac1_pool, UAC1_NUM_EP_BUFFERS, 6,
@@ -140,14 +141,21 @@ struct uac1_stream_runtime {
 	atomic_t feedback_outstanding;
 	atomic_t generation;
 	uint32_t service_number;
+	atomic_t missed_data_packets;
+	atomic_t unpolled_feedback_intervals;
+	atomic_t discarded_tx_bytes;
+	atomic_t acquisition_failures;
+	atomic_t submission_failures;
 };
 
 struct uac1_ctx {
+	struct k_mutex stream_lock;
 	const struct uac1_ops *ops;
 	void *user_data;
 
 	atomic_t as_selected;
 	atomic_t suspended;
+	atomic_t retiring;
 	/* An interrupt status transfer is in flight */
 	atomic_t status_busy;
 	/* Units whose device-side change still has to be notified */
@@ -213,7 +221,9 @@ static uint8_t uac1_ac_interface(const struct uac1_cfg *cfg)
 
 static bool stream_available(const struct uac1_ctx *ctx, uint8_t as_idx)
 {
-	return !atomic_get(&ctx->suspended) && atomic_test_bit(&ctx->as_selected, as_idx);
+	return !atomic_get(&ctx->suspended) &&
+	       !atomic_test_bit(&ctx->retiring, as_idx) &&
+	       atomic_test_bit(&ctx->as_selected, as_idx);
 }
 
 static bool outstanding_acquire(atomic_t *outstanding)
@@ -296,6 +306,7 @@ static struct net_buf *uac1_buf_alloc(const uint8_t ep, void *data, uint16_t siz
 	info->generation = generation;
 	info->as_idx = as_idx;
 	info->kind = UAC1_BUF_DATA;
+	info->prepared_size = size;
 
 	if (USB_EP_DIR_IS_OUT(ep)) {
 		buf->len = 0;
@@ -348,7 +359,7 @@ static void release_tx_buffer(const struct device *dev, uint8_t terminal, void *
 	ctx->ops->tx_buf_release(dev, terminal, data, status, ctx->user_data);
 }
 
-static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t as_idx)
+static void schedule_iso_out_read_locked(struct usbd_class_data *const c_data, uint8_t as_idx)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	const struct uac1_cfg *cfg = dev->config;
@@ -370,6 +381,7 @@ static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t 
 
 	ret = ctx->ops->rx_buf_acquire(dev, terminal, size, &data_buf, ctx->user_data);
 	if (ret != 0 || data_buf == NULL) {
+		atomic_inc(&stream->acquisition_failures);
 		if (ret != -EAGAIN) {
 			LOG_ERR_RATELIMIT("No receive buffer for terminal %u: %d", terminal,
 					  ret != 0 ? ret : -EINVAL);
@@ -386,8 +398,11 @@ static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t 
 		return;
 	}
 
-	ret = usbd_ep_enqueue(c_data, buf);
+	ret = stream_available(ctx, as_idx) &&
+	      generation == (uint32_t)atomic_get(&stream->generation) ?
+	      usbd_ep_enqueue(c_data, buf) : -ECONNABORTED;
 	if (ret) {
+		atomic_inc(&stream->submission_failures);
 		LOG_ERR("Failed to enqueue net_buf for 0x%02x", data_ep->bEndpointAddress);
 		net_buf_unref(buf);
 		release_rx_buffer(dev, terminal, data_buf, 0, ret);
@@ -395,7 +410,18 @@ static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t 
 	}
 }
 
-static void schedule_iso_in_write(struct usbd_class_data *const c_data, uint8_t as_idx)
+static void schedule_iso_out_read(struct usbd_class_data *const c_data, uint8_t as_idx)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+
+	if (k_mutex_lock(&ctx->stream_lock, K_NO_WAIT) == 0) {
+		schedule_iso_out_read_locked(c_data, as_idx);
+		k_mutex_unlock(&ctx->stream_lock);
+	}
+}
+
+static void schedule_iso_in_write_locked(struct usbd_class_data *const c_data, uint8_t as_idx)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	const struct uac1_cfg *cfg = dev->config;
@@ -416,11 +442,12 @@ static void schedule_iso_in_write(struct usbd_class_data *const c_data, uint8_t 
 	generation = atomic_get(&stream->generation);
 	max_size = ep_transfer_size(data_ep);
 
-	const uint32_t service_number = stream->service_number++;
+	const uint32_t service_number = stream->service_number;
 
 	ret = ctx->ops->tx_buf_acquire(dev, terminal, max_size, service_number,
 				      &data, &size, ctx->user_data);
 	if (ret != 0) {
+		atomic_inc(&stream->acquisition_failures);
 		if (ret != -EAGAIN) {
 			LOG_ERR_RATELIMIT("No transmit buffer for terminal %u: %d", terminal, ret);
 		}
@@ -442,15 +469,32 @@ static void schedule_iso_in_write(struct usbd_class_data *const c_data, uint8_t 
 		return;
 	}
 
-	ret = usbd_ep_enqueue(c_data, buf);
+	ret = stream_available(ctx, as_idx) &&
+	      generation == (uint32_t)atomic_get(&stream->generation) ?
+	      usbd_ep_enqueue(c_data, buf) : -ECONNABORTED;
 	if (ret != 0) {
+		atomic_inc(&stream->submission_failures);
+		atomic_add(&stream->discarded_tx_bytes, size);
 		net_buf_unref(buf);
 		release_tx_buffer(dev, terminal, data, ret);
 		outstanding_release(&stream->data_outstanding);
+	} else {
+		stream->service_number++;
 	}
 }
 
-static void write_explicit_feedback(struct usbd_class_data *const c_data, uint8_t as_idx)
+static void schedule_iso_in_write(struct usbd_class_data *const c_data, uint8_t as_idx)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+
+	if (k_mutex_lock(&ctx->stream_lock, K_NO_WAIT) == 0) {
+		schedule_iso_in_write_locked(c_data, as_idx);
+		k_mutex_unlock(&ctx->stream_lock);
+	}
+}
+
+static void write_explicit_feedback_locked(struct usbd_class_data *const c_data, uint8_t as_idx)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	const struct uac1_cfg *cfg = dev->config;
@@ -490,11 +534,24 @@ static void write_explicit_feedback(struct usbd_class_data *const c_data, uint8_
 		net_buf_add_le32(buf, fb_value);
 	}
 
-	ret = usbd_ep_enqueue(c_data, buf);
+	ret = stream_available(ctx, as_idx) &&
+	      info->generation == (uint32_t)atomic_get(&stream->generation) ?
+	      usbd_ep_enqueue(c_data, buf) : -ECONNABORTED;
 	if (ret) {
 		LOG_ERR("Failed to enqueue net_buf for 0x%02x", fb_ep->bEndpointAddress);
 		net_buf_unref(buf);
 		outstanding_release(&stream->feedback_outstanding);
+	}
+}
+
+static void write_explicit_feedback(struct usbd_class_data *const c_data, uint8_t as_idx)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+
+	if (k_mutex_lock(&ctx->stream_lock, K_NO_WAIT) == 0) {
+		write_explicit_feedback_locked(c_data, as_idx);
+		k_mutex_unlock(&ctx->stream_lock);
 	}
 }
 
@@ -1101,7 +1158,9 @@ static struct net_buf *uac1_control_to_host(struct usbd_class_data *const c_data
 	return buf;
 }
 
-static void uac1_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
+static int uac1_retire_stream(struct usbd_class_data *const c_data, uint8_t as_idx);
+
+static void uac1_update_locked(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	const struct uac1_cfg *cfg = dev->config;
@@ -1136,6 +1195,10 @@ static void uac1_update(struct usbd_class_data *const c_data, uint8_t iface, uin
 		return;
 	}
 
+	if (atomic_test_bit(&ctx->retiring, as_idx) &&
+	    uac1_retire_stream(c_data, as_idx) != 0) {
+		return;
+	}
 	if (!atomic_test_and_set_bit(&ctx->as_selected, as_idx)) {
 		atomic_inc(&cfg->streams[as_idx].generation);
 		cfg->streams[as_idx].service_number = 0U;
@@ -1154,7 +1217,17 @@ static void uac1_update(struct usbd_class_data *const c_data, uint8_t iface, uin
 	 */
 }
 
-static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *buf, int err)
+static void uac1_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+
+	k_mutex_lock(&ctx->stream_lock, K_FOREVER);
+	uac1_update_locked(c_data, iface, alternate);
+	k_mutex_unlock(&ctx->stream_lock);
+}
+
+static int uac1_request_locked(struct usbd_class_data *const c_data, struct net_buf *buf, int err)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	const struct uac1_cfg *cfg = dev->config;
@@ -1195,6 +1268,13 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 	status = err != 0 ? err :
 		 generation == (uint32_t)atomic_get(&stream->generation) ? 0 : -ECONNABORTED;
 
+	if (status == -EXDEV) {
+		atomic_inc(kind == UAC1_BUF_FEEDBACK ? &stream->unpolled_feedback_intervals :
+			   &stream->missed_data_packets);
+	}
+	if (kind == UAC1_BUF_DATA && USB_EP_DIR_IS_IN(ep) && status != 0) {
+		atomic_add(&stream->discarded_tx_bytes, info->prepared_size);
+	}
 	if (kind == UAC1_BUF_FEEDBACK) {
 		outstanding_release(&stream->feedback_outstanding);
 	} else {
@@ -1222,6 +1302,47 @@ static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *bu
 	}
 
 	return 0;
+}
+
+static int uac1_request(struct usbd_class_data *const c_data, struct net_buf *buf, int err)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+	int ret;
+
+	k_mutex_lock(&ctx->stream_lock, K_FOREVER);
+	ret = uac1_request_locked(c_data, buf, err);
+	k_mutex_unlock(&ctx->stream_lock);
+	return ret;
+}
+
+int usbd_uac1_stream_diagnostics_get(const struct device *dev, uint8_t terminal,
+				     struct uac1_stream_diagnostics *out)
+{
+	const struct uac1_cfg *cfg = dev->config;
+
+	if (out == NULL) {
+		return -EINVAL;
+	}
+	for (unsigned int i = 0; i < cfg->num_ifaces; ++i) {
+		if (cfg->as_terminals[i] != terminal) {
+			continue;
+		}
+		struct uac1_stream_runtime *stream = &cfg->streams[i];
+
+		*out = (struct uac1_stream_diagnostics) {
+			.generation = atomic_get(&stream->generation),
+			.data_outstanding = atomic_get(&stream->data_outstanding),
+			.feedback_outstanding = atomic_get(&stream->feedback_outstanding),
+			.missed_data_packets = atomic_get(&stream->missed_data_packets),
+			.unpolled_feedback_intervals = atomic_get(&stream->unpolled_feedback_intervals),
+			.discarded_tx_bytes = atomic_get(&stream->discarded_tx_bytes),
+			.acquisition_failures = atomic_get(&stream->acquisition_failures),
+			.submission_failures = atomic_get(&stream->submission_failures),
+		};
+		return 0;
+	}
+	return -ENOENT;
 }
 
 static void uac1_sof(struct usbd_class_data *const c_data)
@@ -1274,17 +1395,66 @@ static void uac1_notify_selected(struct usbd_class_data *const c_data, atomic_va
 	}
 }
 
+/** Stop admission before asking the controller to return old-session requests. */
+static int uac1_retire_stream(struct usbd_class_data *const c_data, uint8_t as_idx)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	const struct uac1_cfg *cfg = dev->config;
+	struct uac1_ctx *ctx = dev->data;
+	const struct uac1_ep_descriptor *data_ep = as_data_ep(cfg, as_idx);
+	const struct uac1_ep_descriptor *fb_ep = as_feedback_ep(cfg, as_idx);
+	int ret = 0;
+
+	atomic_set_bit(&ctx->retiring, as_idx);
+	if (data_ep != NULL) {
+		ret = usbd_ep_dequeue(c_data->uds_ctx, data_ep->bEndpointAddress);
+	}
+	if (fb_ep != NULL) {
+		int fb_ret = usbd_ep_dequeue(c_data->uds_ctx, fb_ep->bEndpointAddress);
+
+		if (ret == 0) {
+			ret = fb_ret;
+		}
+	}
+	if (ret == 0) {
+		atomic_clear_bit(&ctx->retiring, as_idx);
+	} else {
+		LOG_ERR("Stream %u cancellation failed: %d", as_idx, ret);
+	}
+	return ret;
+}
+
+static void uac1_suspended_locked(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	const struct uac1_cfg *cfg = dev->config;
+	struct uac1_ctx *ctx = dev->data;
+
+	if (atomic_cas(&ctx->suspended, 0, 1)) {
+		atomic_val_t selected = atomic_get(&ctx->as_selected);
+
+		for (uint8_t i = 0; i < cfg->num_ifaces; ++i) {
+			if (selected & BIT(i)) {
+				atomic_inc(&cfg->streams[i].generation);
+				cfg->streams[i].service_number = 0;
+				uac1_retire_stream(c_data, i);
+			}
+		}
+		uac1_notify_selected(c_data, selected, UAC1_STREAM_SUSPENDED);
+	}
+}
+
 static void uac1_suspended(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uac1_ctx *ctx = dev->data;
 
-	if (atomic_cas(&ctx->suspended, 0, 1)) {
-		uac1_notify_selected(c_data, atomic_get(&ctx->as_selected), UAC1_STREAM_SUSPENDED);
-	}
+	k_mutex_lock(&ctx->stream_lock, K_FOREVER);
+	uac1_suspended_locked(c_data);
+	k_mutex_unlock(&ctx->stream_lock);
 }
 
-static void uac1_resumed(struct usbd_class_data *const c_data)
+static void uac1_resumed_locked(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uac1_ctx *ctx = dev->data;
@@ -1292,6 +1462,14 @@ static void uac1_resumed(struct usbd_class_data *const c_data)
 
 	if (!atomic_cas(&ctx->suspended, 1, 0)) {
 		return;
+	}
+	const struct uac1_cfg *cfg = dev->config;
+
+	for (uint8_t i = 0; i < cfg->num_ifaces; ++i) {
+		if ((selected & BIT(i)) && atomic_test_bit(&ctx->retiring, i) &&
+		    uac1_retire_stream(c_data, i) != 0) {
+			selected &= ~BIT(i);
+		}
 	}
 	uac1_notify_selected(c_data, selected, UAC1_STREAM_RESUMED);
 
@@ -1303,7 +1481,17 @@ static void uac1_resumed(struct usbd_class_data *const c_data)
 	}
 }
 
-static void uac1_disable(struct usbd_class_data *const c_data)
+static void uac1_resumed(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+
+	k_mutex_lock(&ctx->stream_lock, K_FOREVER);
+	uac1_resumed_locked(c_data);
+	k_mutex_unlock(&ctx->stream_lock);
+}
+
+static void uac1_disable_locked(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	const struct uac1_cfg *cfg = dev->config;
@@ -1318,6 +1506,16 @@ static void uac1_disable(struct usbd_class_data *const c_data)
 	}
 
 	uac1_notify_selected(c_data, selected, UAC1_STREAM_DISABLED);
+}
+
+static void uac1_disable(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uac1_ctx *ctx = dev->data;
+
+	k_mutex_lock(&ctx->stream_lock, K_FOREVER);
+	uac1_disable_locked(c_data);
+	k_mutex_unlock(&ctx->stream_lock);
 }
 
 /*
@@ -1538,7 +1736,9 @@ static struct usbd_class_api uac1_api = {
 	BUILD_ASSERT(UAC1_ALLOWED_AT_FULL_SPEED(DT_DRV_INST(inst)) ||		\
 		     UAC1_ALLOWED_AT_HIGH_SPEED(DT_DRV_INST(inst)),		\
 		     "UAC1 instance must enable at least one speed");		\
-	static struct uac1_ctx uac1_ctx_##inst;					\
+	static struct uac1_ctx uac1_ctx_##inst = { \
+		.stream_lock = Z_MUTEX_INITIALIZER(uac1_ctx_##inst.stream_lock), \
+	};					\
 	UAC1_DESCRIPTOR_ARRAYS(DT_DRV_INST(inst))				\
 	DT_INST_FOREACH_CHILD_STATUS_OKAY(inst, DEFINE_FU_RUNTIME_DATA)	\
 	IF_ENABLED(UAC1_ALLOWED_AT_FULL_SPEED(DT_DRV_INST(inst)), (		\

@@ -169,14 +169,17 @@ struct uac1_ops {
 	/**
 	 * @brief Acquire an AudioStreaming IN transmit buffer
 	 *
-	 * The class calls this callback at the endpoint cadence. The callback must
+	 * The class calls this callback to reserve a prepared packet. Delivery may be
+	 * delayed or batched; callbacks are not a bus clock. The callback must
 	 * return a prepared buffer without blocking. On success, ownership is
 	 * transferred to the class until @ref tx_buf_release is called.
 	 *
 	 * @param dev USB Audio 1 device
 	 * @param terminal Output Terminal ID linked to AudioStreaming interface
 	 * @param max_size Maximum packet size for the active bus speed
-	 * @param service_number Monotonic packet service number for this stream
+	 * @param service_number Packet reservation ordinal for this stream. Advances only
+	 * after enqueue succeeds; failed acquisition/submission reuses the ordinal.
+	 * This is not a USB frame timestamp.
 	 * @param buf Receives the application-owned buffer
 	 * @param size Receives the number of bytes to transmit
 	 * @param user_data Opaque user data pointer
@@ -344,6 +347,20 @@ int usbd_uac1_feature_set(const struct device *dev, uint8_t unit_id, uint8_t con
  */
 int usbd_uac1_status_notify(const struct device *dev, enum uac1_status_origin origin,
 			    uint8_t originator, bool memory_changed);
+
+struct uac1_stream_diagnostics {
+	uint32_t generation;
+	uint32_t data_outstanding;
+	uint32_t feedback_outstanding;
+	uint32_t missed_data_packets;
+	uint32_t unpolled_feedback_intervals;
+	uint32_t discarded_tx_bytes;
+	uint32_t acquisition_failures;
+	uint32_t submission_failures;
+};
+/** Atomic counter observations; individual fields may straddle a completion. */
+int usbd_uac1_stream_diagnostics_get(const struct device *dev, uint8_t terminal,
+				     struct uac1_stream_diagnostics *out);
 
 /**
  * @}

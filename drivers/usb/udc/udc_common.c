@@ -887,7 +887,9 @@ int udc_disable(const struct device *dev)
 	}
 
 	ret = api->disable(dev);
-	atomic_clear_bit(&data->status, UDC_STATUS_ENABLED);
+	if (ret == 0) {
+		atomic_clear_bit(&data->status, UDC_STATUS_ENABLED);
+	}
 
 udc_disable_error:
 	api->unlock(dev);

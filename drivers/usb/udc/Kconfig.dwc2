@@ -59,4 +59,10 @@ config UDC_DWC2_USBHS_VBUS_READY_TIMEOUT
 	  and the Nordic USBHS controller is used, the udc_enable() is
 	  blocked for this amount of time. Set it to zero to wait forever.
 
+config UDC_DWC2_TEST_HOOKS
+	bool "DWC2 fault injection for driver tests"
+	help
+	  Expose deterministic controller quarantine and failed-reset injection.
+	  Enable only in dedicated driver test firmware.
+
 endif # UDC_DWC2

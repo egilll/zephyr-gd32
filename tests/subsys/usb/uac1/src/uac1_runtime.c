@@ -70,6 +70,8 @@ struct function_record {
 	atomic_t activated;
 	atomic_t deactivated;
 	atomic_t disabled;
+	atomic_t fail_acquire;
+	atomic_t first_service;
 	uint8_t terminal;
 	uint8_t data[BUFFER_SIZE];
 	uint16_t len;
@@ -146,6 +148,15 @@ static int tx_acquire(const struct device *dev, uint8_t terminal, uint16_t max_s
 		      uint32_t service_number, void **buf, uint16_t *size, void *user_data)
 {
 	uint8_t *data;
+	struct function_record *record = record_of(dev);
+
+	if (atomic_get(&record->fail_acquire) > 0) {
+		atomic_dec(&record->fail_acquire);
+		return -EAGAIN;
+	}
+	if (atomic_get(&record->first_service) < 0) {
+		atomic_set(&record->first_service, service_number);
+	}
 
 	if (k_mem_slab_alloc(&buffers, buf, K_NO_WAIT) != 0) {
 		return -EAGAIN;
@@ -528,9 +539,15 @@ ZTEST(uac1_runtime, test_4_capture_sends_application_packets)
 	uint8_t packet[196];
 	size_t received = 0;
 
+	atomic_set(&duplex->fail_acquire, 3);
+	atomic_set(&duplex->first_service, -1);
 	select_alternate(layout->as_interfaces[1], 1);
 	zassert_equal(duplex->terminal, DUPLEX_CAPTURE_TERMINAL);
 	zassert_ok(transfer(layout->data_ep[1], packet, sizeof(packet), &received));
+	zassert_equal(atomic_get(&duplex->fail_acquire), 0);
+	zassert_equal(atomic_get(&duplex->first_service), 0,
+		      "Failed acquisition must not consume a reservation");
+
 	zassert_equal(received, CAPTURE_PACKET_SIZE);
 	for (size_t i = 0; i < received; i++) {
 		zassert_equal(packet[i], (uint8_t)(DUPLEX_CAPTURE_TERMINAL + i));
