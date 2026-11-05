@@ -28,4 +28,7 @@
 	(GD32_DMA_FEATURES_FIFO_THRESHOLD(threshold) | GD32_DMA_FEATURES_FIFO_REQUEST)
 
 
+/** Snapshot of the active switch-buffer bank; it does not reserve the other bank. */
+int dma_gd32_active_buffer_get(const struct device *dev, uint32_t channel);
+
 #endif /* ZEPHYR_INCLUDE_DRIVERS_DMA_DMA_GD32_H_ */

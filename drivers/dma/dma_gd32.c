@@ -853,6 +853,18 @@ static bool dma_gd32_on_memory1(const struct dma_gd32_config *cfg, uint32_t ch)
 #endif
 }
 
+int dma_gd32_active_buffer_get(const struct device *dev, uint32_t ch)
+{
+	const struct dma_gd32_config *cfg = dev->config;
+	struct dma_gd32_data *data = dev->data;
+
+	if (ch >= cfg->channels ||
+	    !(data->channels[ch].flags & DMA_GD32_CHANNEL_SWITCH_BUF)) {
+		return -EINVAL;
+	}
+	return dma_gd32_on_memory1(cfg, ch) ? 1 : 0;
+}
+
 static void dma_gd32_note_memory(struct dma_gd32_channel *channel, bool on_memory1)
 {
 	channel->flags &= ~DMA_GD32_CHANNEL_ON_MEMORY1;

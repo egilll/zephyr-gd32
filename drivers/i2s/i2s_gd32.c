@@ -17,6 +17,7 @@
 #include <zephyr/drivers/dma/dma_gd32.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
+#include <zephyr/drivers/i2s/i2s_gd32.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/reset.h>
 #include <zephyr/irq.h>
@@ -27,32 +28,19 @@
 
 #include <gd32_spi.h>
 
-#include "i2s_gd32_banks.h"
+
 
 LOG_MODULE_REGISTER(i2s_gd32, CONFIG_I2S_LOG_LEVEL);
 
-/*
- * Each direction runs a two-buffer ("switch-buffer") DMA channel over the application's own
- * blocks: the DMA moves to the other buffer at the end of every block, and the completion points
- * the buffer it left at the next block. A transmit block is released once it has been sent; a
- * receive buffer gets a fresh block and its filled block is queued for i2s_read().
- *
- * Both buffers share one transfer count, so every block has the configured length: a shorter
- * transmit block is followed by silence. Receiving needs a third slab block to swap in.
- *
- * A stream underruns or overruns when the DMA reaches a buffer with nothing to send or nowhere to
- * receive; a transmit block written after the completion found none is in time if it is there
- * before the DMA. A stream also fails if a completion was serviced too late to know which buffer
- * the DMA is in. Either way it enters the error state until I2S_TRIGGER_PREPARE.
- *
- * The DMA cannot be told to stop after a buffer, only halted from its completion: STOP ends after
- * the blocks the DMA holds, the one it is in and the one it has been given next, and in the
- * interrupt latency after the last block of a stream the start of that block is sent again.
+/**
+ * DMA addresses are fixed for the lifetime of a stream. Completion copies between an inactive
+ * DMA bank and application slabs; hardware never owns an application allocation. Continuous
+ * streams insert silence or discard RX frames under congestion without stopping their peer.
  */
 
 #define GD32_I2SPSC_DEFAULT_VALUE 0x00000002U
 #define GD32_I2S_STOP_TIMEOUT_MS  10U
-#define GD32_I2S_RX_MIN_BLOCKS    3U
+#define GD32_I2S_RX_MIN_BLOCKS    1U
 
 struct queue_item {
 	void *mem_block;
@@ -77,6 +65,10 @@ struct i2s_gd32_config {
 	struct i2s_gd32_dma dma_rx;
 	struct i2s_gd32_dma dma_tx;
 	struct gpio_dt_spec ws_gpio;
+	uint8_t *rx_memory;
+	uint8_t *tx_memory;
+	size_t dma_buffer_size;
+	bool continuous;
 };
 
 struct stream {
@@ -89,14 +81,21 @@ struct stream {
 	uint32_t dma_channel;
 	uint32_t dma_slot;
 	uint32_t dma_priority;
-	struct gd32_i2s_banks banks;
-	/* A finished block the DMA may still read, released once it has stopped */
-	void *retired;
+	uint8_t active;
+	uint32_t generation;
+	uint32_t max_service_cycles;
+	uint32_t min_margin_cycles;
+	uint32_t first_fault_cycle;
+	bool pending[2];
+	struct queue_item startup[2];
+	uint8_t startup_count;
+	uint32_t discarded_frames;
+	uint32_t silent_frames;
 	uint64_t actual_frame_rate_num;
 	uint64_t actual_frame_rate_den;
 	uint64_t frame_count;
 	uint64_t timestamp_cycles;
-	/* Completions further apart than a block and a half mean one was missed */
+	/** Two periods without an observation make sticky completion flags ambiguous. */
 	uint32_t block_cycles;
 	uint32_t last_completion;
 	bool completed;
@@ -108,8 +107,6 @@ struct stream {
 	int64_t stop_deadline;
 	bool master;
 	bool drain;
-	/* A stopping transmit stream has been given its closing block of silence */
-	bool silenced;
 };
 
 struct i2s_gd32_data {
@@ -121,6 +118,8 @@ struct i2s_gd32_data {
 	struct k_mutex api_lock;
 	bool duplex;
 	bool clock_claimed;
+	i2s_gd32_service_callback_t service_callback;
+	void *service_user_data;
 };
 
 static inline uint32_t gd32_i2s_add_reg(uint32_t reg)
@@ -345,8 +344,12 @@ static void gd32_i2s_fail_locked(struct stream *stream)
 			continue;
 		}
 
+		if (!failed->first_fault_cycle) {
+			failed->first_fault_cycle = k_cycle_get_32();
+		}
 		gd32_i2s_halt(failed);
 		failed->state = I2S_STATE_ERROR;
+		failed->generation++;
 		if (failed->dir == I2S_DIR_RX) {
 			(void)queue_put(failed->msgq, NULL, 0U, 0);
 		} else {
@@ -362,44 +365,6 @@ static void gd32_i2s_finish_locked(struct stream *stream)
 	stream->finishing = true;
 	stream->stop_deadline = k_uptime_get() + GD32_I2S_STOP_TIMEOUT_MS;
 	k_work_reschedule(&stream->stop_work, K_NO_WAIT);
-}
-
-static int gd32_i2s_reload(struct stream *stream, void *memory)
-{
-	const uint32_t data_reg = (uint32_t)&SPI_DATA(gd32_i2s_stream_reg(stream));
-
-	if (stream->dir == I2S_DIR_RX) {
-		return dma_reload(stream->dma_dev, stream->dma_channel, data_reg, (uint32_t)memory,
-				  stream->cfg.block_size);
-	}
-
-	return dma_reload(stream->dma_dev, stream->dma_channel, (uint32_t)memory, data_reg,
-			  stream->cfg.block_size);
-}
-
-/*
- * Gives the next transmit bank the oldest queued block if its completion found none. With a
- * completion pending, the DMA may already be past that bank: the block stays queued, for the
- * completion to take. Lock held.
- */
-static int gd32_i2s_tx_feed_locked(struct stream *stream)
-{
-	struct queue_item item;
-	int ret;
-
-	if (stream->state != I2S_STATE_RUNNING || gd32_i2s_banks_next_held(&stream->banks) ||
-	    k_msgq_peek(stream->msgq, &item) != 0) {
-		return 0;
-	}
-
-	ret = gd32_i2s_reload(stream, gd32_i2s_banks_fill_next(&stream->banks, item.mem_block));
-	if (ret != 0) {
-		(void)gd32_i2s_banks_fill_next(&stream->banks, NULL);
-		return ret == -EBUSY ? 0 : ret;
-	}
-
-	(void)k_msgq_get(stream->msgq, &item, K_NO_WAIT);
-	return 0;
 }
 
 /*
@@ -423,13 +388,13 @@ static void gd32_i2s_clock_starts_locked(struct stream *stream)
 	}
 }
 
-/* Whether this completion came within a block and a half of the last one, or of the start. */
+/** Two periods without observation make sticky DMA completion flags ambiguous. */
 static bool gd32_i2s_on_time(struct stream *stream)
 {
 	const uint32_t now = k_cycle_get_32();
 	const bool late = stream->completed &&
 			  now - stream->last_completion >
-				  stream->block_cycles + stream->block_cycles / 2U;
+				  2U * stream->block_cycles;
 
 	stream->completed = true;
 	stream->last_completion = now;
@@ -438,104 +403,84 @@ static bool gd32_i2s_on_time(struct stream *stream)
 
 static const char *gd32_i2s_tx_complete_locked(struct stream *stream)
 {
-	void *done = gd32_i2s_banks_complete(&stream->banks);
-	void *next = NULL;
-	size_t size;
+	const struct i2s_gd32_config *cfg = stream->dev->config;
+	const uint8_t done = stream->active;
+	struct queue_item item;
+	uint8_t *memory = cfg->tx_memory + done * cfg->dma_buffer_size;
 
+	stream->active ^= 1U;
 	stream->frame_count += gd32_i2s_block_frames(stream);
 	stream->timestamp_cycles = k_cycle_get_64();
-
-	if (!gd32_i2s_banks_active_held(&stream->banks)) {
-		/* The DMA moved to a bank with nothing left to send; it reads `done` until halted. */
-		stream->retired = done;
-		if (stream->state == I2S_STATE_STOPPING) {
-			const uint32_t reg = gd32_i2s_stream_reg(stream);
-
-			/* A target with nothing to send underruns on the next frame, by design. */
-			SPI_CTL1(reg) &= ~SPI_CTL1_ERRIE;
-			spi_dma_disable(reg, SPI_DMA_TRANSMIT);
-			gd32_i2s_finish_locked(stream);
-			return NULL;
-		}
+	if (stream->state == I2S_STATE_STOPPING && !stream->pending[stream->active] &&
+	    (!stream->drain || (!stream->pending[done] && k_msgq_num_used_get(stream->msgq) == 0))) {
+		SPI_CTL1(gd32_i2s_stream_reg(stream)) &= ~SPI_CTL1_ERRIE;
+		spi_dma_disable(gd32_i2s_stream_reg(stream), SPI_DMA_TRANSMIT);
+		gd32_i2s_finish_locked(stream);
+		return NULL;
+	}
+	if (!cfg->continuous && stream->state == I2S_STATE_RUNNING &&
+	    !stream->pending[stream->active]) {
 		gd32_i2s_fail_locked(stream);
 		return "underrun";
 	}
+	bool take = stream->state == I2S_STATE_RUNNING || stream->drain;
 
-	if (stream->state == I2S_STATE_RUNNING || stream->drain) {
-		(void)queue_get(stream->msgq, &next, &size, 0);
-	}
-	if (next == NULL && stream->state == I2S_STATE_STOPPING && !stream->silenced) {
-		/* The bank left without a block replays the last one until the stream stops, and a
-		 * target then repeats the last word it was given. Ending on silence keeps both quiet.
-		 */
-		stream->silenced = true;
-		if (k_mem_slab_alloc(stream->cfg.mem_slab, &next, K_NO_WAIT) == 0) {
-			memset(next, 0, stream->cfg.block_size);
-		} else {
-			next = NULL;
+	stream->pending[done] = take && k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0;
+	if (stream->pending[done]) {
+		memcpy(memory, item.mem_block, stream->cfg.block_size);
+		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
+	} else {
+		memset(memory, 0, stream->cfg.block_size);
+		if (stream->state == I2S_STATE_RUNNING) {
+			stream->silent_frames += gd32_i2s_block_frames(stream);
 		}
 	}
-
-	if (gd32_i2s_reload(stream, gd32_i2s_banks_fill_next(&stream->banks, next)) < 0) {
-		stream->retired = done;
+	sys_cache_data_flush_range(memory, stream->cfg.block_size);
+	if (dma_gd32_active_buffer_get(stream->dma_dev, stream->dma_channel) != stream->active) {
 		gd32_i2s_fail_locked(stream);
-		return "DMA reload";
+		return "TX copy deadline";
 	}
-
-	/* The bank that sent `done` points elsewhere now, and the DMA is in the other one. */
-	k_mem_slab_free(stream->cfg.mem_slab, done);
 	return NULL;
 }
 
-static const char *gd32_i2s_rx_complete_locked(struct stream *stream)
+static const char *gd32_i2s_rx_complete_locked(struct stream *stream, uint32_t started,
+					       uint32_t budget)
 {
-	void *done = gd32_i2s_banks_complete(&stream->banks);
-	void *fresh;
+	const struct i2s_gd32_config *cfg = stream->dev->config;
+	const uint8_t done = stream->active;
+	uint8_t *memory = cfg->rx_memory + done * cfg->dma_buffer_size;
+	void *copy;
 
+	stream->active ^= 1U;
 	stream->frame_count += gd32_i2s_block_frames(stream);
 	stream->timestamp_cycles = k_cycle_get_64();
-	sys_cache_data_invd_range(done, stream->cfg.block_size);
-
-	if (stream->state == I2S_STATE_STOPPING) {
-		/*
-		 * The DMA stops in the bank it has started; that partial block is discarded. The bank
-		 * `done` came from is pointed at it too, so the DMA cannot come back to `done`.
-		 */
-		if (gd32_i2s_reload(stream, gd32_i2s_banks_fill_next(&stream->banks, NULL)) < 0) {
-			stream->retired = done;
+	sys_cache_data_invd_range(memory, stream->cfg.block_size);
+	if (k_mem_slab_alloc(stream->cfg.mem_slab, &copy, K_NO_WAIT) == 0) {
+		memcpy(copy, memory, stream->cfg.block_size);
+		if (k_cycle_get_32() - started >= budget ||
+		    dma_gd32_active_buffer_get(stream->dma_dev, stream->dma_channel) != stream->active) {
+			k_mem_slab_free(stream->cfg.mem_slab, copy);
 			gd32_i2s_fail_locked(stream);
-			return "DMA reload";
+			return "RX copy deadline";
 		}
-		gd32_i2s_halt(stream);
-		gd32_i2s_finish_locked(stream);
-		if (queue_put(stream->msgq, done, stream->cfg.block_size, 0) != 0) {
-			k_mem_slab_free(stream->cfg.mem_slab, done);
-			stream->state = I2S_STATE_ERROR;
+		if (queue_put(stream->msgq, copy, stream->cfg.block_size, 0) != 0) {
+			k_mem_slab_free(stream->cfg.mem_slab, copy);
+			copy = NULL;
+		}
+	} else {
+		copy = NULL;
+	}
+	if (copy == NULL) {
+		stream->discarded_frames += gd32_i2s_block_frames(stream);
+		if (!cfg->continuous) {
+			gd32_i2s_fail_locked(stream);
 			return "overrun";
 		}
-		return NULL;
 	}
-
-	if (k_mem_slab_alloc(stream->cfg.mem_slab, &fresh, K_NO_WAIT) != 0) {
-		/* The bank keeps `done` until the DMA has stopped. */
-		(void)gd32_i2s_banks_fill_next(&stream->banks, done);
-		gd32_i2s_fail_locked(stream);
-		return "overrun";
+	if (stream->state == I2S_STATE_STOPPING) {
+		gd32_i2s_halt(stream);
+		gd32_i2s_finish_locked(stream);
 	}
-
-	sys_cache_data_invd_range(fresh, stream->cfg.block_size);
-	if (gd32_i2s_reload(stream, gd32_i2s_banks_fill_next(&stream->banks, fresh)) < 0) {
-		stream->retired = done;
-		gd32_i2s_fail_locked(stream);
-		return "DMA reload";
-	}
-
-	if (queue_put(stream->msgq, done, stream->cfg.block_size, 0) != 0) {
-		k_mem_slab_free(stream->cfg.mem_slab, done);
-		gd32_i2s_fail_locked(stream);
-		return "overrun";
-	}
-
 	return NULL;
 }
 
@@ -545,6 +490,9 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	struct stream *stream = arg;
 	struct i2s_gd32_data *data = stream->dev->data;
 	const char *failure = NULL;
+	const uint32_t started = k_cycle_get_32();
+	struct dma_status progress = {0};
+	uint32_t budget = 0;
 	k_spinlock_key_t key;
 
 	ARG_UNUSED(dma_dev);
@@ -561,35 +509,59 @@ static void gd32_i2s_dma_callback(const struct device *dma_dev, void *arg, uint3
 	} else if (status < 0) {
 		gd32_i2s_fail_locked(stream);
 		failure = "DMA error";
+	} else if (dma_gd32_active_buffer_get(stream->dma_dev, stream->dma_channel) !=
+		   (stream->active ^ 1U)) {
+		gd32_i2s_fail_locked(stream);
+		failure = "DMA bank identity";
 	} else if (!gd32_i2s_on_time(stream)) {
 		gd32_i2s_fail_locked(stream);
 		failure = "late completion";
-	} else if (stream->dir == I2S_DIR_RX) {
-		failure = gd32_i2s_rx_complete_locked(stream);
 	} else {
-		failure = gd32_i2s_tx_complete_locked(stream);
+		if (dma_get_status(stream->dma_dev, stream->dma_channel, &progress) == 0 &&
+		    progress.pending_length > 16U) {
+			budget = (uint64_t)(progress.pending_length - 16U) * stream->block_cycles /
+				 stream->cfg.block_size;
+		}
+		if (budget == 0) {
+			gd32_i2s_fail_locked(stream);
+			failure = "no DMA copy window";
+		} else if (stream->dir == I2S_DIR_RX) {
+			failure = gd32_i2s_rx_complete_locked(stream, started, budget);
+		} else {
+			failure = gd32_i2s_tx_complete_locked(stream);
+		}
+		const uint32_t elapsed = k_cycle_get_32() - started;
+
+		stream->max_service_cycles = MAX(stream->max_service_cycles, elapsed);
+		if (elapsed >= budget) {
+			gd32_i2s_fail_locked(stream);
+			failure = "DMA service deadline";
+		} else {
+			stream->min_margin_cycles = MIN(stream->min_margin_cycles, budget - elapsed);
+		}
 	}
 	k_spin_unlock(&data->lock, key);
 
 	if (failure != NULL) {
 		LOG_ERR("%s %s %s", stream->dev->name, gd32_i2s_dir_name(stream), failure);
 	}
+	if (data->service_callback != NULL) {
+		data->service_callback(stream->dev, data->service_user_data);
+	}
 }
 
 /*
- * Stops the stream's peripheral and DMA and puts it into `state`, then releases every block the
- * banks held. If the DMA does not stop, the blocks stay with the stream. Called with the API lock
- * held.
+ * Stops the peripheral and DMA before fixed storage can be reused. A failed DMA stop leaves
+ * the stream in ERROR. Called with the API lock held.
  */
 static int gd32_i2s_teardown(struct stream *stream, enum i2s_state state)
 {
 	struct i2s_gd32_data *data = stream->dev->data;
-	void *blocks[3];
-	size_t count = 0U;
 	k_spinlock_key_t key;
 	int ret;
 
 	key = k_spin_lock(&data->lock);
+	stream->generation++;
 	stream->state = state;
 	stream->finishing = false;
 	gd32_i2s_halt(stream);
@@ -599,20 +571,10 @@ static int gd32_i2s_teardown(struct stream *stream, enum i2s_state state)
 	ret = dma_stop(stream->dma_dev, stream->dma_channel);
 
 	key = k_spin_lock(&data->lock);
-	if (ret == 0) {
-		count = gd32_i2s_banks_take_all(&stream->banks, blocks);
-		if (stream->retired != NULL) {
-			blocks[count++] = stream->retired;
-			stream->retired = NULL;
-		}
-	} else {
+	if (ret != 0) {
 		stream->state = I2S_STATE_ERROR;
 	}
 	k_spin_unlock(&data->lock, key);
-
-	for (size_t i = 0U; i < count; i++) {
-		k_mem_slab_free(stream->cfg.mem_slab, blocks[i]);
-	}
 
 	return ret;
 }
@@ -629,6 +591,19 @@ static void gd32_i2s_stop_work_handler(struct k_work *work)
 
 	k_mutex_lock(&data->api_lock, K_FOREVER);
 	key = k_spin_lock(&data->lock);
+	if (stream->state == I2S_STATE_STOPPING && !stream->finishing) {
+		if (k_uptime_get() >= stream->stop_deadline) {
+			gd32_i2s_fail_locked(stream);
+			k_spin_unlock(&data->lock, key);
+			LOG_ERR("%s %s clock lost while stopping", stream->dev->name,
+				gd32_i2s_dir_name(stream));
+		} else {
+			k_spin_unlock(&data->lock, key);
+			k_work_reschedule(&stream->stop_work, K_MSEC(1));
+		}
+		k_mutex_unlock(&data->api_lock);
+		return;
+	}
 	current = stream->state == I2S_STATE_STOPPING && stream->finishing;
 	k_spin_unlock(&data->lock, key);
 
@@ -729,7 +704,7 @@ static int gd32_i2s_validate_config(enum i2s_dir dir, const struct i2s_config *c
 		return -EINVAL;
 	}
 
-	if (cfg->block_size == 0U || (cfg->block_size % gd32_i2s_frame_bytes(cfg)) != 0U ||
+	if (cfg->block_size <= 16U || (cfg->block_size % gd32_i2s_frame_bytes(cfg)) != 0U ||
 	    cfg->block_size > cfg->mem_slab->info.block_size) {
 		return -EINVAL;
 	}
@@ -772,14 +747,18 @@ static bool gd32_i2s_arms_on_ws(const struct stream *stream)
 	       format != I2S_FMT_DATA_FORMAT_PCM_SHORT && format != I2S_FMT_DATA_FORMAT_PCM_LONG;
 }
 
-static bool gd32_i2s_wait_ws(const struct gpio_dt_spec *ws, int level, uint32_t deadline)
+static int gd32_i2s_wait_ws(const struct gpio_dt_spec *ws, int level, uint32_t deadline)
 {
 	gpio_port_value_t value;
 
 	while ((int32_t)(deadline - k_cycle_get_32()) > 0) {
-		if (gpio_port_get_raw(ws->port, &value) == 0 &&
-		    (int)((value >> ws->pin) & 1U) == level) {
-			return true;
+		int ret = gpio_port_get_raw(ws->port, &value);
+
+		if (ret < 0) {
+			return ret;
+		}
+		if ((int)((value >> ws->pin) & 1U) == level) {
+			return 1;
 		}
 	}
 	return false;
@@ -790,7 +769,7 @@ static bool gd32_i2s_wait_ws(const struct gpio_dt_spec *ws, int level, uint32_t 
  * enables them at once. With the master clocking, interrupts stay locked for at most a frame, and
  * the first completion is timed from the enable.
  */
-static void gd32_i2s_enable_on_ws(struct stream *stream, uint32_t first, uint32_t second)
+static int gd32_i2s_enable_on_ws(struct stream *stream, uint32_t first, uint32_t second)
 {
 	const struct i2s_gd32_config *cfg = stream->dev->config;
 	const uint32_t format = stream->cfg.format & I2S_FMT_DATA_FORMAT_MASK;
@@ -800,10 +779,16 @@ static void gd32_i2s_enable_on_ws(struct stream *stream, uint32_t first, uint32_
 	struct i2s_gd32_data *data = stream->dev->data;
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
 	const uint32_t deadline = k_cycle_get_32() + window;
-	const bool clocking = gd32_i2s_wait_ws(&cfg->ws_gpio, !arm_level, deadline) &&
-			      gd32_i2s_wait_ws(&cfg->ws_gpio, arm_level, deadline);
+	int clocking = gd32_i2s_wait_ws(&cfg->ws_gpio, !arm_level, deadline);
 
-	if (clocking) {
+	if (clocking > 0) {
+		clocking = gd32_i2s_wait_ws(&cfg->ws_gpio, arm_level, deadline);
+	}
+	if (clocking < 0) {
+		k_spin_unlock(&data->lock, key);
+		return clocking;
+	}
+	if (clocking > 0) {
 		gd32_i2s_clock_starts_locked(stream);
 	}
 	i2s_enable(first);
@@ -811,37 +796,11 @@ static void gd32_i2s_enable_on_ws(struct stream *stream, uint32_t first, uint32_
 		i2s_enable(second);
 	}
 	k_spin_unlock(&data->lock, key);
-}
-
-/* The blocks a stream starts with: queued transmit blocks, or receive blocks from the slab. */
-static int gd32_i2s_first_blocks(struct stream *stream, void *blocks[2])
-{
-	struct queue_item item;
-
-	if (stream->dir == I2S_DIR_TX) {
-		if (k_msgq_peek_at(stream->msgq, &item, 0U) != 0) {
-			return -EIO;
-		}
-		blocks[0] = item.mem_block;
-		blocks[1] = k_msgq_peek_at(stream->msgq, &item, 1U) == 0 ? item.mem_block : NULL;
-		return 0;
-	}
-
-	if (k_mem_slab_alloc(stream->cfg.mem_slab, &blocks[0], K_NO_WAIT) != 0) {
-		return -ENOMEM;
-	}
-	if (k_mem_slab_alloc(stream->cfg.mem_slab, &blocks[1], K_NO_WAIT) != 0) {
-		k_mem_slab_free(stream->cfg.mem_slab, blocks[0]);
-		return -ENOMEM;
-	}
-	sys_cache_data_invd_range(blocks[0], stream->cfg.block_size);
-	sys_cache_data_invd_range(blocks[1], stream->cfg.block_size);
 	return 0;
 }
 
 /*
- * Points the two DMA banks at the stream's first blocks, starts the DMA and enables the
- * peripheral's requests. The peripheral itself is enabled here, or on the frame clock by the
+ * Copies startup blocks into fixed DMA banks, starts DMA and enables peripheral requests. The peripheral itself is enabled here, or on the frame clock by the
  * caller. Called with the API lock held, from READY.
  */
 static int gd32_i2s_stream_start(struct stream *stream)
@@ -868,27 +827,35 @@ static int gd32_i2s_stream_start(struct stream *stream)
 	};
 	struct queue_item item;
 	k_spinlock_key_t key;
-	void *first[2];
 	int ret;
 
-	ret = gd32_i2s_first_blocks(stream, first);
-	if (ret < 0) {
-		return ret;
-	}
-	gd32_i2s_banks_init(&stream->banks, first[0], first[1]);
+	uint8_t *memory = stream->dir == I2S_DIR_RX ? cfg->rx_memory : cfg->tx_memory;
 
+	if (stream->dir == I2S_DIR_TX && k_msgq_peek(stream->msgq, &item) != 0) {
+		return -EIO;
+	}
+	stream->startup_count = 0U;
+	stream->active = 0U;
 	for (uint8_t bank = 0U; bank < 2U; bank++) {
-		const uint32_t memory = (uint32_t)gd32_i2s_banks_memory(&stream->banks, bank);
+		uint8_t *bank_memory = memory + bank * cfg->dma_buffer_size;
+		stream->pending[bank] = stream->dir == I2S_DIR_TX &&
+			k_msgq_peek_at(stream->msgq, &item, bank) == 0;
+		if (stream->pending[bank]) {
+			memcpy(bank_memory, item.mem_block, stream->cfg.block_size);
+		} else {
+			memset(bank_memory, 0, stream->cfg.block_size);
+		}
+		sys_cache_data_flush_and_invd_range(bank_memory, stream->cfg.block_size);
 
 		blocks[bank].block_size = stream->cfg.block_size;
 		blocks[bank].fifo_mode_control = dma->fifo_threshold;
 		if (stream->dir == I2S_DIR_RX) {
 			blocks[bank].source_address = (uint32_t)&SPI_DATA(reg);
 			blocks[bank].source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-			blocks[bank].dest_address = memory;
+			blocks[bank].dest_address = (uint32_t)bank_memory;
 			blocks[bank].dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 		} else {
-			blocks[bank].source_address = memory;
+			blocks[bank].source_address = (uint32_t)bank_memory;
 			blocks[bank].source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 			blocks[bank].dest_address = (uint32_t)&SPI_DATA(reg);
 			blocks[bank].dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
@@ -903,26 +870,19 @@ static int gd32_i2s_stream_start(struct stream *stream)
 	if (ret < 0) {
 		LOG_ERR("%s %s DMA start failed: %d", stream->dev->name,
 			gd32_i2s_dir_name(stream), ret);
-		if (stream->dir == I2S_DIR_RX) {
-			k_mem_slab_free(stream->cfg.mem_slab, first[0]);
-			k_mem_slab_free(stream->cfg.mem_slab, first[1]);
-		}
-		gd32_i2s_banks_init(&stream->banks, NULL, NULL);
 		return ret;
 	}
 
-	/* The transmit blocks were only looked at; the banks hold them now. */
 	if (stream->dir == I2S_DIR_TX) {
-		(void)k_msgq_get(stream->msgq, &item, K_NO_WAIT);
-		if (first[1] != NULL) {
-			(void)k_msgq_get(stream->msgq, &item, K_NO_WAIT);
+		for (unsigned int bank = 0; bank < 2; ++bank) {
+			if (stream->pending[bank]) {
+				(void)k_msgq_get(stream->msgq, &stream->startup[stream->startup_count++], K_NO_WAIT);
+			}
 		}
 	}
 
 	key = k_spin_lock(&data->lock);
-	stream->retired = NULL;
 	stream->drain = false;
-	stream->silenced = false;
 	stream->finishing = false;
 	stream->completed = false;
 	stream->block_cycles =
@@ -1039,6 +999,9 @@ static int gd32_i2s_configure_one(const struct device *dev, enum i2s_dir dir,
 		return 0;
 	}
 
+	if (i2s_cfg->block_size > cfg->dma_buffer_size) {
+		return -EINVAL;
+	}
 	ret = gd32_i2s_validate_config(dir, i2s_cfg);
 	if (ret < 0) {
 		return ret;
@@ -1104,9 +1067,15 @@ static int gd32_i2s_configure_one(const struct device *dev, enum i2s_dir dir,
 	}
 
 	data->duplex = forming_duplex;
+	stream->generation++;
 	stream->cfg = *i2s_cfg;
 	stream->master = master;
 	stream->state = I2S_STATE_READY;
+	stream->discarded_frames = 0;
+	stream->silent_frames = 0;
+	stream->max_service_cycles = 0;
+	stream->min_margin_cycles = UINT32_MAX;
+	stream->first_fault_cycle = 0;
 	stream->frame_count = 0U;
 	stream->timestamp_cycles = 0U;
 
@@ -1133,6 +1102,9 @@ static int gd32_i2s_configure_both(const struct device *dev, const struct i2s_co
 		return -EBUSY;
 	}
 	if (i2s_cfg->frame_clk_freq != 0U) {
+		if (i2s_cfg->block_size > cfg->dma_buffer_size) {
+			return -EINVAL;
+		}
 		ret = gd32_i2s_validate_config(I2S_DIR_TX, i2s_cfg);
 		if (ret == 0) {
 			ret = gd32_i2s_validate_config(I2S_DIR_RX, i2s_cfg);
@@ -1254,6 +1226,25 @@ static int gd32_i2s_prepare(const struct device *dev, struct stream *stream)
 	return ret;
 }
 
+static void gd32_i2s_start_commit(struct stream *stream, bool success)
+{
+	while (stream->startup_count != 0) {
+		struct queue_item *item = &stream->startup[--stream->startup_count];
+
+		if (success) {
+			k_mem_slab_free(stream->cfg.mem_slab, item->mem_block);
+		} else {
+			/** The API lock excludes writers; no requests ran after a failed WS arm. */
+			int ret = k_msgq_put_front(stream->msgq, item);
+
+			__ASSERT_NO_MSG(ret == 0);
+			if (ret != 0) {
+				k_mem_slab_free(stream->cfg.mem_slab, item->mem_block);
+			}
+		}
+	}
+}
+
 static int gd32_i2s_trigger_one(const struct device *dev, struct stream *stream,
 				enum i2s_trigger_cmd cmd)
 {
@@ -1268,8 +1259,12 @@ static int gd32_i2s_trigger_one(const struct device *dev, struct stream *stream,
 		}
 		ret = gd32_i2s_stream_start(stream);
 		if (ret == 0 && gd32_i2s_arms_on_ws(stream)) {
-			gd32_i2s_enable_on_ws(stream, gd32_i2s_stream_reg(stream), 0U);
+			ret = gd32_i2s_enable_on_ws(stream, gd32_i2s_stream_reg(stream), 0U);
+			if (ret < 0) {
+				(void)gd32_i2s_teardown(stream, I2S_STATE_READY);
+			}
 		}
+		gd32_i2s_start_commit(stream, ret == 0);
 		return ret;
 
 	case I2S_TRIGGER_STOP:
@@ -1282,6 +1277,12 @@ static int gd32_i2s_trigger_one(const struct device *dev, struct stream *stream,
 		/* A receive stream drains as it stops: at the end of the current block. */
 		stream->drain = cmd == I2S_TRIGGER_DRAIN && stream->dir == I2S_DIR_TX;
 		stream->state = I2S_STATE_STOPPING;
+		const uint64_t periods = 4U + (stream->drain ? k_msgq_num_used_get(stream->msgq) : 0U);
+
+		stream->stop_deadline = k_uptime_get() + GD32_I2S_STOP_TIMEOUT_MS +
+			DIV_ROUND_UP(periods * gd32_i2s_block_frames(stream) * 1000U,
+				     stream->cfg.frame_clk_freq);
+		k_work_reschedule(&stream->stop_work, K_MSEC(1));
 		k_spin_unlock(&data->lock, key);
 		return 0;
 
@@ -1329,9 +1330,14 @@ static int gd32_i2s_trigger_both(const struct device *dev, enum i2s_trigger_cmd 
 			return ret;
 		}
 		if (gd32_i2s_arms_on_ws(&data->tx)) {
-			gd32_i2s_enable_on_ws(&data->tx, gd32_i2s_rx_reg(dev), cfg->reg);
+			ret = gd32_i2s_enable_on_ws(&data->tx, gd32_i2s_rx_reg(dev), cfg->reg);
+			if (ret < 0) {
+				(void)gd32_i2s_teardown(&data->rx, I2S_STATE_READY);
+				(void)gd32_i2s_teardown(&data->tx, I2S_STATE_READY);
+			}
 		}
-		return 0;
+		gd32_i2s_start_commit(&data->tx, ret == 0);
+		return ret;
 
 	case I2S_TRIGGER_STOP:
 	case I2S_TRIGGER_DRAIN:
@@ -1397,8 +1403,8 @@ static int i2s_gd32_trigger(const struct device *dev, enum i2s_dir dir, enum i2s
 	k_mutex_lock(&data->api_lock, K_FOREVER);
 	if (dir == I2S_DIR_BOTH) {
 		ret = gd32_i2s_add_reg(cfg->reg) != 0U ? gd32_i2s_trigger_both(dev, cmd) : -ENOTSUP;
-	} else if (data->duplex) {
-		LOG_ERR("%s configured duplex; trigger both directions together", dev->name);
+	} else if (data->duplex && (data->tx.master || cmd == I2S_TRIGGER_PREPARE)) {
+		LOG_ERR("%s shared clock/reset requires triggering both directions", dev->name);
 		ret = -ENOTSUP;
 	} else if (dir == I2S_DIR_RX || dir == I2S_DIR_TX) {
 		ret = gd32_i2s_trigger_one(dev, dir == I2S_DIR_RX ? &data->rx : &data->tx, cmd);
@@ -1433,48 +1439,126 @@ static int i2s_gd32_read(const struct device *dev, void **mem_block, size_t *siz
 	return ret == -ENOMSG ? -EBUSY : ret;
 }
 
+/** Strict streams may fill an empty future bank before the next completion. */
+static void gd32_i2s_feed_empty_locked(struct stream *stream)
+{
+	const struct i2s_gd32_config *cfg = stream->dev->config;
+	struct dma_status progress;
+	struct queue_item item;
+	const uint8_t next = stream->active ^ 1U;
+	const uint32_t started = k_cycle_get_32();
+
+	if (cfg->continuous || stream->state != I2S_STATE_RUNNING || stream->pending[next] ||
+	    dma_gd32_active_buffer_get(stream->dma_dev, stream->dma_channel) != stream->active ||
+	    dma_get_status(stream->dma_dev, stream->dma_channel, &progress) != 0 ||
+	    progress.pending_length <= 16U) {
+		return;
+	}
+	const uint32_t budget = (uint64_t)(progress.pending_length - 16U) * stream->block_cycles /
+				stream->cfg.block_size;
+
+	if (k_msgq_get(stream->msgq, &item, K_NO_WAIT) != 0) {
+		return;
+	}
+	uint8_t *memory = cfg->tx_memory + next * cfg->dma_buffer_size;
+
+	memcpy(memory, item.mem_block, stream->cfg.block_size);
+	sys_cache_data_flush_range(memory, stream->cfg.block_size);
+	k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
+	if (k_cycle_get_32() - started >= budget ||
+	    dma_gd32_active_buffer_get(stream->dma_dev, stream->dma_channel) != stream->active) {
+		gd32_i2s_fail_locked(stream);
+		return;
+	}
+	stream->pending[next] = true;
+}
+
 static int i2s_gd32_write(const struct device *dev, void *mem_block, size_t size)
 {
 	struct i2s_gd32_data *data = dev->data;
 	struct stream *stream = &data->tx;
-	const size_t block_size = stream->cfg.block_size;
-	k_spinlock_key_t key;
-	int ret;
+	uint32_t generation;
+	int64_t deadline;
+	bool initialized = false;
 
-	if (stream->state != I2S_STATE_RUNNING && stream->state != I2S_STATE_READY) {
-		return -EIO;
-	}
-
-	if (size == 0U || size > block_size || (size % gd32_i2s_frame_bytes(&stream->cfg)) != 0U) {
+	if (mem_block == NULL) {
 		return -EINVAL;
 	}
+	for (;;) {
+		k_mutex_lock(&data->api_lock, K_FOREVER);
+		k_spinlock_key_t key = k_spin_lock(&data->lock);
+		if ((stream->state != I2S_STATE_RUNNING && stream->state != I2S_STATE_READY) ||
+		    (initialized && generation != stream->generation)) {
+			k_spin_unlock(&data->lock, key);
+			k_mutex_unlock(&data->api_lock);
+			return -EIO;
+		}
+		const size_t block_size = stream->cfg.block_size;
 
-	/* Both DMA banks have the configured length, so a shorter block ends in silence. */
-	memset((uint8_t *)mem_block + size, 0, block_size - size);
-	sys_cache_data_flush_range(mem_block, block_size);
+		if (size == 0U || size > block_size ||
+		    size % gd32_i2s_frame_bytes(&stream->cfg) != 0U) {
+			k_spin_unlock(&data->lock, key);
+			k_mutex_unlock(&data->api_lock);
+			return -EINVAL;
+		}
+		if (!initialized) {
+			generation = stream->generation;
+			deadline = stream->cfg.timeout == SYS_FOREVER_MS ? INT64_MAX :
+				k_uptime_get() + stream->cfg.timeout;
+			initialized = true;
+			memset((uint8_t *)mem_block + size, 0, block_size - size);
+		}
+		/** Successful publication under the state lock is the ownership transfer. */
+		int ret = queue_put(stream->msgq, mem_block, block_size, 0);
 
-	/* Queued and fed under the lock, so no completion can find the queue empty in between. */
-	key = k_spin_lock(&data->lock);
-	ret = queue_put(stream->msgq, mem_block, block_size, 0);
-	if (ret == 0 && gd32_i2s_tx_feed_locked(stream) < 0) {
-		gd32_i2s_fail_locked(stream);
-	}
-	k_spin_unlock(&data->lock, key);
-
-	if (ret == -ENOMSG && stream->cfg.timeout != 0) {
-		/*
-		 * Room is made by completions, which may have found the queue empty meanwhile. A block
-		 * accepted after the stream failed is released by I2S_TRIGGER_PREPARE.
-		 */
-		ret = queue_put(stream->msgq, mem_block, block_size, stream->cfg.timeout);
-		key = k_spin_lock(&data->lock);
-		if (ret == 0 && gd32_i2s_tx_feed_locked(stream) < 0) {
-			gd32_i2s_fail_locked(stream);
+		if (ret == 0) {
+			gd32_i2s_feed_empty_locked(stream);
 		}
 		k_spin_unlock(&data->lock, key);
+		k_mutex_unlock(&data->api_lock);
+		if (ret != -ENOMSG) {
+			return ret;
+		}
+		if (k_uptime_get() >= deadline) {
+			return -EBUSY;
+		}
+		k_sleep(K_MSEC(1));
 	}
+}
 
-	return ret == -ENOMSG ? -EBUSY : ret;
+int i2s_gd32_service_callback_set(const struct device *dev,
+				i2s_gd32_service_callback_t callback, void *user_data)
+{
+	struct i2s_gd32_data *data = dev->data;
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+	data->service_callback = callback;
+	data->service_user_data = user_data;
+	k_spin_unlock(&data->lock, key);
+	return 0;
+}
+
+int i2s_gd32_diagnostics_get(const struct device *dev, enum i2s_dir dir,
+			   struct i2s_gd32_diagnostics *out)
+{
+	struct i2s_gd32_data *data = dev->data;
+
+	if (out == NULL || (dir != I2S_DIR_RX && dir != I2S_DIR_TX)) {
+		return -EINVAL;
+	}
+	struct stream *stream = dir == I2S_DIR_RX ? &data->rx : &data->tx;
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+	*out = (struct i2s_gd32_diagnostics) {
+		.generation = stream->generation,
+		.silent_frames = stream->silent_frames,
+		.discarded_frames = stream->discarded_frames,
+		.maximum_service_cycles = stream->max_service_cycles,
+		.minimum_margin_cycles = stream->min_margin_cycles,
+		.first_fault_cycle = stream->first_fault_cycle,
+	};
+	k_spin_unlock(&data->lock, key);
+	return 0;
 }
 
 static DEVICE_API(i2s, i2s_gd32_driver_api) = {
@@ -1575,6 +1659,8 @@ static int i2s_gd32_init(const struct device *dev)
 #define I2S_GD32_INIT(inst)                                                                        \
 	BUILD_ASSERT(DT_INST_DMAS_HAS_NAME(inst, rx), "GD32 I2S requires RX DMA");                 \
 	BUILD_ASSERT(DT_INST_DMAS_HAS_NAME(inst, tx), "GD32 I2S requires TX DMA");                 \
+	static uint8_t rx_memory_##inst[2 * DT_INST_PROP_OR(inst, dma_buffer_size, 2048)] __aligned(4); \
+	static uint8_t tx_memory_##inst[2 * DT_INST_PROP_OR(inst, dma_buffer_size, 2048)] __aligned(4); \
 	PINCTRL_DT_INST_DEFINE(inst);                                                              \
 	K_MSGQ_DEFINE(rx_##inst##_queue, sizeof(struct queue_item),                                \
 		      CONFIG_I2S_GD32_RX_BLOCK_COUNT, 4);                                          \
@@ -1592,6 +1678,10 @@ static int i2s_gd32_init(const struct device *dev)
 		.tx = {.msgq = &tx_##inst##_queue, .state = I2S_STATE_NOT_READY},                  \
 	};                                                                                         \
 	static const struct i2s_gd32_config i2s_gd32_config_##inst = {                             \
+		.rx_memory = rx_memory_##inst, \
+		.tx_memory = tx_memory_##inst, \
+		.dma_buffer_size = DT_INST_PROP_OR(inst, dma_buffer_size, 2048), \
+		.continuous = DT_INST_PROP(inst, continuous_streaming), \
 		.reg = DT_INST_REG_ADDR(inst),                                                     \
 		.clkid = DT_INST_CLOCKS_CELL(inst, id),                                            \
 		.reset = RESET_DT_SPEC_INST_GET(inst),                                             \

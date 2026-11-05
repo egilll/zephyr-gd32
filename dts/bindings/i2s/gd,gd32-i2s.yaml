@@ -45,3 +45,12 @@ properties:
       property it arms in the half frame before the next frame starts, so it
       can start while the master is already clocking. The pin stays muxed to
       the I2S. Philips and justified formats only; PCM targets enable at once.
+
+  dma-buffer-size:
+    type: int
+    default: 2048
+    description: Maximum bytes per fixed DMA bank in each direction.
+
+  continuous-streaming:
+    type: boolean
+    description: Insert TX silence and discard congested RX frames instead of stopping.
