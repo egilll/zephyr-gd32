@@ -17,6 +17,7 @@
 #include <zephyr/usb/usbh.h>
 #include <zephyr/usb/class/usbd_uac1.h>
 #include <zephyr/drivers/usb/udc.h>
+#include <zephyr/drivers/usb/uhc.h>
 #include <zephyr/ztest.h>
 
 #include <usbh_ch9.h>
@@ -70,6 +71,9 @@ struct function_record {
 	atomic_t activated;
 	atomic_t deactivated;
 	atomic_t disabled;
+	atomic_t suspended;
+	atomic_t resumed;
+	uint8_t capture_pattern_offset;
 	atomic_t fail_acquire;
 	atomic_t first_service;
 	uint8_t terminal;
@@ -111,6 +115,10 @@ static void stream_event(const struct device *dev, uint8_t terminal,
 		atomic_inc(&record->deactivated);
 	} else if (event == UAC1_STREAM_DISABLED) {
 		atomic_inc(&record->disabled);
+	} else if (event == UAC1_STREAM_SUSPENDED) {
+		atomic_inc(&record->suspended);
+	} else if (event == UAC1_STREAM_RESUMED) {
+		atomic_inc(&record->resumed);
 	}
 }
 
@@ -164,7 +172,7 @@ static int tx_acquire(const struct device *dev, uint8_t terminal, uint16_t max_s
 
 	data = *buf;
 	for (size_t i = 0; i < CAPTURE_PACKET_SIZE; i++) {
-		data[i] = (uint8_t)(terminal + i);
+		data[i] = (uint8_t)(terminal + i + record->capture_pattern_offset);
 	}
 	*size = CAPTURE_PACKET_SIZE;
 	atomic_inc(&record_of(dev)->acquired);
@@ -555,6 +563,46 @@ ZTEST(uac1_runtime, test_4_capture_sends_application_packets)
 
 	select_alternate(layout->as_interfaces[1], 0);
 	assert_all_buffers_returned(duplex);
+}
+
+ZTEST(uac1_runtime, test_4b_suspend_retires_both_sessions_before_fresh_resume)
+{
+	struct function_record *record = &records[0];
+	const struct function_layout *layout = &layouts[0];
+	const struct device *host = DEVICE_DT_GET(DT_NODELABEL(zephyr_uhc0));
+	struct uac1_stream_diagnostics before, suspended;
+	uint8_t packet[196] = {0};
+	size_t received = 0;
+
+	select_alternate(layout->as_interfaces[0], 1);
+	select_alternate(layout->as_interfaces[1], 1);
+	zassert_ok(transfer(layout->data_ep[1], packet, sizeof(packet), &received));
+	zassert_ok(usbd_uac1_stream_diagnostics_get(record->dev, DUPLEX_CAPTURE_TERMINAL, &before));
+	zassert_ok(uhc_bus_suspend(host));
+	k_msleep(50);
+	zassert_equal(atomic_get(&record->suspended), 2);
+	zassert_ok(usbd_uac1_stream_diagnostics_get(record->dev, DUPLEX_CAPTURE_TERMINAL, &suspended));
+	zassert_true(suspended.generation > before.generation);
+	zassert_equal(suspended.data_outstanding, 0);
+	zassert_ok(usbd_uac1_stream_diagnostics_get(record->dev, DUPLEX_PLAYBACK_TERMINAL, &suspended));
+	zassert_equal(suspended.data_outstanding, 0);
+	zassert_equal(suspended.feedback_outstanding, 0);
+	assert_all_buffers_returned(record);
+	record->capture_pattern_offset = 0x40;
+	atomic_set(&record->first_service, -1);
+	zassert_ok(uhc_bus_resume(host));
+	k_msleep(30);
+	zassert_equal(atomic_get(&record->resumed), 2);
+	zassert_ok(transfer(layout->data_ep[1], packet, sizeof(packet), &received));
+	zassert_equal(atomic_get(&record->first_service), 0);
+	zassert_equal(received, CAPTURE_PACKET_SIZE);
+	for (size_t i = 0; i < received; ++i) {
+		zassert_equal(packet[i], (uint8_t)(DUPLEX_CAPTURE_TERMINAL + i + 0x40));
+	}
+	select_alternate(layout->as_interfaces[0], 0);
+	select_alternate(layout->as_interfaces[1], 0);
+	assert_all_buffers_returned(record);
+	record->capture_pattern_offset = 0;
 }
 
 ZTEST(uac1_runtime, test_5_shutdown_while_streaming_returns_every_buffer)

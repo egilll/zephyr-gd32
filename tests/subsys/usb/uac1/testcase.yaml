@@ -17,3 +17,13 @@ tests:
     extra_args:
       - EXTRA_CONF_FILE=runtime/runtime.conf
       - EXTRA_DTC_OVERLAY_FILE=runtime/runtime.overlay
+  usb.uac1.runtime_pressure:
+    tags:
+      - usb
+    platform_allow:
+      - qemu_cortex_m3
+    extra_args:
+      - EXTRA_CONF_FILE=runtime/runtime.conf
+      - EXTRA_DTC_OVERLAY_FILE=runtime/runtime.overlay
+    extra_configs:
+      - CONFIG_USBD_MAX_UDC_MSG=1

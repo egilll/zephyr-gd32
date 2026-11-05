@@ -874,7 +874,8 @@ static void dwc2_handle_xfer_next(const struct device *dev,
 	const uint8_t ep_bit = USB_EP_GET_IDX(cfg->addr) +
 		(USB_EP_DIR_IS_OUT(cfg->addr) ? 16U : 0U);
 
-	if (atomic_test_bit(&priv->quiescing, ep_bit)) {
+	if (atomic_test_bit(&priv->quiescing, ep_bit) ||
+	    atomic_test_bit(&priv->xfer_finished, ep_bit)) {
 		return;
 	}
 
@@ -1758,7 +1759,11 @@ static int udc_dwc2_ep_disable(const struct device *dev,
 					irq_unlock(key);
 					return -EIO;
 				}
-				sys_write32(UINT32_MAX, interrupts);
+				const uint32_t discard = stall ?
+					(USB_EP_DIR_IS_OUT(cfg->addr) ? USB_DWC2_DOEPINT_EPDISBLD :
+					 USB_DWC2_DIEPINT_EPDISBLD) : UINT32_MAX;
+
+				sys_write32(discard, interrupts);
 				k_event_post(&priv->ep_disabled, BIT(ep_bit));
 				irq_unlock(key);
 				break;
@@ -1840,7 +1845,11 @@ static int udc_dwc2_ep_set_halt(const struct device *dev,
 				struct udc_ep_config *const cfg)
 {
 	uint8_t ep_idx = USB_EP_GET_IDX(cfg->addr);
+	struct udc_dwc2_data *priv = udc_get_private(dev);
 
+	if (ep_idx != 0U) {
+		atomic_set_bit(&priv->quiescing, ep_idx + (USB_EP_DIR_IS_OUT(cfg->addr) ? 16U : 0U));
+	}
 	int ret = udc_dwc2_ep_disable(dev, cfg, true, true);
 
 	if (ret) {
@@ -1862,6 +1871,12 @@ static int udc_dwc2_ep_clear_halt(const struct device *dev,
 	mem_addr_t dxepctl_reg = dwc2_get_dxepctl_reg(dev, cfg->addr);
 	uint32_t dxepctl;
 
+	const uint8_t bit = USB_EP_GET_IDX(cfg->addr) + (USB_EP_DIR_IS_OUT(cfg->addr) ? 16U : 0U);
+
+	if (atomic_get(&priv->faulted) ||
+	    (atomic_test_bit(&priv->quiescing, bit) && !cfg->stat.halted)) {
+		return -EIO;
+	}
 	dxepctl = sys_read32(dxepctl_reg);
 	dxepctl &= ~USB_DWC2_DEPCTL_STALL;
 	dxepctl |= USB_DWC2_DEPCTL_SETD0PID;
@@ -1869,6 +1884,7 @@ static int udc_dwc2_ep_clear_halt(const struct device *dev,
 
 	LOG_DBG("Clear halt ep 0x%02x", cfg->addr);
 	cfg->stat.halted = false;
+	atomic_clear_bit(&priv->quiescing, bit);
 
 	/* Resume queued transfers if any */
 	if (udc_buf_peek(cfg)) {
@@ -2115,6 +2131,10 @@ static int dwc2_core_soft_reset(const struct device *dev)
 	/* CSFTRSTDONE is W1C so the write must have the bit set to clear it */
 	sys_clear_bits(grstctl_reg, USB_DWC2_GRSTCTL_CSFTRST);
 
+	/** GD32 vendor reset sequence waits for three PHY clocks after reset. */
+	if (dwc2_quirk_rx_fifo_read_before_pop(dev)) {
+		k_busy_wait(3);
+	}
 	return 0;
 }
 
